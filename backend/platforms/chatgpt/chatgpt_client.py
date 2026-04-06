@@ -7,7 +7,8 @@ import random
 import uuid
 import time
 from urllib.parse import urlparse
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, instrument_session_proxy_requests
+from core.task_runtime import TaskInterruption
 
 try:
     from curl_cffi import requests as curl_requests
@@ -108,6 +109,7 @@ class ChatGPTClient:
 
         # 创建 session
         self.session = curl_requests.Session(impersonate=self.impersonate)
+        instrument_session_proxy_requests(self.session, proxy_url=self.proxy)
 
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
@@ -134,30 +136,35 @@ class ChatGPTClient:
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
-        if prefer_browser:
-            token = get_sentinel_token_via_browser(
+        for attempt in range(2):
+            if prefer_browser:
+                token = get_sentinel_token_via_browser(
+                    flow=flow,
+                    proxy=self.proxy,
+                    page_url=page_url,
+                    headless=self.browser_mode != "headed",
+                    device_id=self.device_id,
+                    log_fn=lambda msg: self._log(msg),
+                )
+                if token:
+                    self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
+                    return token
+
+            token = build_sentinel_token(
+                self.session,
+                self.device_id,
                 flow=flow,
-                proxy=self.proxy,
-                page_url=page_url,
-                headless=self.browser_mode != "headed",
-                device_id=self.device_id,
-                log_fn=lambda msg: self._log(msg),
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                impersonate=self.impersonate,
             )
             if token:
-                self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
+                self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
                 return token
-
-        token = build_sentinel_token(
-            self.session,
-            self.device_id,
-            flow=flow,
-            user_agent=self.ua,
-            sec_ch_ua=self.sec_ch_ua,
-            impersonate=self.impersonate,
-        )
-        if token:
-            self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
-        return token
+            if attempt < 1:
+                self._log(f"{flow}: sentinel 获取失败，准备重试")
+                time.sleep(1.0)
+        return None
 
     def _log(self, msg):
         """输出日志"""
@@ -229,6 +236,7 @@ class ChatGPTClient:
         )
 
         self.session = curl_requests.Session(impersonate=self.impersonate)
+        instrument_session_proxy_requests(self.session, proxy_url=self.proxy)
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
 
@@ -1112,6 +1120,8 @@ class ChatGPTClient:
                             )
                             or ""
                         ).strip()
+                    except TaskInterruption:
+                        raise
                     except Exception as e:
                         self._log(f"等待验证码异常: {e}")
                         otp_code = ""

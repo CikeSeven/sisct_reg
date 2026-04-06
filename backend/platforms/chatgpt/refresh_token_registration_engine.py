@@ -78,10 +78,17 @@ class SignupFormResult:
 class EmailServiceAdapter:
     """将现有 email_service 适配给 ChatGPTClient / OAuthClient 状态机。"""
 
-    def __init__(self, email_service, email: str, log_fn: Callable[[str], None]):
+    def __init__(
+        self,
+        email_service,
+        email: str,
+        log_fn: Callable[[str], None],
+        interrupt_check: Callable[[], None] | None = None,
+    ):
         self.email_service = email_service
         self.email = email
         self.log_fn = log_fn
+        self.interrupt_check = interrupt_check
         self._used_codes: set[str] = set()
         self._last_code: str = ""
         self._last_code_at: float = 0.0
@@ -106,6 +113,10 @@ class EmailServiceAdapter:
 
     def remember_successful_code(self, code: str) -> None:
         self._remember_code(code, successful=True)
+
+    def _checkpoint(self) -> None:
+        if callable(self.interrupt_check):
+            self.interrupt_check()
 
     def get_recent_code(
         self,
@@ -132,17 +143,20 @@ class EmailServiceAdapter:
         exclude_codes=None,
     ):
         excluded = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
+        self._checkpoint()
         self.log_fn(f"正在等待邮箱 {email} 的验证码 ({timeout}s)...")
         code = self.email_service.get_verification_code(
             email=email,
             timeout=timeout,
             otp_sent_at=otp_sent_at,
             exclude_codes=excluded,
+            interrupt_check=self.interrupt_check,
         )
         if code:
             code = str(code).strip()
             self._remember_code(code, successful=False)
             self.log_fn(f"成功获取验证码: {code}")
+        self._checkpoint()
         return code
 
 
@@ -158,6 +172,7 @@ class RefreshTokenRegistrationEngine:
         browser_mode: str = "protocol",
         max_retries: int = 3,
         extra_config: Optional[dict] = None,
+        interrupt_check: Callable[[], None] | None = None,
     ):
         self.email_service = email_service
         self.proxy_url = proxy_url
@@ -167,6 +182,7 @@ class RefreshTokenRegistrationEngine:
         # 已移除整流程重试能力，保留参数仅兼容调用方
         self.max_retries = 1
         self.extra_config = dict(extra_config or {})
+        self.interrupt_check = interrupt_check
 
         self.email: Optional[str] = None
         self.password: Optional[str] = None
@@ -207,6 +223,11 @@ class RefreshTokenRegistrationEngine:
             "failure_origin": origin,
             "failure_detail": str(detail or "").strip(),
             "resume_supported": bool(resume_supported),
+            "email_binding": (
+                dict((self.email_info or {}).get("account") or {})
+                if isinstance((self.email_info or {}).get("account"), dict)
+                else {}
+            ),
         }
 
     def _log(self, message: str, level: str = "info"):
@@ -399,6 +420,11 @@ class RefreshTokenRegistrationEngine:
             "user_agent": getattr(register_client, "ua", ""),
             "workspace_id": workspace_id,
             "account_claims_email": account_info.get("email", ""),
+            "email_binding": (
+                dict((self.email_info or {}).get("account") or {})
+                if isinstance((self.email_info or {}).get("account"), dict)
+                else {}
+            ),
         }
 
     def run(self) -> RegistrationResult:
@@ -464,6 +490,7 @@ class RefreshTokenRegistrationEngine:
                 self.email_service,
                 result.email,
                 self._log,
+                interrupt_check=self.interrupt_check,
             )
 
             direct_oauth_retry = retry_resume_stage in {"about_you", "workspace_select", "token_exchange"} or (

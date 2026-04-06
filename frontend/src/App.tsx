@@ -5,6 +5,7 @@ type MailProvider = 'luckmail' | 'tempmail_lol' | 'outlook_local'
 type Executor = 'protocol' | 'headless' | 'headed'
 type SettingsTab = 'base' | 'mail' | 'uploads' | 'outlook'
 type OutlookDeleteScope = 'all' | 'taken'
+type ProxyDeleteScope = 'all'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -101,6 +102,38 @@ type OutlookPoolSummary = {
   items: OutlookPoolItem[]
 }
 
+type LuckMailTokenPoolItem = {
+  id: number
+  email: string
+  token: string
+  enabled: boolean
+  created_at: number
+  updated_at: number
+  last_used: number
+}
+
+type LuckMailTokenPoolSummary = {
+  total: number
+  enabled: number
+  disabled: number
+  items: LuckMailTokenPoolItem[]
+}
+
+type LuckMailTokenImportResult = {
+  total: number
+  success: number
+  updated: number
+  failed: number
+  accounts: Array<{
+    id: number
+    email: string
+    enabled: boolean
+    status: string
+  }>
+  errors: string[]
+  summary: LuckMailTokenPoolSummary
+}
+
 type OutlookImportResult = {
   total: number
   success: number
@@ -115,6 +148,48 @@ type OutlookImportResult = {
   }>
   errors: string[]
   summary: OutlookPoolSummary
+}
+
+type ProxyPoolItem = {
+  id: number
+  proxy_url: string
+  enabled: boolean
+  success_count: number
+  failure_count: number
+  last_checked_at: number
+  last_check_status: string
+  last_check_message: string
+  last_ip: string
+  last_country: string
+  last_used_at: number
+  created_at: number
+  updated_at: number
+}
+
+type ProxyPoolSummary = {
+  total: number
+  enabled: number
+  disabled: number
+  healthy: number
+  unhealthy: number
+  success_count: number
+  failure_count: number
+  items: ProxyPoolItem[]
+}
+
+type ProxyImportResult = {
+  total: number
+  success: number
+  updated: number
+  failed: number
+  items: Array<{
+    id: number
+    proxy_url: string
+    enabled: boolean
+    status: string
+  }>
+  errors: string[]
+  summary: ProxyPoolSummary
 }
 
 const defaultForm: FormState = {
@@ -237,8 +312,14 @@ export default function App() {
   const [activeTask, setActiveTask] = useState<TaskSnapshot | null>(null)
   const [taskSnapshots, setTaskSnapshots] = useState<TaskSnapshot[]>([])
   const [outlookSummary, setOutlookSummary] = useState<OutlookPoolSummary | null>(null)
+  const [luckmailTokenSummary, setLuckmailTokenSummary] = useState<LuckMailTokenPoolSummary | null>(null)
+  const [proxySummary, setProxySummary] = useState<ProxyPoolSummary | null>(null)
   const [outlookImportText, setOutlookImportText] = useState('')
+  const [luckmailTokenImportText, setLuckmailTokenImportText] = useState('')
+  const [proxyImportText, setProxyImportText] = useState('')
   const [outlookImportResult, setOutlookImportResult] = useState<OutlookImportResult | null>(null)
+  const [luckmailTokenImportResult, setLuckmailTokenImportResult] = useState<LuckMailTokenImportResult | null>(null)
+  const [proxyImportResult, setProxyImportResult] = useState<ProxyImportResult | null>(null)
   const [expandedAccounts, setExpandedAccounts] = useState<string[]>([])
   const [selectedAccounts, setSelectedAccounts] = useState<string[]>([])
   const [showSettings, setShowSettings] = useState(false)
@@ -247,8 +328,16 @@ export default function App() {
   const [starting, setStarting] = useState(false)
   const [saving, setSaving] = useState(false)
   const [importingOutlook, setImportingOutlook] = useState(false)
+  const [importingLuckmailToken, setImportingLuckmailToken] = useState(false)
+  const [importingProxy, setImportingProxy] = useState(false)
   const [deletingOutlookId, setDeletingOutlookId] = useState<number | null>(null)
   const [deletingOutlookScope, setDeletingOutlookScope] = useState<OutlookDeleteScope | null>(null)
+  const [deletingLuckmailTokenId, setDeletingLuckmailTokenId] = useState<number | null>(null)
+  const [deletingLuckmailTokenScope, setDeletingLuckmailTokenScope] = useState<OutlookDeleteScope | null>(null)
+  const [deletingProxyId, setDeletingProxyId] = useState<number | null>(null)
+  const [deletingProxyScope, setDeletingProxyScope] = useState<ProxyDeleteScope | null>(null)
+  const [testingProxies, setTestingProxies] = useState(false)
+  const [testingProxyId, setTestingProxyId] = useState<number | null>(null)
   const [retryingResultId, setRetryingResultId] = useState<number | null>(null)
   const [deletingAccounts, setDeletingAccounts] = useState(false)
   const [stoppingAccountKeys, setStoppingAccountKeys] = useState<string[]>([])
@@ -472,6 +561,8 @@ export default function App() {
       const config = await apiFetch<Partial<FormState>>('/api/config')
       setForm((prev) => ({ ...prev, ...config }))
       await loadOutlookSummary()
+      await loadLuckmailTokenSummary()
+      await loadProxySummary()
       const snapshots = await loadTaskSnapshots()
       const runningSnapshot = snapshots.find((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status))
       const nextActiveTask = runningSnapshot || snapshots[0] || null
@@ -489,6 +580,16 @@ export default function App() {
   async function loadOutlookSummary() {
     const summary = await apiFetch<OutlookPoolSummary>('/api/outlook/summary')
     setOutlookSummary(summary)
+  }
+
+  async function loadLuckmailTokenSummary() {
+    const summary = await apiFetch<LuckMailTokenPoolSummary>('/api/luckmail-pool/summary')
+    setLuckmailTokenSummary(summary)
+  }
+
+  async function loadProxySummary() {
+    const summary = await apiFetch<ProxyPoolSummary>('/api/proxies/summary')
+    setProxySummary(summary)
   }
 
   async function loadTaskSnapshots(preferTaskId?: string) {
@@ -538,6 +639,7 @@ export default function App() {
       if (['done', 'failed', 'stopped'].includes(snapshot.status)) {
         closeStream()
         await loadOutlookSummary()
+        await loadLuckmailTokenSummary()
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err || '')
@@ -634,7 +736,6 @@ export default function App() {
           values: {
             executor_type: form.executor_type,
             mail_provider: form.mail_provider,
-            proxy: form.proxy,
             luckmail_base_url: form.luckmail_base_url,
             luckmail_api_key: form.luckmail_api_key,
             luckmail_email_type: form.luckmail_email_type,
@@ -677,6 +778,28 @@ export default function App() {
     }
   }
 
+  async function importLuckmailTokenPool() {
+    if (!luckmailTokenImportText.trim()) {
+      setError('请先粘贴邮箱令牌内容')
+      return
+    }
+    setImportingLuckmailToken(true)
+    setError('')
+    try {
+      const result = await apiFetch<LuckMailTokenImportResult>('/api/luckmail-pool/batch-import', {
+        method: 'POST',
+        body: JSON.stringify({ data: luckmailTokenImportText, enabled: true }),
+      })
+      setLuckmailTokenImportResult(result)
+      setLuckmailTokenSummary(result.summary)
+      setLuckmailTokenImportText('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '导入令牌池失败')
+    } finally {
+      setImportingLuckmailToken(false)
+    }
+  }
+
   async function deleteOutlookAccount(accountId: number) {
     setDeletingOutlookId(accountId)
     setError('')
@@ -711,6 +834,124 @@ export default function App() {
     }
   }
 
+  async function deleteLuckmailTokenAccount(accountId: number) {
+    setDeletingLuckmailTokenId(accountId)
+    setError('')
+    try {
+      const result = await apiFetch<{ ok: boolean; summary: LuckMailTokenPoolSummary }>(`/api/luckmail-pool/accounts/${accountId}`, {
+        method: 'DELETE',
+      })
+      setLuckmailTokenSummary(result.summary)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '删除令牌池账号失败')
+    } finally {
+      setDeletingLuckmailTokenId(null)
+    }
+  }
+
+  async function deleteLuckmailTokenAccounts(scope: OutlookDeleteScope) {
+    setDeletingLuckmailTokenScope(scope)
+    setError('')
+    try {
+      const result = await apiFetch<{ ok: boolean; deleted: number; summary: LuckMailTokenPoolSummary }>(
+        `/api/luckmail-pool/accounts?scope=${scope}`,
+        { method: 'DELETE' },
+      )
+      setLuckmailTokenSummary(result.summary)
+      if (scope === 'all') {
+        setLuckmailTokenImportResult(null)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '批量删除令牌池失败')
+    } finally {
+      setDeletingLuckmailTokenScope(null)
+    }
+  }
+
+  async function importProxyPool() {
+    if (!proxyImportText.trim()) {
+      setError('请先粘贴代理内容')
+      return
+    }
+    setImportingProxy(true)
+    setError('')
+    try {
+      const result = await apiFetch<ProxyImportResult>('/api/proxies/batch-import', {
+        method: 'POST',
+        body: JSON.stringify({ data: proxyImportText, enabled: true }),
+      })
+      setProxyImportResult(result)
+      setProxySummary(result.summary)
+      setProxyImportText('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '导入代理池失败')
+    } finally {
+      setImportingProxy(false)
+    }
+  }
+
+  async function testProxyPool() {
+    setTestingProxies(true)
+    setError('')
+    try {
+      const result = await apiFetch<{ ok: boolean; tested: number; success: number; failed: number; summary: ProxyPoolSummary }>('/api/proxies/test', {
+        method: 'POST',
+      })
+      setProxySummary(result.summary)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '代理检测失败')
+    } finally {
+      setTestingProxies(false)
+    }
+  }
+
+  async function testProxyAccount(proxyId: number) {
+    setTestingProxyId(proxyId)
+    setError('')
+    try {
+      const result = await apiFetch<{ ok: boolean; ip: string; country: string; summary: ProxyPoolSummary }>(`/api/proxies/accounts/${proxyId}/test`, {
+        method: 'POST',
+      })
+      setProxySummary(result.summary)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '代理检测失败')
+      await loadProxySummary()
+    } finally {
+      setTestingProxyId(null)
+    }
+  }
+
+  async function deleteProxyAccount(proxyId: number) {
+    setDeletingProxyId(proxyId)
+    setError('')
+    try {
+      const result = await apiFetch<{ ok: boolean; summary: ProxyPoolSummary }>(`/api/proxies/accounts/${proxyId}`, {
+        method: 'DELETE',
+      })
+      setProxySummary(result.summary)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '删除代理失败')
+    } finally {
+      setDeletingProxyId(null)
+    }
+  }
+
+  async function deleteProxyAccounts(scope: ProxyDeleteScope) {
+    setDeletingProxyScope(scope)
+    setError('')
+    try {
+      const result = await apiFetch<{ ok: boolean; deleted: number; summary: ProxyPoolSummary }>(`/api/proxies/accounts?scope=${scope}`, {
+        method: 'DELETE',
+      })
+      setProxySummary(result.summary)
+      setProxyImportResult(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '清空代理池失败')
+    } finally {
+      setDeletingProxyScope(null)
+    }
+  }
+
   async function startTask(event: FormEvent) {
     event.preventDefault()
     setStarting(true)
@@ -725,7 +966,7 @@ export default function App() {
           register_delay_seconds: Number(form.register_delay_seconds),
           email: null,
           password: null,
-          proxy: form.proxy || null,
+          proxy: null,
           executor_type: form.executor_type,
           mail_provider: form.mail_provider,
           provider_config: {
@@ -884,10 +1125,97 @@ export default function App() {
                 </select>
               </label>
             </div>
+          </div>
+
+          <div className="sub-block">
+            <div className="sub-block-title">代理池</div>
+            <div className="mini-stats-grid">
+              <StatCard label="总数" value={proxySummary?.total ?? 0} />
+              <StatCard label="可用" value={proxySummary?.enabled ?? 0} tone="success" />
+              <StatCard label="连通" value={proxySummary?.healthy ?? 0} tone="info" />
+              <StatCard label="失败" value={proxySummary?.unhealthy ?? 0} tone="danger" />
+              <StatCard label="成功次数" value={proxySummary?.success_count ?? 0} tone="success" />
+              <StatCard label="失败次数" value={proxySummary?.failure_count ?? 0} tone="danger" />
+            </div>
+
             <label>
-              <span>代理</span>
-              <input value={form.proxy} onChange={(e) => updateField('proxy', e.target.value)} placeholder="user:pass@host:port 或 host:port" />
+              <span>批量导入内容</span>
+              <textarea
+                rows={6}
+                value={proxyImportText}
+                onChange={(e) => setProxyImportText(e.target.value)}
+                placeholder={'host:port\nuser:pass@host:port'}
+              />
             </label>
+
+            <div className="form-actions split-actions">
+              <button className="primary-btn" type="button" onClick={() => void importProxyPool()} disabled={importingProxy}>
+                {importingProxy ? '导入中...' : '批量导入'}
+              </button>
+              <button className="ghost-btn" type="button" onClick={() => void testProxyPool()} disabled={testingProxies}>
+                {testingProxies ? '检测中...' : '检测全部'}
+              </button>
+              <button
+                className="ghost-btn danger"
+                type="button"
+                onClick={() => void deleteProxyAccounts('all')}
+                disabled={deletingProxyScope !== null}
+              >
+                {deletingProxyScope === 'all' ? '删除中...' : '删除全部'}
+              </button>
+            </div>
+
+            {proxyImportResult ? (
+              <div className="import-result">
+                <div className="import-result-head">
+                  <strong>最近一次导入</strong>
+                  <span>成功 {proxyImportResult.success} / 更新 {proxyImportResult.updated} / 失败 {proxyImportResult.failed}</span>
+                </div>
+                {proxyImportResult.errors.length > 0 ? (
+                  <div className="import-error-list">
+                    {proxyImportResult.errors.slice(0, 4).map((item, index) => (
+                      <div className="import-error-item" key={`${item}-${index}`}>{item}</div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="provider-item-list">
+              {(proxySummary?.items || []).length === 0 ? <div className="timeline-empty">暂无数据</div> : null}
+              {(proxySummary?.items || []).map((item) => (
+                <div className="provider-item provider-item-compact" key={item.id}>
+                  <div className="provider-item-main">
+                    <strong className="proxy-line">{item.proxy_url}</strong>
+                    <p>
+                      {item.last_check_status === 'ok'
+                        ? `${item.last_ip || '-'}${item.last_country ? ` (${item.last_country})` : ''}`
+                        : item.last_check_message || '-'}
+                    </p>
+                  </div>
+                  <div className="provider-item-meta">
+                    <span className="proxy-count proxy-count-success">{item.success_count}</span>
+                    <span className="proxy-count proxy-count-failed">{item.failure_count}</span>
+                    <button
+                      className="tiny-action-btn"
+                      type="button"
+                      onClick={() => void testProxyAccount(item.id)}
+                      disabled={testingProxyId === item.id}
+                    >
+                      {testingProxyId === item.id ? '检测中' : '测试'}
+                    </button>
+                    <button
+                      className="tiny-action-btn danger"
+                      type="button"
+                      onClick={() => void deleteProxyAccount(item.id)}
+                      disabled={deletingProxyId === item.id || testingProxyId === item.id}
+                    >
+                      {deletingProxyId === item.id ? '删除中' : '删除'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )
@@ -1048,6 +1376,94 @@ export default function App() {
                   disabled={deletingOutlookId === item.id}
                 >
                   {deletingOutlookId === item.id ? '删除中' : '删除'}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="sub-block">
+          <div className="sub-block-title">LuckMail 令牌池</div>
+          <div className="mini-stats-grid">
+            <StatCard label="总数" value={luckmailTokenSummary?.total ?? 0} />
+            <StatCard label="可用" value={luckmailTokenSummary?.enabled ?? 0} tone="success" />
+            <StatCard label="已取出" value={luckmailTokenSummary?.disabled ?? 0} tone="danger" />
+          </div>
+
+          <label>
+            <span>批量导入内容</span>
+            <textarea
+              rows={6}
+              value={luckmailTokenImportText}
+              onChange={(e) => setLuckmailTokenImportText(e.target.value)}
+              placeholder={'示例：\nuser1@hotmail.com----tok_xxx\nuser2@hotmail.com----tok_xxx'}
+            />
+          </label>
+
+          <div className="form-actions split-actions">
+            <button className="primary-btn" type="button" onClick={() => void importLuckmailTokenPool()} disabled={importingLuckmailToken}>
+              {importingLuckmailToken ? '导入中...' : '批量导入令牌池'}
+            </button>
+            <button className="ghost-btn" type="button" onClick={() => setLuckmailTokenImportText('')} disabled={importingLuckmailToken}>
+              清空
+            </button>
+          </div>
+
+          <div className="form-actions split-actions">
+            <button
+              className="ghost-btn danger"
+              type="button"
+              onClick={() => void deleteLuckmailTokenAccounts('taken')}
+              disabled={deletingLuckmailTokenScope !== null}
+            >
+              {deletingLuckmailTokenScope === 'taken' ? '删除中...' : '删除已取出'}
+            </button>
+            <button
+              className="ghost-btn danger"
+              type="button"
+              onClick={() => void deleteLuckmailTokenAccounts('all')}
+              disabled={deletingLuckmailTokenScope !== null}
+            >
+              {deletingLuckmailTokenScope === 'all' ? '删除中...' : '删除全部'}
+            </button>
+          </div>
+        </div>
+
+        {luckmailTokenImportResult ? (
+          <div className="import-result">
+            <div className="import-result-head">
+              <strong>最近一次导入</strong>
+              <span>成功 {luckmailTokenImportResult.success} / 更新 {luckmailTokenImportResult.updated} / 失败 {luckmailTokenImportResult.failed}</span>
+            </div>
+            {luckmailTokenImportResult.errors.length > 0 ? (
+              <div className="import-error-list">
+                {luckmailTokenImportResult.errors.slice(0, 4).map((item, index) => (
+                  <div className="import-error-item" key={`${item}-${index}`}>{item}</div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="provider-item-list">
+          {(luckmailTokenSummary?.items || []).length === 0 ? <div className="timeline-empty">暂无数据</div> : null}
+          {(luckmailTokenSummary?.items || []).map((item) => (
+            <div className="provider-item" key={item.id}>
+              <div>
+                <strong>{renderPoolEmail(item.email)}</strong>
+                <p>{item.token ? `${String(item.token).slice(0, 14)}...` : '-'}</p>
+              </div>
+              <div className="provider-item-meta">
+                <span className={`history-badge ${item.enabled ? 'status-done' : 'status-stopped'}`}>
+                  {item.enabled ? '可用' : '已取出'}
+                </span>
+                <button
+                  className="tiny-action-btn danger"
+                  type="button"
+                  onClick={() => void deleteLuckmailTokenAccount(item.id)}
+                  disabled={deletingLuckmailTokenId === item.id}
+                >
+                  {deletingLuckmailTokenId === item.id ? '删除中' : '删除'}
                 </button>
               </div>
             </div>

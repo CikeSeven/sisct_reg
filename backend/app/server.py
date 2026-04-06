@@ -10,13 +10,17 @@ from fastapi.staticfiles import StaticFiles
 
 from .db import finalize_orphaned_tasks, get_config, get_task_events, init_db, parse_config_row_values, set_config
 from .defaults import DEFAULT_CONFIG
+from .luckmail_pool import router as luckmail_pool_router
 from .manager import manager
 from .outlook_pool import router as outlook_router
+from .proxy_pool import router as proxy_router
 from .schemas import CreateRegisterTaskRequest, DeleteAccountRequest, DeleteAccountsBatchRequest, UpdateConfigRequest
 
 app = FastAPI(title="ChatGPT Register Workbench", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(outlook_router)
+app.include_router(luckmail_pool_router)
+app.include_router(proxy_router)
 
 
 @app.on_event("startup")

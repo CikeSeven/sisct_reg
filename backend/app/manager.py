@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, isolate_proxy_session, proxy_usage_context, tracked_request
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -22,7 +22,9 @@ from core.task_runtime import (
 from platforms.chatgpt.refresh_token_registration_engine import RefreshTokenRegistrationEngine
 
 from .db import (
+    acquire_proxy_pool_entry,
     append_task_event,
+    get_proxy_pool_summary,
     count_task_runs,
     create_task_run,
     delete_task_result,
@@ -34,7 +36,9 @@ from .db import (
     get_task_run,
     insert_task_result,
     list_task_runs,
+    list_enabled_proxy_pool,
     parse_config_row_values,
+    update_proxy_check_result,
     update_task_run,
 )
 from .defaults import DEFAULT_CONFIG
@@ -48,6 +52,7 @@ class QueuedAttempt:
     attempt_index: int
     req_overrides: dict[str, Any] = field(default_factory=dict)
     merged_config_overrides: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -166,16 +171,20 @@ class RegistrationManager:
         return merged
 
     @staticmethod
-    def _query_egress_info(proxy_url: str | None = None) -> tuple[str, str]:
+    def _query_egress_info(proxy_url: str | None = None, *, proxy_id: int | None = None) -> tuple[str, str]:
         proxies = build_requests_proxy_config(proxy_url)
         timeout = RegistrationManager.PROXY_TEST_TIMEOUT_SECONDS
 
         # 先做一次快速连通性检测
         try:
-            response = requests.get(
+            response = tracked_request(
+                requests.request,
+                "GET",
                 "http://httpbin.org/ip",
                 proxies=proxies,
                 timeout=timeout,
+                proxy_id=proxy_id,
+                proxy_url=proxy_url,
             )
             response.raise_for_status()
             payload = response.json() or {}
@@ -188,10 +197,14 @@ class RegistrationManager:
 
         # 国家码查询尽力而为，不阻塞主流程
         try:
-            geo_resp = requests.get(
+            geo_resp = tracked_request(
+                requests.request,
+                "GET",
                 "http://ip-api.com/json/?fields=status,message,query,countryCode",
                 proxies=proxies,
                 timeout=min(5, timeout),
+                proxy_id=proxy_id,
+                proxy_url=proxy_url,
             )
             geo_resp.raise_for_status()
             geo_payload = geo_resp.json() or {}
@@ -216,6 +229,9 @@ class RegistrationManager:
                 self._log(task_id, f"代理出口: {proxy_ip} ({proxy_country})")
             else:
                 self._log(task_id, f"代理出口 IP: {proxy_ip}")
+            return
+
+        if self._enabled_proxy_pool_exists():
             return
 
         try:
@@ -387,6 +403,53 @@ class RegistrationManager:
         update_task_run(task_id, **payload)
         return completed, success, failed, skipped
 
+    @staticmethod
+    def _enabled_proxy_pool_exists() -> bool:
+        summary = get_proxy_pool_summary(limit=1)
+        return int(summary.get("enabled") or 0) > 0
+
+    def _acquire_checked_proxy_for_attempt(
+        self,
+        *,
+        task_id: str,
+        attempt_index: int,
+        attempt_log,
+        max_candidates: int = 3,
+    ) -> tuple[str | None, int | None]:
+        tried_proxy_ids: list[int] = []
+        enabled_count = len(list_enabled_proxy_pool())
+        candidate_limit = max(1, min(enabled_count or 1, max_candidates))
+        last_error = ""
+
+        for _ in range(candidate_limit):
+            entry = acquire_proxy_pool_entry(exclude_ids=tried_proxy_ids)
+            if not entry:
+                break
+            proxy_id = int(entry.get("id") or 0)
+            proxy_url = str(entry.get("proxy_url") or "").strip()
+            tried_proxy_ids.append(proxy_id)
+            if not proxy_url:
+                continue
+            try:
+                attempt_log("正在检测代理连通性...")
+                proxy_ip, proxy_country = self._query_egress_info(proxy_url, proxy_id=proxy_id)
+                update_proxy_check_result(proxy_id, ok=True, message="ok", ip=proxy_ip, country=proxy_country)
+                if proxy_country:
+                    attempt_log(f"代理出口: {proxy_ip} ({proxy_country})")
+                else:
+                    attempt_log(f"代理出口 IP: {proxy_ip}")
+                return proxy_url, proxy_id
+            except Exception as exc:
+                last_error = str(exc)
+                update_proxy_check_result(proxy_id, ok=False, message=last_error)
+                attempt_log(f"代理检测失败: {last_error}", level="error")
+                if len(tried_proxy_ids) < candidate_limit:
+                    attempt_log("切换下一个代理继续尝试")
+
+        if last_error:
+            raise RuntimeError(f"代理检测失败: {last_error}")
+        return None, None
+
     def _queue_retry_into_active_task(
         self,
         task_id: str,
@@ -397,6 +460,7 @@ class RegistrationManager:
         retry_stage: str,
         retry_origin: str,
         current_proxy: str | None,
+        retry_email_binding: dict[str, Any] | None = None,
     ) -> bool:
         state = self._get_task_execution_state(task_id)
         if state is None:
@@ -426,6 +490,7 @@ class RegistrationManager:
                     "retry_resume_origin": retry_origin,
                     "retry_from_task_id": task_id,
                     "retry_from_attempt_index": int(attempt_index),
+                    "retry_email_binding": dict(retry_email_binding or {}),
                 },
             )
         )
@@ -532,6 +597,11 @@ class RegistrationManager:
                     "failure_origin": failure_origin,
                     "failure_detail": failure_detail,
                     "retry_supported": bool(retry_supported) and self._supports_retry(mail_provider, email),
+                    "retry_email_binding": (
+                        dict(metadata.get("email_binding") or {})
+                        if isinstance(metadata.get("email_binding"), dict)
+                        else {}
+                    ),
                 }
             )
 
@@ -758,6 +828,7 @@ class RegistrationManager:
         metadata = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
         failure_stage = str(extra.get("failure_stage") or metadata.get("failure_stage") or "").strip()
         failure_origin = str(extra.get("failure_origin") or metadata.get("failure_origin") or "").strip()
+        retry_email_binding = dict(metadata.get("email_binding") or {}) if isinstance(metadata.get("email_binding"), dict) else {}
         mail_provider = str(
             request_payload.get("mail_provider")
             or extra.get("mail_provider")
@@ -769,7 +840,7 @@ class RegistrationManager:
             return {"ok": False, "reason": "retry_not_supported"}
 
         current_defaults = self._get_current_runtime_defaults()
-        current_proxy = str(current_defaults.get("proxy") or "").strip() or None
+        current_proxy = None if self._enabled_proxy_pool_exists() else (str(current_defaults.get("proxy") or "").strip() or None)
         source_task_id = str(result.get("task_id") or "").strip()
         source_task_row = get_task_run(source_task_id) if source_task_id else None
 
@@ -787,6 +858,7 @@ class RegistrationManager:
                 retry_stage=failure_stage,
                 retry_origin=failure_origin,
                 current_proxy=current_proxy,
+                retry_email_binding=retry_email_binding,
             )
             if queued:
                 return {"ok": True, "task_id": source_task_id, "queued": True}
@@ -809,6 +881,7 @@ class RegistrationManager:
         merged_config["retry_from_result_id"] = int(result_id)
         merged_config["retry_from_task_id"] = str(result.get("task_id") or "")
         merged_config["retry_from_attempt_index"] = retry_from_attempt_index
+        merged_config["retry_email_binding"] = retry_email_binding
         task_id = self.create_task(
             req,
             merged_config,
@@ -846,7 +919,7 @@ class RegistrationManager:
             return {"ok": False, "reason": "retry_not_supported"}
 
         current_defaults = self._get_current_runtime_defaults()
-        current_proxy = str(current_defaults.get("proxy") or "").strip() or None
+        current_proxy = None if self._enabled_proxy_pool_exists() else (str(current_defaults.get("proxy") or "").strip() or None)
 
         if (
             self._task_store.exists(task_id)
@@ -860,6 +933,11 @@ class RegistrationManager:
                 retry_stage=str(target.get("failure_stage") or "").strip(),
                 retry_origin=str(target.get("failure_origin") or "").strip(),
                 current_proxy=current_proxy,
+                retry_email_binding=(
+                    dict(target.get("retry_email_binding") or {})
+                    if isinstance(target.get("retry_email_binding"), dict)
+                    else {}
+                ),
             )
             if queued:
                 return {"ok": True, "task_id": task_id, "queued": True}
@@ -880,6 +958,11 @@ class RegistrationManager:
         merged_config["retry_resume_origin"] = str(target.get("failure_origin") or "").strip()
         merged_config["retry_from_task_id"] = task_id
         merged_config["retry_from_attempt_index"] = int(attempt_index)
+        merged_config["retry_email_binding"] = (
+            dict(target.get("retry_email_binding") or {})
+            if isinstance(target.get("retry_email_binding"), dict)
+            else {}
+        )
         new_task_id = self.create_task(
             req,
             merged_config,
@@ -1018,7 +1101,15 @@ class RegistrationManager:
             config["proxy"] = req.proxy
         return config
 
-    def _make_engine(self, req: CreateRegisterTaskRequest, merged_config: dict[str, Any], email_provider, log_fn):
+    def _make_engine(
+        self,
+        req: CreateRegisterTaskRequest,
+        merged_config: dict[str, Any],
+        email_provider,
+        log_fn,
+        *,
+        interrupt_check=None,
+    ):
         extra_config = self._merge_runtime_config(merged_config, req)
         kwargs = {
             "email_service": email_provider,
@@ -1027,6 +1118,7 @@ class RegistrationManager:
             "callback_logger": log_fn,
             "max_retries": 3,
             "extra_config": extra_config,
+            "interrupt_check": interrupt_check,
         }
         engine = RefreshTokenRegistrationEngine(**kwargs)
         if req.email:
@@ -1116,6 +1208,7 @@ class RegistrationManager:
         def do_one(queued_attempt: QueuedAttempt):
             nonlocal next_start_time
             attempt_id: int | None = None
+            proxy_entry_id: int | None = None
             attempt_index = int(queued_attempt.attempt_index)
             attempt_req = req.model_copy(deep=True, update=queued_attempt.req_overrides or {})
             attempt_merged_config = deepcopy(merged_config)
@@ -1143,21 +1236,48 @@ class RegistrationManager:
                     self._log(task_id, message, level=level, attempt_index=attempt_index)
                     control.checkpoint(attempt_id=attempt_id)
 
-                runtime_config = self._merge_runtime_config(attempt_merged_config, attempt_req)
-                provider = build_mail_provider(
-                    attempt_req.mail_provider,
-                    config=runtime_config,
-                    proxy=attempt_req.proxy,
-                    fixed_email=attempt_req.email,
-                    log_fn=attempt_log,
+                if not str(attempt_req.proxy or "").strip() and self._enabled_proxy_pool_exists():
+                    selected_proxy, selected_proxy_id = self._acquire_checked_proxy_for_attempt(
+                        task_id=task_id,
+                        attempt_index=attempt_index,
+                        attempt_log=attempt_log,
+                    )
+                    if selected_proxy:
+                        attempt_req = attempt_req.model_copy(update={"proxy": selected_proxy})
+                        proxy_entry_id = int(selected_proxy_id or 0) or None
+                elif str(attempt_req.proxy or "").strip():
+                    attempt_log("正在检测代理连通性...")
+                    proxy_ip, proxy_country = self._query_egress_info(str(attempt_req.proxy or "").strip())
+                    if proxy_country:
+                        attempt_log(f"代理出口: {proxy_ip} ({proxy_country})")
+                    else:
+                        attempt_log(f"代理出口 IP: {proxy_ip}")
+
+                accounting_proxy = str(attempt_req.proxy or "").strip() or None
+                attempt_proxy = isolate_proxy_session(
+                    attempt_req.proxy,
+                    scope=f"{task_id}:{attempt_index}:{time.time_ns()}",
                 )
-                engine = self._make_engine(
-                    attempt_req,
-                    attempt_merged_config,
-                    provider,
-                    attempt_log,
-                )
-                result = engine.run()
+                if attempt_proxy != attempt_req.proxy:
+                    attempt_req = attempt_req.model_copy(update={"proxy": attempt_proxy})
+
+                with proxy_usage_context(proxy_id=proxy_entry_id, proxy_url=accounting_proxy):
+                    runtime_config = self._merge_runtime_config(attempt_merged_config, attempt_req)
+                    provider = build_mail_provider(
+                        attempt_req.mail_provider,
+                        config=runtime_config,
+                        proxy=attempt_req.proxy,
+                        fixed_email=attempt_req.email,
+                        log_fn=attempt_log,
+                    )
+                    engine = self._make_engine(
+                        attempt_req,
+                        attempt_merged_config,
+                        provider,
+                        attempt_log,
+                        interrupt_check=lambda: control.checkpoint(attempt_id=attempt_id),
+                    )
+                    result = engine.run()
                 if not result or not getattr(result, "success", False):
                     failure_message = getattr(result, "error_message", "") or "注册失败"
                     failure_metadata = getattr(result, "metadata", None) or {}
@@ -1210,9 +1330,13 @@ class RegistrationManager:
                 self._sync_task_progress(task_id, state)
                 return AttemptResult.skipped(str(exc))
             except StopTaskRequested as exc:
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="stopped", error=str(exc))
-                self._log(task_id, f"[STOP] {exc}", attempt_index=attempt_index)
-                return AttemptResult.stopped(str(exc))
+                message = str(exc)
+                insert_task_result(task_id, attempt_index=attempt_index, status="stopped", email=attempt_req.email or "", error=message)
+                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="stopped", error=message)
+                self._log(task_id, f"[STOP] {message}", attempt_index=attempt_index)
+                state.apply_outcome(AttemptOutcome.STOPPED)
+                self._sync_task_progress(task_id, state)
+                return AttemptResult.stopped(message)
             except StopCurrentAttemptRequested as exc:
                 message = str(exc)
                 insert_task_result(task_id, attempt_index=attempt_index, status="stopped", email=attempt_req.email or "", error=message)

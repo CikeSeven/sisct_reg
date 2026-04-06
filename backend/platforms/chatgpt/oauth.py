@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from curl_cffi import requests as cffi_requests
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, tracked_request
 
 from .constants import (
     OAUTH_CLIENT_ID,
@@ -150,13 +150,16 @@ def _post_form(
 
     try:
         # 使用 curl_cffi 发送请求，支持代理和浏览器指纹
-        response = cffi_requests.post(
+        response = tracked_request(
+            cffi_requests.request,
+            "POST",
             url,
             data=data,
             headers=headers,
             timeout=timeout,
             proxies=proxies,
             impersonate="chrome",
+            proxy_url=proxy_url,
         )
 
         if response.status_code != 200:

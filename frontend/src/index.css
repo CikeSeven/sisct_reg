@@ -728,9 +728,26 @@ button:disabled {
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+.provider-item-compact {
+  padding: 8px 10px;
+  border-radius: 10px;
+}
+
+.provider-item-main {
+  min-width: 0;
+  flex: 1;
+}
+
 .provider-item strong {
   display: block;
   margin-bottom: 4px;
+}
+
+.proxy-line {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
 }
 
 .provider-item p {
@@ -743,6 +760,27 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.proxy-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.proxy-count-success {
+  color: #7cf2bf;
+}
+
+.proxy-count-failed {
+  color: #ff9898;
 }
 
 .tiny-action-btn {

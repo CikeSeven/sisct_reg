@@ -8,13 +8,18 @@ from email import message_from_bytes
 from email.header import decode_header
 from email.policy import default as email_default_policy
 from email.utils import parsedate_to_datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, tracked_request
 
-from .db import get_outlook_account_by_email, take_outlook_account
+from .db import (
+    get_luckmail_token_account_by_email,
+    get_outlook_account_by_email,
+    take_luckmail_token_account,
+    take_outlook_account,
+)
 
 
 class _ServiceType:
@@ -31,6 +36,25 @@ class ProviderBase:
     def _log(self, message: str) -> None:
         if callable(self.log_fn):
             self.log_fn(message)
+
+    def _interrupt(self, interrupt_check: Callable[[], None] | None = None) -> None:
+        if callable(interrupt_check):
+            interrupt_check()
+
+    def _sleep_interruptibly(
+        self,
+        seconds: float,
+        interrupt_check: Callable[[], None] | None = None,
+        *,
+        chunk: float = 0.5,
+    ) -> None:
+        remaining = max(0.0, float(seconds or 0.0))
+        while remaining > 0:
+            self._interrupt(interrupt_check)
+            sleep_for = min(max(chunk, 0.05), remaining)
+            time.sleep(sleep_for)
+            remaining -= sleep_for
+        self._interrupt(interrupt_check)
 
     @property
     def proxies(self):
@@ -86,7 +110,14 @@ class TempMailLolProvider(ProviderBase):
             raise RuntimeError("tempmail_lol 不支持预置固定邮箱")
 
     def create_email(self, config=None):
-        response = requests.post(f"{self.api_base}/inbox/create", json={}, proxies=self.proxies, timeout=20)
+        response = tracked_request(
+            requests.request,
+            "POST",
+            f"{self.api_base}/inbox/create",
+            proxies=self.proxies,
+            timeout=20,
+            json={},
+        )
         payload = response.json()
         email = str(payload.get("address") or payload.get("email") or "").strip()
         token = str(payload.get("token") or "").strip()
@@ -101,7 +132,9 @@ class TempMailLolProvider(ProviderBase):
     def _list_ids(self) -> set[str]:
         if not self._token:
             return set()
-        response = requests.get(
+        response = tracked_request(
+            requests.request,
+            "GET",
             f"{self.api_base}/inbox",
             params={"token": self._token},
             proxies=self.proxies,
@@ -111,10 +144,14 @@ class TempMailLolProvider(ProviderBase):
         return {str(item.get("id")) for item in (payload.get("emails") or []) if item.get("id") is not None}
 
     def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
+        interrupt_check = kwargs.get("interrupt_check")
         exclude_codes = {str(item) for item in (exclude_codes or set()) if item}
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         while time.monotonic() < deadline:
-            response = requests.get(
+            self._interrupt(interrupt_check)
+            response = tracked_request(
+                requests.request,
+                "GET",
                 f"{self.api_base}/inbox",
                 params={"token": self._token},
                 proxies=self.proxies,
@@ -137,7 +174,7 @@ class TempMailLolProvider(ProviderBase):
                 code = self._extract_code(text)
                 if code and code not in exclude_codes:
                     return code
-            time.sleep(3)
+            self._sleep_interruptibly(3, interrupt_check)
         raise TimeoutError(f"TempMail.lol 等待验证码超时 ({timeout}s)")
 
 
@@ -152,6 +189,7 @@ class LuckMailProvider(ProviderBase):
         project_code: str = "openai",
         email_type: str = "",
         domain: str = "",
+        fixed_account: dict | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -160,6 +198,7 @@ class LuckMailProvider(ProviderBase):
         self.project_code = project_code or "openai"
         self.email_type = email_type or None
         self.domain = domain or None
+        self._fixed_account = dict(fixed_account or {}) if isinstance(fixed_account, dict) else None
         self._email = ""
         self._token = ""
         self._seen_ids: set[str] = set()
@@ -175,7 +214,8 @@ class LuckMailProvider(ProviderBase):
         }
 
     def _request(self, method: str, path: str, **kwargs):
-        response = requests.request(
+        response = tracked_request(
+            requests.request,
             method,
             f"{self.base_url}{path}",
             headers={**self.headers, **kwargs.pop("headers", {})},
@@ -203,7 +243,45 @@ class LuckMailProvider(ProviderBase):
         return None
 
     def create_email(self, config=None):
+        if self._fixed_account:
+            email = str(self._fixed_account.get("email") or "").strip()
+            token = str(self._fixed_account.get("token") or "").strip()
+            if not email or not token:
+                raise RuntimeError("LuckMail 绑定令牌缺失")
+            self._email = email
+            self._token = token
+            self._seen_ids = self._list_message_ids(token)
+            self._log(f"[LuckMail] 使用绑定令牌邮箱: {email}")
+            return {
+                "email": email,
+                "token": token,
+                "service_id": token,
+                "account": {
+                    "id": self._fixed_account.get("id"),
+                    "email": email,
+                    "token": token,
+                },
+            }
+
         if self.fixed_email:
+            local_account = get_luckmail_token_account_by_email(self.fixed_email)
+            if local_account and local_account.get("token"):
+                email = str(local_account.get("email") or "").strip()
+                token = str(local_account.get("token") or "").strip()
+                self._email = email
+                self._token = token
+                self._seen_ids = self._list_message_ids(token)
+                self._log(f"[LuckMail] 使用本地令牌邮箱: {email}")
+                return {
+                    "email": email,
+                    "token": token,
+                    "service_id": token,
+                    "account": {
+                        "id": local_account.get("id"),
+                        "email": email,
+                        "token": token,
+                    },
+                }
             existing = self._find_existing_purchase(self.fixed_email)
             if not existing:
                 raise RuntimeError("LuckMail 固定邮箱模式下未找到对应已购邮箱和 token")
@@ -213,6 +291,25 @@ class LuckMailProvider(ProviderBase):
             self._seen_ids = self._list_message_ids(token)
             self._log(f"[LuckMail] 使用已购邮箱: {email}")
             return {"email": email, "token": token, "service_id": token}
+
+        local_account = take_luckmail_token_account(preferred_email=None)
+        if local_account and local_account.get("token"):
+            email = str(local_account.get("email") or "").strip()
+            token = str(local_account.get("token") or "").strip()
+            self._email = email
+            self._token = token
+            self._seen_ids = self._list_message_ids(token)
+            self._log(f"[LuckMail] 使用本地令牌邮箱: {email}")
+            return {
+                "email": email,
+                "token": token,
+                "service_id": token,
+                "account": {
+                    "id": local_account.get("id"),
+                    "email": email,
+                    "token": token,
+                },
+            }
 
         body = {"project_code": self.project_code, "quantity": 1}
         if self.email_type:
@@ -241,9 +338,11 @@ class LuckMailProvider(ProviderBase):
     def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
         if not self._token:
             raise RuntimeError("LuckMail token 不存在，无法获取验证码")
+        interrupt_check = kwargs.get("interrupt_check")
         exclude_codes = {str(item) for item in (exclude_codes or set()) if item}
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         while time.monotonic() < deadline:
+            self._interrupt(interrupt_check)
             data = self._request("GET", f"/api/v1/openapi/email/token/{self._token}/mails")
             for mail in data.get("mails") or []:
                 message_id = str(mail.get("message_id") or "").strip()
@@ -258,7 +357,7 @@ class LuckMailProvider(ProviderBase):
                 code = self._extract_code(text)
                 if code and code not in exclude_codes:
                     return code
-            time.sleep(4)
+            self._sleep_interruptibly(4, interrupt_check)
         raise TimeoutError(f"LuckMail 等待验证码超时 ({timeout}s)")
 
 
@@ -271,6 +370,7 @@ class OutlookLocalProvider(ProviderBase):
         imap_server: str = "",
         imap_port: int | str = 993,
         token_endpoint: str = "",
+        fixed_account: dict | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -295,6 +395,7 @@ class OutlookLocalProvider(ProviderBase):
         except Exception:
             self._imap_port = 993
         self._token_endpoint = str(token_endpoint or "").strip()
+        self._fixed_account = dict(fixed_account or {}) if isinstance(fixed_account, dict) else None
         self._account: dict | None = None
         self._seen_ids: set[str] = set()
         self._oauth_access_token: str = ""
@@ -311,7 +412,9 @@ class OutlookLocalProvider(ProviderBase):
         )
 
     def create_email(self, config=None):
-        if self.fixed_email:
+        if self._fixed_account:
+            account = dict(self._fixed_account)
+        elif self.fixed_email:
             account = get_outlook_account_by_email(self.fixed_email)
         else:
             account = take_outlook_account(preferred_email=None)
@@ -331,6 +434,13 @@ class OutlookLocalProvider(ProviderBase):
             "email": str(account.get("email") or "").strip(),
             "token": f"local-outlook-{account.get('id')}",
             "service_id": str(account.get("id") or ""),
+            "account": {
+                "id": account.get("id"),
+                "email": str(account.get("email") or "").strip(),
+                "password": str(account.get("password") or "").strip(),
+                "client_id": str(account.get("client_id") or "").strip(),
+                "refresh_token": str(account.get("refresh_token") or "").strip(),
+            },
         }
 
     def _token_endpoints(self) -> list[str]:
@@ -378,7 +488,14 @@ class OutlookLocalProvider(ProviderBase):
             if scope:
                 payload["scope"] = scope
             try:
-                response = requests.post(endpoint, data=payload, proxies=self.proxies, timeout=20)
+                response = tracked_request(
+                    requests.request,
+                    "POST",
+                    endpoint,
+                    data=payload,
+                    proxies=self.proxies,
+                    timeout=20,
+                )
                 if response.status_code >= 400:
                     continue
                 data = response.json() if response.content else {}
@@ -457,6 +574,12 @@ class OutlookLocalProvider(ProviderBase):
                 decoded.append(str(part))
         return "".join(decoded)
 
+    def _message_sent_at(self, message) -> float | None:
+        try:
+            return parsedate_to_datetime(message.get("Date") or "").timestamp()
+        except Exception:
+            return None
+
     def _extract_message_text(self, message) -> str:
         subject = self._decode_header_value(message.get("Subject", ""))
         body_chunks: list[str] = []
@@ -503,9 +626,8 @@ class OutlookLocalProvider(ProviderBase):
     def _is_recent_message(self, message, otp_sent_at) -> bool:
         if not otp_sent_at:
             return True
-        try:
-            sent_at = parsedate_to_datetime(message.get("Date") or "").timestamp()
-        except Exception:
+        sent_at = self._message_sent_at(message)
+        if sent_at is None:
             return True
         return sent_at + 300 >= float(otp_sent_at)
 
@@ -539,12 +661,14 @@ class OutlookLocalProvider(ProviderBase):
         if not self._account:
             raise RuntimeError("本地微软邮箱尚未创建")
 
+        interrupt_check = kwargs.get("interrupt_check")
         exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         conn = None
 
         try:
             while time.monotonic() < deadline:
+                self._interrupt(interrupt_check)
                 try:
                     if conn is None:
                         conn = self._open_imap()
@@ -559,11 +683,12 @@ class OutlookLocalProvider(ProviderBase):
                             conn = self._open_imap()
                 except Exception:
                     conn = None
-                    time.sleep(5)
+                    self._sleep_interruptibly(1, interrupt_check)
                     continue
 
                 try:
                     for mailbox in self._mailboxes:
+                        self._interrupt(interrupt_check)
                         if not self._select_mailbox(conn, mailbox):
                             continue
                         status, data = conn.uid("search", None, "ALL")
@@ -590,15 +715,28 @@ class OutlookLocalProvider(ProviderBase):
                                 continue
                             msg = message_from_bytes(raw, policy=email_default_policy)
                             subject = self._decode_header_value(msg.get("Subject", ""))
+                            sent_at = self._message_sent_at(msg)
                             if not self._is_recent_message(msg, otp_sent_at):
+                                preview = self._subject_preview(subject)
+                                sent_label = (
+                                    f" ({time.strftime('%H:%M:%S', time.localtime(sent_at))})"
+                                    if sent_at
+                                    else ""
+                                )
+                                self._log(f"[OutlookLocal] 跳过旧邮件: {preview}{sent_label}")
                                 continue
                             text = self._extract_message_text(msg)
                             code = self._extract_code(text)
+                            if code:
+                                self._log(
+                                    f"[OutlookLocal] 扫描到验证码: mailbox={mailbox} "
+                                    f"subject={self._subject_preview(subject)} code={code}"
+                                )
                             if code and code not in exclude_codes:
-                                self._log(f"[OutlookLocal] 在 {mailbox} 收到验证码邮件: {self._subject_preview(subject)}")
+                                self._log(f"[OutlookLocal] 命中新验证码: {code}")
                                 return code
                             if code and code in exclude_codes:
-                                self._log(f"[OutlookLocal] 在 {mailbox} 收到重复验证码，继续等待")
+                                self._log(f"[OutlookLocal] 跳过旧验证码: {code}")
                                 continue
                             lowered = text.lower()
                             subject_lower = subject.lower()
@@ -612,7 +750,7 @@ class OutlookLocalProvider(ProviderBase):
                     except Exception:
                         pass
                     conn = None
-                time.sleep(5)
+                self._sleep_interruptibly(1, interrupt_check)
         finally:
             try:
                 if conn:
@@ -646,6 +784,7 @@ def build_mail_provider(
             project_code="openai",
             email_type=str(config.get("luckmail_email_type") or ""),
             domain=str(config.get("luckmail_domain") or ""),
+            fixed_account=(config.get("retry_email_binding") if isinstance(config.get("retry_email_binding"), dict) else None),
             proxy=proxy,
             log_fn=log_fn,
             fixed_email=fixed_email,
@@ -655,6 +794,7 @@ def build_mail_provider(
             imap_server=str(config.get("outlook_imap_server") or ""),
             imap_port=config.get("outlook_imap_port") or 993,
             token_endpoint=str(config.get("outlook_token_endpoint") or ""),
+            fixed_account=(config.get("retry_email_binding") if isinstance(config.get("retry_email_binding"), dict) else None),
             proxy=proxy,
             log_fn=log_fn,
             fixed_email=fixed_email,

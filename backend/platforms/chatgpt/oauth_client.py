@@ -8,7 +8,7 @@ import uuid
 import json
 import random
 from urllib.parse import urlparse, parse_qs
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, instrument_session_proxy_requests, isolate_proxy_session
 from core.task_runtime import TaskInterruption
 
 try:
@@ -64,9 +64,11 @@ class OAuthClient:
         self.ua = ""
         self.sec_ch_ua = ""
         self.impersonate = ""
+        self._proxy_rotate_count = 0
 
         # 创建 session
         self.session = curl_requests.Session()
+        instrument_session_proxy_requests(self.session, proxy_url=self.proxy)
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
 
@@ -82,6 +84,7 @@ class OAuthClient:
         """承接前序浏览器上下文，延续已建立的 cookie / session。"""
         if session is not None:
             self.session = session
+            instrument_session_proxy_requests(self.session, proxy_url=self.proxy)
 
         if self.proxy:
             try:
@@ -139,6 +142,117 @@ class OAuthClient:
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    @staticmethod
+    def _is_transient_network_error(message: str) -> bool:
+        text = str(message or "").lower()
+        markers = (
+            "curl: (35)",
+            "tls connect error",
+            "ssl",
+            "connection closed",
+            "err_connection_closed",
+            "connection reset",
+            "connection aborted",
+            "proxy error",
+            "eof occurred",
+            "timed out",
+            "timeout",
+            "handshake",
+        )
+        return any(marker in text for marker in markers)
+
+    def _rotate_proxy_session(self, *, reason: str = "") -> None:
+        rotated = isolate_proxy_session(
+            self.proxy,
+            scope=f"{self.device_id}:{reason}:{self._proxy_rotate_count}:{time.time_ns()}",
+        )
+        self._proxy_rotate_count += 1
+        if rotated and rotated != self.proxy:
+            self.proxy = rotated
+
+    def _recreate_session(self):
+        """重新创建会话容器。"""
+        old_headers = {}
+        try:
+            old_headers = dict(getattr(self.session, "headers", {}) or {})
+        except Exception:
+            old_headers = {}
+
+        try:
+            if self.impersonate:
+                self.session = curl_requests.Session(impersonate=self.impersonate)
+            else:
+                self.session = curl_requests.Session()
+        except TypeError:
+            self.session = curl_requests.Session()
+        instrument_session_proxy_requests(self.session, proxy_url=self.proxy)
+
+        if self.proxy:
+            self.session.proxies = build_requests_proxy_config(self.proxy)
+        if old_headers:
+            try:
+                self.session.headers.update(old_headers)
+            except Exception:
+                pass
+        if self.device_id:
+            try:
+                seed_oai_device_cookie(self.session, self.device_id)
+            except Exception:
+                pass
+
+    def _get_sentinel_token_with_retry(
+        self,
+        *,
+        flow: str,
+        device_id: str,
+        page_urls: list[str],
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        log_prefix: str = "",
+        browser_first: bool = True,
+    ) -> str | None:
+        for attempt in range(2):
+            page_url = ""
+            for candidate in page_urls:
+                candidate = str(candidate or "").strip()
+                if candidate:
+                    page_url = candidate
+                    break
+            token = None
+            browser_failed = False
+            if browser_first:
+                token = get_sentinel_token_via_browser(
+                    flow=flow,
+                    proxy=self.proxy,
+                    page_url=page_url,
+                    headless=self.browser_mode != "headed",
+                    device_id=device_id,
+                    log_fn=lambda msg: self._log(f"{log_prefix}{msg}"),
+                )
+                if token:
+                    self._log(f"{log_prefix}已通过 Playwright SentinelSDK 获取 token")
+                    return token
+                browser_failed = True
+
+            token = build_sentinel_token(
+                self.session,
+                device_id,
+                flow=flow,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            if token:
+                self._log(f"{log_prefix}已通过 HTTP PoW 获取 token")
+                return token
+
+            if attempt < 1:
+                if browser_failed:
+                    self._log(f"{log_prefix}sentinel 获取失败，准备重试")
+                time.sleep(1.0)
+        return None
 
     @staticmethod
     def _random_chrome_fingerprint():
@@ -554,87 +668,113 @@ class OAuthClient:
         impersonate=None,
     ):
         """启动 OAuth 会话，确保 auth 域上的 login_session 已建立。"""
-        if device_id:
-            seed_oai_device_cookie(self.session, device_id)
+        last_authorize_final_url = ""
+        for attempt in range(3):
+            if device_id:
+                seed_oai_device_cookie(self.session, device_id)
+            if attempt > 0:
+                self._log(f"Bootstrap 重试 {attempt + 1}/3")
+                self._rotate_proxy_session(reason="oauth_bootstrap")
+                self._recreate_session()
+                if device_id:
+                    seed_oai_device_cookie(self.session, device_id)
 
-        has_login_session = False
-        authorize_final_url = ""
+            has_login_session = False
+            authorize_final_url = ""
+            authorize_error = ""
+            oauth2_error = ""
 
-        try:
-            headers = self._headers(
-                authorize_url,
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                referer="https://chatgpt.com/",
-                navigation=True,
-            )
-            kwargs = {
-                "params": authorize_params,
-                "headers": headers,
-                "allow_redirects": True,
-                "timeout": 30,
-            }
-            if impersonate:
-                kwargs["impersonate"] = impersonate
-
-            self._browser_pause()
-            r = self.session.get(authorize_url, **kwargs)
-            authorize_final_url = str(r.url)
-            redirects = len(getattr(r, "history", []) or [])
-            self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
-
-            has_login_session = any(
-                (cookie.name if hasattr(cookie, "name") else str(cookie))
-                == "login_session"
-                for cookie in self.session.cookies
-            )
-            self._log(f"login_session: {'已获取' if has_login_session else '未获取'}")
-        except Exception as e:
-            self._log(f"/oauth/authorize 异常: {e}")
-
-        if has_login_session:
-            return authorize_final_url
-
-        self._log("未获取到 login_session，尝试 /api/oauth/oauth2/auth...")
-        try:
-            oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
-            kwargs = {
-                "params": authorize_params,
-                "headers": self._headers(
-                    oauth2_url,
+            try:
+                headers = self._headers(
+                    authorize_url,
                     user_agent=user_agent,
                     sec_ch_ua=sec_ch_ua,
                     accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     referer="https://chatgpt.com/",
                     navigation=True,
-                ),
-                "allow_redirects": True,
-                "timeout": 30,
-            }
-            if impersonate:
-                kwargs["impersonate"] = impersonate
+                )
+                kwargs = {
+                    "params": authorize_params,
+                    "headers": headers,
+                    "allow_redirects": True,
+                    "timeout": 30,
+                }
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
 
-            self._browser_pause()
-            r2 = self.session.get(oauth2_url, **kwargs)
-            authorize_final_url = str(r2.url)
-            redirects2 = len(getattr(r2, "history", []) or [])
-            self._log(
-                f"/api/oauth/oauth2/auth -> {r2.status_code}, redirects={redirects2}"
-            )
+                self._browser_pause()
+                r = self.session.get(authorize_url, **kwargs)
+                authorize_final_url = str(r.url)
+                redirects = len(getattr(r, "history", []) or [])
+                self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
 
-            has_login_session = any(
-                (cookie.name if hasattr(cookie, "name") else str(cookie))
-                == "login_session"
-                for cookie in self.session.cookies
-            )
-            self._log(
-                f"login_session(重试): {'已获取' if has_login_session else '未获取'}"
-            )
-        except Exception as e:
-            self._log(f"/api/oauth/oauth2/auth 异常: {e}")
+                has_login_session = any(
+                    (cookie.name if hasattr(cookie, "name") else str(cookie))
+                    == "login_session"
+                    for cookie in self.session.cookies
+                )
+                self._log(f"login_session: {'已获取' if has_login_session else '未获取'}")
+            except Exception as e:
+                authorize_error = str(e)
+                self._log(f"/oauth/authorize 异常: {e}")
 
-        return authorize_final_url
+            if has_login_session:
+                return authorize_final_url
+
+            self._log("未获取到 login_session，尝试 /api/oauth/oauth2/auth...")
+            try:
+                oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
+                kwargs = {
+                    "params": authorize_params,
+                    "headers": self._headers(
+                        oauth2_url,
+                        user_agent=user_agent,
+                        sec_ch_ua=sec_ch_ua,
+                        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        referer="https://chatgpt.com/",
+                        navigation=True,
+                    ),
+                    "allow_redirects": True,
+                    "timeout": 30,
+                }
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+
+                self._browser_pause()
+                r2 = self.session.get(oauth2_url, **kwargs)
+                authorize_final_url = str(r2.url)
+                redirects2 = len(getattr(r2, "history", []) or [])
+                self._log(
+                    f"/api/oauth/oauth2/auth -> {r2.status_code}, redirects={redirects2}"
+                )
+
+                has_login_session = any(
+                    (cookie.name if hasattr(cookie, "name") else str(cookie))
+                    == "login_session"
+                    for cookie in self.session.cookies
+                )
+                self._log(
+                    f"login_session(重试): {'已获取' if has_login_session else '未获取'}"
+                )
+            except Exception as e:
+                oauth2_error = str(e)
+                self._log(f"/api/oauth/oauth2/auth 异常: {e}")
+
+            if has_login_session:
+                return authorize_final_url
+
+            last_authorize_final_url = authorize_final_url or last_authorize_final_url
+            combined_error = " | ".join(
+                item for item in [authorize_error, oauth2_error] if item
+            )
+            if attempt < 2 and self._is_transient_network_error(combined_error):
+                self._log("Bootstrap 网络异常，准备重试")
+                time.sleep(1.2 + attempt * 0.8)
+                continue
+
+            return authorize_final_url
+
+        return last_authorize_final_url
 
     def _bootstrap_chatgpt_entry(
         self,
@@ -781,30 +921,22 @@ class OAuthClient:
         self._log("步骤2: POST /api/accounts/authorize/continue")
 
         self._log(f"authorize_continue: device_id={device_id}")
-        sentinel_token = get_sentinel_token_via_browser(
+        sentinel_token = self._get_sentinel_token_with_retry(
             flow="authorize_continue",
-            proxy=self.proxy,
-            page_url=continue_referer or f"{self.oauth_issuer}/log-in",
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
+            page_urls=[
+                continue_referer or f"{self.oauth_issuer}/log-in",
+                authorize_url or f"{self.oauth_issuer}/create-account",
+                f"{self.oauth_issuer}/log-in",
+            ],
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            log_prefix="authorize_continue: ",
         )
-        if sentinel_token:
-            self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="authorize_continue",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_token:
-                self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
-            else:
-                self._set_error("无法获取 sentinel token (authorize_continue)")
-                return None
+        if not sentinel_token:
+            self._set_error("无法获取 sentinel token (authorize_continue)")
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
         headers = self._headers(
@@ -908,30 +1040,18 @@ class OAuthClient:
         self._log("步骤3: POST /api/accounts/password/verify")
 
         self._log(f"password_verify: device_id={device_id}")
-        sentinel_pwd = get_sentinel_token_via_browser(
+        sentinel_pwd = self._get_sentinel_token_with_retry(
             flow="password_verify",
-            proxy=self.proxy,
-            page_url=referer or f"{self.oauth_issuer}/log-in/password",
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"password_verify: {msg}"),
+            page_urls=[referer or f"{self.oauth_issuer}/log-in/password"],
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            log_prefix="password_verify: ",
         )
-        if sentinel_pwd:
-            self._log("password_verify: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_pwd = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="password_verify",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_pwd:
-                self._log("password_verify: 已通过 HTTP PoW 获取 token")
-            else:
-                self._set_error("无法获取 sentinel token (password_verify)")
-                return None
+        if not sentinel_pwd:
+            self._set_error("无法获取 sentinel token (password_verify)")
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
         headers = self._headers(
@@ -1072,27 +1192,15 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
 
-        sentinel_token = get_sentinel_token_via_browser(
+        sentinel_token = self._get_sentinel_token_with_retry(
             flow="username_password_create",
-            proxy=self.proxy,
-            page_url=referer or f"{self.oauth_issuer}/create-account/password",
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"username_password_create: {msg}"),
+            page_urls=[referer or f"{self.oauth_issuer}/create-account/password"],
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            log_prefix="username_password_create: ",
         )
-        if sentinel_token:
-            self._log("username_password_create: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="username_password_create",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_token:
-                self._log("username_password_create: 已通过 HTTP PoW 获取 token")
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
 
@@ -1628,12 +1736,6 @@ class OAuthClient:
         except Exception as e:
             self._set_error(f"about_you 提交异常: {e}")
             return None
-
-    def _recreate_session(self):
-        """重新创建会话容器。"""
-        self.session = curl_requests.Session()
-        if self.proxy:
-            self.session.proxies = build_requests_proxy_config(self.proxy)
 
     def login_and_get_tokens(
         self,
@@ -3026,29 +3128,17 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/email-verification"
         )
-        sentinel_otp = get_sentinel_token_via_browser(
+        sentinel_otp = self._get_sentinel_token_with_retry(
             flow="email_otp_validate",
-            proxy=self.proxy,
-            page_url=otp_referer,
-            headless=self.browser_mode != "headed",
             device_id=device_id,
-            log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
+            page_urls=[otp_referer, f"{self.oauth_issuer}/email-verification"],
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            log_prefix="email_otp_validate: ",
         )
-        if sentinel_otp:
-            self._log("email_otp_validate: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_otp = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="email_otp_validate",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_otp:
-                self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
-            else:
-                self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
+        if not sentinel_otp:
+            self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
 
         def _build_otp_headers():
             extra_headers = {
