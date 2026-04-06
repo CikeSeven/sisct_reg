@@ -314,6 +314,11 @@ function isActiveAccountStatus(status: string) {
   return ['registering', 'running'].includes(String(status || '').toLowerCase())
 }
 
+function canStopAccount(item: AccountItem) {
+  const status = String(item.status || '').toLowerCase()
+  return ['pending', 'registering', 'running'].includes(status) && Boolean(item.action_task_id || item.task_id)
+}
+
 function getAccountStatusRank(status: string) {
   const value = String(status || '').toLowerCase()
   if (value === 'registering' || value === 'running') return 0
@@ -1237,7 +1242,7 @@ export default function App() {
   async function stopAccount(item: AccountItem) {
     const actionTaskId = item.action_task_id || item.task_id
     const actionAttemptIndex = Number(item.action_attempt_index || item.attempt_index || 0)
-    if (!actionTaskId || actionAttemptIndex <= 0 || !isActiveAccountStatus(item.status)) return
+    if (!actionTaskId || actionAttemptIndex <= 0 || !canStopAccount(item)) return
     const accountKey = getAccountKey(item)
     setStoppingAccountKeys((prev) => (prev.includes(accountKey) ? prev : [...prev, accountKey]))
     setError('')
@@ -1779,7 +1784,7 @@ export default function App() {
                       </button>
                     </div>
                     <div className="account-side">
-                      {isActiveAccountStatus(item.status) ? (
+                      {canStopAccount(item) ? (
                         <button
                           className="tiny-action-btn warning"
                           type="button"

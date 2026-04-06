@@ -130,6 +130,18 @@ class TaskExecutionState:
             self.active_indexes.discard(int(attempt_index))
             self.condition.notify_all()
 
+    def cancel_pending_attempt(self, attempt_index: int) -> QueuedAttempt | None:
+        with self.condition:
+            target_index = int(attempt_index)
+            for idx, item in enumerate(self.pending_attempts):
+                if int(item.attempt_index) != target_index:
+                    continue
+                removed = self.pending_attempts.pop(idx)
+                self.queued_indexes.discard(target_index)
+                self.condition.notify_all()
+                return removed
+        return None
+
     def snapshot_counts(self) -> tuple[int, int, int, int]:
         with self.lock:
             return self.completed, self.success, self.failed, self.skipped
@@ -571,7 +583,7 @@ class RegistrationManager:
     def _build_db_accounts(self, task_id: str, *, request_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         request_payload = request_payload or {}
         task_row = get_task_run(task_id) or {}
-        task_status = str(task_row.get("status") or "")
+        task_status = str(task_row.get("status") or "").strip().lower()
         task_total = int(task_row.get("total") or request_payload.get("count") or 0)
         mail_provider = str(
             request_payload.get("mail_provider")
@@ -688,6 +700,8 @@ class RegistrationManager:
                     break
             persisted_status = str(persisted_state.get("status") or "").strip()
             item_status = persisted_status or fallback_status
+            if task_status in {"stopped", "failed", "done"} and item_status in {"pending", "registering", "running"}:
+                item_status = "stopped" if task_status == "stopped" else ("failed" if task_status == "failed" else "stopped")
             persisted_error = str(persisted_state.get("error") or "").strip()
             items.append(
                 {
@@ -767,6 +781,32 @@ class RegistrationManager:
         with self._lock:
             self._task_accounts.pop(task_id, None)
 
+    def _finalize_incomplete_accounts(
+        self,
+        task_id: str,
+        *,
+        final_status: str,
+        error_message: str = "",
+    ) -> None:
+        request_payload = (get_task_run(task_id) or {}).get("request_json") or {}
+        accounts = self._merged_accounts_snapshot(task_id, request_payload=request_payload)
+        terminal_status = "failed" if str(final_status or "").strip().lower() == "failed" else "stopped"
+        terminal_error = str(error_message or "").strip()
+        for item in accounts:
+            current_status = str(item.get("status") or "").strip().lower()
+            if current_status not in {"pending", "registering", "running"}:
+                continue
+            attempt_index = int(item.get("attempt_index") or 0)
+            if attempt_index <= 0:
+                continue
+            self._upsert_task_account(
+                task_id,
+                attempt_index,
+                email=str(item.get("email") or ""),
+                status=terminal_status,
+                error=terminal_error,
+            )
+
     def _log(self, task_id: str, message: str, *, level: str = "info", attempt_index: int | None = None) -> None:
         import re
 
@@ -797,7 +837,9 @@ class RegistrationManager:
         request_payload = db_task.get("request_json") or {} if db_task is not None else {}
         source = str(request_payload.get("source") or "manual")
         meta = request_payload.get("meta") if isinstance(request_payload.get("meta"), dict) else {}
-        if self._task_store.exists(task_id):
+        db_status = str((db_task or {}).get("status") or "").strip().lower()
+        record_is_active = self._task_store.exists(task_id) and db_status not in {"done", "failed", "stopped"}
+        if record_is_active:
             snapshot = self._task_store.snapshot(task_id)
             if db_task is not None:
                 snapshot['progress'] = db_task.get('progress') or snapshot.get('progress')
@@ -1431,7 +1473,34 @@ class RegistrationManager:
         )
         if target is None:
             return {"ok": False, "reason": "account_not_found"}
-        if str(target.get("status") or "") not in {"registering", "running"}:
+        target_status = str(target.get("status") or "").strip().lower()
+        if target_status == "pending":
+            state = self._get_task_execution_state(task_id)
+            if state is None:
+                return {"ok": False, "reason": "account_not_running"}
+            removed = state.cancel_pending_attempt(int(attempt_index))
+            if removed is None:
+                return {"ok": False, "reason": "account_not_running"}
+            message = "当前账号已手动停止"
+            insert_task_result(
+                task_id,
+                attempt_index=int(attempt_index),
+                status="stopped",
+                email=str(target.get("email") or ""),
+                error=message,
+            )
+            self._upsert_task_account(
+                task_id,
+                int(attempt_index),
+                email=str(target.get("email") or ""),
+                status="stopped",
+                error=message,
+            )
+            state.apply_outcome(AttemptOutcome.STOPPED)
+            self._sync_task_progress(task_id, state)
+            self._log(task_id, f"[STOP] 已停止等待中的账号", attempt_index=int(attempt_index))
+            return {"ok": True, "control": {"pending_stopped": True}}
+        if target_status not in {"registering", "running"}:
             return {"ok": False, "reason": "account_not_running"}
         control = self._task_store.request_stop_attempt(task_id, int(attempt_index))
         if control is None:
@@ -1509,6 +1578,7 @@ class RegistrationManager:
                 summary_json={"success": success, "failed": failed, "skipped": skipped, "total": req.count},
             )
             self._task_store.finish(task_id, status="stopped", success=success, skipped=skipped, errors=[str(exc)], error=str(exc))
+            self._finalize_incomplete_accounts(task_id, final_status="stopped", error_message=str(exc))
             self._set_task_execution_state(task_id, None)
             self._task_store.cleanup()
             return
@@ -1877,6 +1947,7 @@ class RegistrationManager:
                 summary_json={"success": success, "failed": failed or len(errors), "skipped": skipped},
             )
             self._task_store.finish(task_id, status="failed", success=success, skipped=skipped, errors=errors, error=str(exc))
+            self._finalize_incomplete_accounts(task_id, final_status="failed", error_message=str(exc))
             self._set_task_execution_state(task_id, None)
             self._task_store.cleanup()
             return
@@ -1901,6 +1972,11 @@ class RegistrationManager:
             summary_json=summary,
         )
         self._task_store.finish(task_id, status=final_status, success=success, skipped=skipped, errors=errors)
+        self._finalize_incomplete_accounts(
+            task_id,
+            final_status=final_status,
+            error_message=("任务已停止" if final_status == "stopped" else ""),
+        )
         self._set_task_execution_state(task_id, None)
         self._task_store.cleanup()
 
