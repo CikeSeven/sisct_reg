@@ -400,6 +400,7 @@ class OutlookLocalProvider(ProviderBase):
         self._seen_ids: set[str] = set()
         self._oauth_access_token: str = ""
         self._oauth_access_token_expires_at: float = 0.0
+        self._last_oauth_error: str = ""
         self._mailboxes = (
             "INBOX",
             "Junk",
@@ -461,32 +462,59 @@ class OutlookLocalProvider(ProviderBase):
                 "https://login.microsoftonline.com/common/oauth2/v2.0/token",
             ]
 
-    def _fetch_oauth_token(self, *, email: str, client_id: str, refresh_token: str) -> str:
+    def _fetch_oauth_token(
+        self,
+        *,
+        email: str,
+        client_id: str,
+        refresh_token: str,
+        force_refresh: bool = False,
+    ) -> str:
         if not client_id or not refresh_token:
+            self._last_oauth_error = "缺少 client_id 或 refresh_token"
             return ""
 
         now = time.time()
+        if force_refresh:
+            self._oauth_access_token = ""
+            self._oauth_access_token_expires_at = 0.0
         if self._oauth_access_token and now < max(0.0, self._oauth_access_token_expires_at - 120):
             return self._oauth_access_token
 
-        scope = ""
         try:
             from platforms.chatgpt.constants import MICROSOFT_SCOPES
 
-            scope = str(MICROSOFT_SCOPES.get("IMAP_NEW") or "").strip()
+            imap_scope = str(MICROSOFT_SCOPES.get("IMAP_NEW") or "").strip()
         except Exception:
-            scope = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+            imap_scope = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 
+        attempts: list[tuple[str, dict[str, str], str]] = []
         for endpoint in self._token_endpoints():
             if not endpoint:
                 continue
+            endpoint_lower = endpoint.lower()
+            if "login.live.com" in endpoint_lower:
+                attempts.append((endpoint, {"scope": "wl.imap wl.offline_access"}, "live_wl_imap"))
+                attempts.append((endpoint, {}, "live_default"))
+                continue
+            if imap_scope:
+                attempts.append((endpoint, {"scope": imap_scope}, "imap_scope"))
+            attempts.append((endpoint, {}, "default"))
+
+        self._last_oauth_error = ""
+        seen_keys: set[tuple[str, str]] = set()
+        for endpoint, extra_payload, label in attempts:
+            cache_key = (endpoint, label)
+            if cache_key in seen_keys:
+                continue
+            seen_keys.add(cache_key)
             payload = {
                 "client_id": client_id,
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
+                **extra_payload,
             }
-            if scope:
-                payload["scope"] = scope
+            self._log(f"[OutlookLocal] 刷新 access token: mode={label} endpoint={endpoint}")
             try:
                 response = tracked_request(
                     requests.request,
@@ -496,26 +524,74 @@ class OutlookLocalProvider(ProviderBase):
                     proxies=self.proxies,
                     timeout=20,
                 )
-                if response.status_code >= 400:
-                    continue
-                data = response.json() if response.content else {}
-                access_token = str(data.get("access_token") or "").strip()
-                if access_token:
-                    try:
-                        expires_in = int(data.get("expires_in") or 3600)
-                    except Exception:
-                        expires_in = 3600
-                    self._oauth_access_token = access_token
-                    self._oauth_access_token_expires_at = time.time() + max(300, expires_in)
-                    self._log(f"[OutlookLocal] 微软 access token 获取成功: {email}")
-                    return access_token
-            except Exception:
+            except Exception as exc:
+                self._last_oauth_error = str(exc) or "请求失败"
+                self._log(f"[OutlookLocal] access token 请求失败: mode={label} error={self._last_oauth_error}")
                 continue
+
+            body_preview = (response.text or "").strip().replace("\n", " ")[:220]
+            if response.status_code >= 400:
+                self._last_oauth_error = f"HTTP {response.status_code}: {body_preview or 'empty response'}"
+                self._log(f"[OutlookLocal] access token 刷新失败: mode={label} {self._last_oauth_error}")
+                continue
+
+            try:
+                data = response.json() if response.content else {}
+            except Exception:
+                data = {}
+            access_token = str(data.get("access_token") or "").strip()
+            if access_token:
+                try:
+                    expires_in = int(data.get("expires_in") or 3600)
+                except Exception:
+                    expires_in = 3600
+                self._oauth_access_token = access_token
+                self._oauth_access_token_expires_at = time.time() + max(300, expires_in)
+                self._last_oauth_error = ""
+                self._log(f"[OutlookLocal] 微软 access token 获取成功: {email} mode={label}")
+                return access_token
+
+            error_desc = str(data.get("error_description") or data.get("error") or body_preview or "empty response").strip()
+            self._last_oauth_error = error_desc
+            self._log(f"[OutlookLocal] access token 返回为空: mode={label} detail={error_desc}")
         return ""
 
     def _imap_auth_oauth(self, conn: imaplib.IMAP4_SSL, *, email: str, access_token: str) -> None:
         auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
         conn.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
+
+    @staticmethod
+    def _is_fatal_mail_auth_error(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        fatal_markers = (
+            "basicauthblocked",
+            "authenticate failed",
+            "logondenied",
+            "login failed",
+            "oauth 刷新失败",
+            "outlook oauth imap 登录失败",
+            "invalid_grant",
+            "interaction_required",
+            "unauthorized_client",
+            "aadsts",
+            "authfailed",
+            "xoauth2",
+        )
+        return any(marker in lowered for marker in fatal_markers)
+
+    @staticmethod
+    def _should_retry_with_fresh_oauth_token(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        markers = (
+            "authenticate failed",
+            "authfailed",
+            "invalid token",
+            "expired",
+            "expiredtoken",
+            "oauthbearer",
+            "xoauth2",
+        )
+        return any(marker in lowered for marker in markers)
 
     def _open_imap(self) -> imaplib.IMAP4_SSL:
         if not self._account:
@@ -525,33 +601,59 @@ class OutlookLocalProvider(ProviderBase):
         password = str(self._account.get("password") or "").strip()
         client_id = str(self._account.get("client_id") or "").strip()
         refresh_token = str(self._account.get("refresh_token") or "").strip()
-        access_token = self._fetch_oauth_token(email=email_addr, client_id=client_id, refresh_token=refresh_token)
+        has_oauth = bool(client_id and refresh_token)
 
         last_error: Exception | None = None
-        for host in self._imap_servers:
-            if access_token:
-                conn: imaplib.IMAP4_SSL | None = None
-                try:
-                    conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
-                    self._imap_auth_oauth(conn, email=email_addr, access_token=access_token)
-                    return conn
-                except Exception as exc:
-                    last_error = exc
-                    self._oauth_access_token = ""
-                    self._oauth_access_token_expires_at = 0.0
+        if has_oauth:
+            access_token = self._fetch_oauth_token(email=email_addr, client_id=client_id, refresh_token=refresh_token)
+            if not access_token:
+                raise RuntimeError(f"微软 OAuth 刷新失败: {self._last_oauth_error or '未返回 access token'}")
+
+            for host in self._imap_servers:
+                refreshed_once = False
+                while True:
+                    conn: imaplib.IMAP4_SSL | None = None
                     try:
-                        if conn:
-                            conn.logout()
-                    except Exception:
-                        pass
-            if password:
+                        self._log(f"[OutlookLocal] 尝试 OAuth IMAP 登录: host={host} email={email_addr}")
+                        conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                        self._imap_auth_oauth(conn, email=email_addr, access_token=access_token)
+                        self._log(f"[OutlookLocal] OAuth IMAP 登录成功: host={host} email={email_addr}")
+                        return conn
+                    except Exception as exc:
+                        last_error = exc
+                        error_text = str(exc)
+                        self._log(f"[OutlookLocal] OAuth IMAP 登录失败: host={host} error={error_text}")
+                        try:
+                            if conn:
+                                conn.logout()
+                        except Exception:
+                            pass
+                        if (not refreshed_once) and self._should_retry_with_fresh_oauth_token(error_text):
+                            refreshed_once = True
+                            access_token = self._fetch_oauth_token(
+                                email=email_addr,
+                                client_id=client_id,
+                                refresh_token=refresh_token,
+                                force_refresh=True,
+                            )
+                            if access_token:
+                                self._log(f"[OutlookLocal] 已刷新 access token，重试 OAuth IMAP 登录: host={host}")
+                                continue
+                        break
+            raise RuntimeError(f"Outlook OAuth IMAP 登录失败: {last_error}")
+
+        if password:
+            for host in self._imap_servers:
                 conn = None
                 try:
+                    self._log(f"[OutlookLocal] 尝试密码 IMAP 登录: host={host} email={email_addr}")
                     conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
                     conn.login(email_addr, password)
+                    self._log(f"[OutlookLocal] 密码 IMAP 登录成功: host={host} email={email_addr}")
                     return conn
                 except Exception as exc:
                     last_error = exc
+                    self._log(f"[OutlookLocal] 密码 IMAP 登录失败: host={host} error={exc}")
                     try:
                         if conn:
                             conn.logout()
@@ -657,6 +759,70 @@ class OutlookLocalProvider(ProviderBase):
                 pass
         return seen
 
+    def _log_recent_code_snapshot(
+        self,
+        conn: imaplib.IMAP4_SSL | None,
+        *,
+        exclude_codes: set[str],
+        otp_sent_at=None,
+        limit: int = 8,
+    ) -> None:
+        created_conn = False
+        seen_logs = 0
+        try:
+            if conn is None:
+                conn = self._open_imap()
+                created_conn = True
+            for mailbox in self._mailboxes:
+                if not self._select_mailbox(conn, mailbox):
+                    continue
+                status, data = conn.uid("search", None, "ALL")
+                if status != "OK":
+                    continue
+                ids = data[0].split() if data and data[0] else []
+                if not ids:
+                    continue
+                for uid in reversed(ids[-max(int(limit or 0), 1):]):
+                    uid_text = uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid)
+                    if not uid_text:
+                        continue
+                    status, msg_data = conn.uid("fetch", uid, "(RFC822)")
+                    if status != "OK":
+                        continue
+                    raw = None
+                    for item in msg_data or []:
+                        if isinstance(item, tuple) and item[1]:
+                            raw = item[1]
+                            break
+                    if not raw:
+                        continue
+                    msg = message_from_bytes(raw, policy=email_default_policy)
+                    subject = self._decode_header_value(msg.get("Subject", ""))
+                    if not self._is_recent_message(msg, otp_sent_at):
+                        continue
+                    text = self._extract_message_text(msg)
+                    code = self._extract_code(text)
+                    if not code:
+                        continue
+                    status_text = "已尝试" if code in exclude_codes else "未使用"
+                    self._log(
+                        f"[OutlookLocal] 最近验证码: mailbox={mailbox} "
+                        f"subject={self._subject_preview(subject)} code={code} status={status_text}"
+                    )
+                    seen_logs += 1
+                    if seen_logs >= max(int(limit or 0), 1):
+                        return
+        except Exception as exc:
+            self._log(f"[OutlookLocal] 最近验证码回溯失败: {exc}")
+        finally:
+            if created_conn:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        if seen_logs == 0:
+            self._log("[OutlookLocal] 最近未发现可提取的验证码")
+
     def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
         if not self._account:
             raise RuntimeError("本地微软邮箱尚未创建")
@@ -665,6 +831,7 @@ class OutlookLocalProvider(ProviderBase):
         exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         conn = None
+        auth_failure_count = 0
 
         try:
             while time.monotonic() < deadline:
@@ -681,8 +848,16 @@ class OutlookLocalProvider(ProviderBase):
                             except Exception:
                                 pass
                             conn = self._open_imap()
-                except Exception:
+                    auth_failure_count = 0
+                except Exception as exc:
                     conn = None
+                    auth_failure_count += 1
+                    error_text = str(exc)
+                    self._log(f"[OutlookLocal] 打开 IMAP 失败: {error_text}")
+                    if self._is_fatal_mail_auth_error(error_text):
+                        raise RuntimeError(error_text)
+                    if auth_failure_count >= 3:
+                        raise RuntimeError(f"Outlook IMAP 连接连续失败: {error_text}")
                     self._sleep_interruptibly(1, interrupt_check)
                     continue
 
@@ -743,7 +918,11 @@ class OutlookLocalProvider(ProviderBase):
                             from_header = self._decode_header_value(msg.get("From", "")).lower()
                             if any(keyword in lowered or keyword in subject_lower or keyword in from_header for keyword in ("openai", "chatgpt", "verification code", "验证码")):
                                 self._log(f"[OutlookLocal] 在 {mailbox} 发现相关邮件但未提取到验证码: {self._subject_preview(subject)}")
-                except Exception:
+                except Exception as exc:
+                    error_text = str(exc)
+                    self._log(f"[OutlookLocal] 扫描邮箱失败: {error_text}")
+                    if self._is_fatal_mail_auth_error(error_text):
+                        raise RuntimeError(error_text)
                     try:
                         if conn:
                             conn.logout()
@@ -758,6 +937,7 @@ class OutlookLocalProvider(ProviderBase):
             except Exception:
                 pass
 
+        self._log_recent_code_snapshot(conn, exclude_codes=exclude_codes, otp_sent_at=otp_sent_at)
         raise TimeoutError(f"Outlook 本地邮箱等待验证码超时 ({timeout}s)")
 
 

@@ -352,42 +352,6 @@ export default function App() {
 
   const isRunning = activeTask ? Boolean(activeTask.is_active) && !['done', 'failed', 'stopped'].includes(activeTask.status) : false
 
-  const taskStats = useMemo(() => {
-    const summary = activeTask?.summary || {}
-    const accounts = activeTask?.accounts || []
-    let accountSuccess = 0
-    let accountFailed = 0
-    let accountSkipped = 0
-    let accountCompleted = 0
-
-    for (const item of accounts) {
-      const status = String(item.status || '').toLowerCase()
-      if (status === 'success') {
-        accountSuccess += 1
-        accountCompleted += 1
-      } else if (status === 'failed') {
-        accountFailed += 1
-        accountCompleted += 1
-      } else if (status === 'stopped' || status === 'skipped') {
-        accountSkipped += 1
-        accountCompleted += 1
-      }
-    }
-
-    const rawTotal = String(activeTask?.progress || '0/0').split('/')[1]
-    const parsedTotal = Number(rawTotal || 0)
-    const requestTotal = Number((activeTask?.request?.count as number | undefined) ?? 0)
-    const total = Math.max(parsedTotal || 0, requestTotal || 0, accounts.length)
-
-    return {
-      success: Math.max(Number(activeTask?.success ?? summary.success ?? 0), accountSuccess),
-      skipped: Math.max(Number(activeTask?.skipped ?? summary.skipped ?? 0), accountSkipped),
-      failed: Math.max(Number(activeTask?.failed ?? (summary as Record<string, unknown>).failed ?? activeTask?.errors?.length ?? 0), accountFailed),
-      completed: accountCompleted,
-      total,
-    }
-  }, [activeTask])
-
   const sortedAccounts = useMemo(() => {
     const merged = new Map<string, AccountItem>()
     const taskMap = new Map(taskSnapshots.map((item) => [item.id, item]))
@@ -517,6 +481,41 @@ export default function App() {
     })
     return items
   }, [taskSnapshots])
+
+  const taskStats = useMemo(() => {
+    const summary = activeTask?.summary || {}
+    let accountSuccess = 0
+    let accountFailed = 0
+    let accountSkipped = 0
+    let accountCompleted = 0
+
+    for (const item of sortedAccounts) {
+      const status = String(item.status || '').toLowerCase()
+      if (status === 'success') {
+        accountSuccess += 1
+        accountCompleted += 1
+      } else if (status === 'failed') {
+        accountFailed += 1
+        accountCompleted += 1
+      } else if (status === 'stopped' || status === 'skipped') {
+        accountSkipped += 1
+        accountCompleted += 1
+      }
+    }
+
+    const rawTotal = String(activeTask?.progress || '0/0').split('/')[1]
+    const parsedTotal = Number(rawTotal || 0)
+    const requestTotal = Number((activeTask?.request?.count as number | undefined) ?? 0)
+    const total = Math.max(parsedTotal || 0, requestTotal || 0, sortedAccounts.length)
+
+    return {
+      success: Math.max(Number(activeTask?.success ?? summary.success ?? 0), accountSuccess),
+      skipped: Math.max(Number(activeTask?.skipped ?? summary.skipped ?? 0), accountSkipped),
+      failed: Math.max(Number(activeTask?.failed ?? (summary as Record<string, unknown>).failed ?? activeTask?.errors?.length ?? 0), accountFailed),
+      completed: Math.max(accountCompleted, Math.min(total, accountSuccess + accountFailed + accountSkipped)),
+      total,
+    }
+  }, [activeTask, sortedAccounts])
 
   const totalAccountPages = useMemo(
     () => Math.max(1, Math.ceil(sortedAccounts.length / accountPageSize)),
