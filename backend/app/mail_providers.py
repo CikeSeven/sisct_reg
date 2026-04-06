@@ -610,6 +610,10 @@ class OutlookLocalProvider(ProviderBase):
         self._last_provider_errors: dict[str, str] = {}
         self._preferred_provider: str = ""
         self._strict_provider_lock = False
+        self._provider_health: dict[str, dict[str, float | int | str]] = {}
+        self._provider_failure_threshold = 2
+        self._provider_disable_seconds = 120
+        self._provider_permanent_disable_seconds = 1800
         self._provider_order_with_oauth = ("graph_api", "imap_old", "imap_new")
         self._provider_order_without_oauth = ("password_imap",)
         self._mailboxes = (
@@ -654,6 +658,54 @@ class OutlookLocalProvider(ProviderBase):
         self._preferred_provider = str(provider_name or "").strip()
         if strict:
             self._strict_provider_lock = True
+
+    def _provider_health_entry(self, provider_name: str) -> dict[str, float | int | str]:
+        return self._provider_health.setdefault(
+            str(provider_name or "").strip(),
+            {
+                "failures": 0,
+                "disabled_until": 0.0,
+                "last_error": "",
+                "disable_logged_until": 0.0,
+            },
+        )
+
+    def _is_provider_available(self, provider_name: str) -> bool:
+        entry = self._provider_health_entry(provider_name)
+        disabled_until = float(entry.get("disabled_until") or 0.0)
+        if disabled_until <= time.time():
+            if disabled_until > 0:
+                entry["disabled_until"] = 0.0
+                entry["failures"] = 0
+                entry["disable_logged_until"] = 0.0
+            return True
+        if float(entry.get("disable_logged_until") or 0.0) != disabled_until:
+            remaining = max(1, int(disabled_until - time.time()))
+            self._log(f"[OutlookLocal] provider 暂时禁用: provider={provider_name} remain={remaining}s")
+            entry["disable_logged_until"] = disabled_until
+        return False
+
+    def _record_provider_success(self, provider_name: str) -> None:
+        entry = self._provider_health_entry(provider_name)
+        entry["failures"] = 0
+        entry["disabled_until"] = 0.0
+        entry["last_error"] = ""
+        entry["disable_logged_until"] = 0.0
+
+    def _record_provider_failure(self, provider_name: str, error_text: str) -> None:
+        entry = self._provider_health_entry(provider_name)
+        entry["last_error"] = str(error_text or "")
+        is_permanent = self._is_service_abuse_error(error_text)
+        if is_permanent:
+            entry["failures"] = self._provider_failure_threshold
+            entry["disabled_until"] = time.time() + self._provider_permanent_disable_seconds
+            entry["disable_logged_until"] = 0.0
+            return
+        failures = int(entry.get("failures") or 0) + 1
+        entry["failures"] = failures
+        if failures >= self._provider_failure_threshold:
+            entry["disabled_until"] = time.time() + self._provider_disable_seconds
+            entry["disable_logged_until"] = 0.0
 
     def _preflight_oauth_mailbox(self) -> None:
         if not self._account:
@@ -891,6 +943,7 @@ class OutlookLocalProvider(ProviderBase):
             order = list(self._provider_order_with_oauth)
         else:
             order = list(self._provider_order_without_oauth)
+        order = [item for item in order if self._is_provider_available(item)]
         preferred = str(self._preferred_provider or "").strip()
         if preferred and preferred in order:
             if self._strict_provider_lock:
@@ -1386,17 +1439,23 @@ class OutlookLocalProvider(ProviderBase):
                         else:
                             code = self._scan_imap_for_code(provider_name, otp_sent_at=otp_sent_at, exclude_codes=exclude_codes)
                         poll_had_success = True
+                        self._record_provider_success(provider_name)
+                        self._lock_provider(provider_name, strict=True)
                         self._last_provider_errors.pop(provider_name, None)
                         if code:
                             return code
                     except Exception as exc:
                         error_text = str(exc)
                         self._last_provider_errors[provider_name] = error_text
+                        self._record_provider_failure(provider_name, error_text)
                         self._log(f"[OutlookLocal] provider 失败: provider={provider_name} error={error_text}")
                         if self._is_fatal_mail_auth_error(error_text):
                             fatal_errors.append(f"{provider_name}: {error_text}")
                         continue
 
+                if not current_order:
+                    self._sleep_interruptibly(1, interrupt_check)
+                    continue
                 if fatal_errors and len(fatal_errors) == len(current_order) and not poll_had_success:
                     raise RuntimeError(" ; ".join(fatal_errors))
                 self._sleep_interruptibly(1, interrupt_check)
