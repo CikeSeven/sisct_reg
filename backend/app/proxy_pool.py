@@ -57,7 +57,7 @@ def test_proxy_accounts():
     for item in items:
         tested += 1
         try:
-            ip, country = manager._query_egress_info(str(item.get("proxy_url") or ""))
+            ip, country = manager._query_egress_info(str(item.get("proxy_url") or ""), proxy_id=int(item.get("id") or 0))
             update_proxy_check_result(
                 int(item.get("id") or 0),
                 ok=True,
@@ -91,7 +91,7 @@ def test_proxy_account(proxy_id: int):
     if not proxy_url:
         raise HTTPException(400, "代理为空")
     try:
-        ip, country = manager._query_egress_info(proxy_url)
+        ip, country = manager._query_egress_info(proxy_url, proxy_id=int(item.get("id") or 0))
         update_proxy_check_result(
             int(item.get("id") or 0),
             ok=True,
