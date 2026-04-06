@@ -26,10 +26,16 @@ class UpdateConfigRequest(BaseModel):
     values: dict[str, Any] = Field(default_factory=dict)
 
 
+class DeleteAccountRef(BaseModel):
+    task_id: str
+    attempt_index: int = Field(ge=1)
+
+
 class DeleteAccountRequest(BaseModel):
     task_id: str
     attempt_index: int = Field(ge=1)
     task_ids: list[str] = Field(default_factory=list)
+    refs: list[DeleteAccountRef] = Field(default_factory=list)
 
 
 class DeleteAccountsBatchRequest(BaseModel):

@@ -9,6 +9,11 @@ type DeleteDialogState = {
   items: AccountItem[]
 } | null
 
+type TaskAttemptRef = {
+  task_id: string
+  attempt_index: number
+}
+
 type FormState = {
   count: number
   concurrency: number
@@ -34,6 +39,7 @@ type AccountItem = {
   action_task_id?: string
   action_attempt_index?: number
   task_ids?: string[]
+  task_refs?: TaskAttemptRef[]
   attempt_index: number
   email: string
   label: string
@@ -321,6 +327,7 @@ export default function App() {
           action_task_id: task.id,
           action_attempt_index: Number(account.attempt_index || 0),
           task_ids: [task.id],
+          task_refs: [{ task_id: task.id, attempt_index: Number(account.attempt_index || 0) }],
           attempt_index: baseAttemptIndex,
           created_at: Number(account.created_at || 0),
           updated_at: Number(account.updated_at || 0) || (taskSnapshots.length - taskIndex),
@@ -335,6 +342,13 @@ export default function App() {
         const currentLogs = Array.isArray(current.logs) ? current.logs : []
         const nextLogs = Array.isArray(normalized.logs) ? normalized.logs : []
         const taskIds = Array.from(new Set([...(current.task_ids || []), ...(normalized.task_ids || [])]))
+        const taskRefs = new Map<string, TaskAttemptRef>()
+        for (const ref of [...(current.task_refs || []), ...(normalized.task_refs || [])]) {
+          const refTaskId = String(ref?.task_id || '').trim()
+          const refAttemptIndex = Number(ref?.attempt_index || 0)
+          if (!refTaskId || refAttemptIndex <= 0) continue
+          taskRefs.set(`${refTaskId}:${refAttemptIndex}`, { task_id: refTaskId, attempt_index: refAttemptIndex })
+        }
 
         const shouldReplace =
           ['pending', 'registering', 'running'].includes(normalized.status) ||
@@ -351,12 +365,14 @@ export default function App() {
                 action_task_id: normalized.action_task_id,
                 action_attempt_index: normalized.action_attempt_index,
                 task_ids: taskIds,
+                task_refs: Array.from(taskRefs.values()),
                 attempt_index: baseAttemptIndex,
               }
             : {
                 ...current,
                 logs: [...currentLogs],
                 task_ids: taskIds,
+                task_refs: Array.from(taskRefs.values()),
                 retry_supported: Boolean(current.retry_supported || normalized.retry_supported),
                 updated_at: Math.max(Number(current.updated_at || 0), Number(normalized.updated_at || 0)),
               },
@@ -767,6 +783,7 @@ export default function App() {
           body: JSON.stringify({
             task_id: item.task_id,
             task_ids: item.task_ids || [],
+            refs: item.task_refs || [],
             attempt_index: item.attempt_index,
           }),
         })
@@ -777,6 +794,7 @@ export default function App() {
             items: targets.map((item) => ({
               task_id: item.task_id,
               task_ids: item.task_ids || [],
+              refs: item.task_refs || [],
               attempt_index: item.attempt_index,
             })),
           }),

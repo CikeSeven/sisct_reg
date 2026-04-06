@@ -125,7 +125,7 @@ def retry_register_attempt(task_id: str, attempt_index: int):
 
 @app.post("/api/register/accounts/delete")
 def delete_register_account(body: DeleteAccountRequest):
-    result = manager.delete_account(body.task_id, body.attempt_index, body.task_ids)
+    result = manager.delete_account(body.task_id, body.attempt_index, body.task_ids, body.refs)
     if not result.get("ok"):
         reason = str(result.get("reason") or "")
         if reason == "task_not_found":
@@ -143,7 +143,7 @@ def delete_register_accounts_batch(body: DeleteAccountsBatchRequest):
     deleted = 0
     skipped: list[dict[str, object]] = []
     for item in body.items:
-        result = manager.delete_account(item.task_id, item.attempt_index, item.task_ids)
+        result = manager.delete_account(item.task_id, item.attempt_index, item.task_ids, item.refs)
         if result.get("ok"):
             deleted += 1
         else:
