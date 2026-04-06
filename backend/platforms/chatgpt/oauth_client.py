@@ -598,8 +598,55 @@ class OAuthClient:
         return (
             state.page_type == "email_otp_verification"
             or "email-verification" in target
-            or "email-otp" in target
+            or ("email-otp" in target and "email-otp/send" not in target)
         )
+
+    def _state_is_email_otp_send(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type == "email_otp_send"
+            or "email-otp/send" in target
+        )
+
+    def _state_is_codex_consent(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type == "sign_in_with_chatgpt_codex_consent"
+            or "sign-in-with-chatgpt/codex/consent" in target
+        )
+
+    def _state_is_accounts_consent(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type == "consent"
+            or "/api/accounts/consent" in target
+            or "consent_challenge=" in target
+        )
+
+    def _state_is_oauth2_auth(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return "/api/oauth/oauth2/auth" in target
+
+    def _state_has_login_verifier(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return "login_verifier=" in target
+
+    def _state_has_consent_verifier(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return "consent_verifier=" in target
+
+    def _log_oauth_state_markers(self, state: FlowState) -> None:
+        if self._state_is_codex_consent(state):
+            self._log("状态识别: Codex consent")
+        elif self._state_is_accounts_consent(state):
+            self._log("状态识别: accounts consent")
+        elif self._state_is_oauth2_auth(state):
+            if self._state_has_consent_verifier(state):
+                self._log("状态识别: oauth2/auth (consent_verifier)")
+            elif self._state_has_login_verifier(state):
+                self._log("状态识别: oauth2/auth (login_verifier)")
+            else:
+                self._log("状态识别: oauth2/auth")
 
     def _state_is_add_phone(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
@@ -670,6 +717,19 @@ class OAuthClient:
 
         for hop in range(max_hops):
             try:
+                lowered_current = str(current_url or "").lower()
+                if "/api/oauth/oauth2/auth" in lowered_current:
+                    if "consent_verifier=" in lowered_current:
+                        self._log(f"follow[{hop + 1}] oauth2/auth (consent_verifier)")
+                    elif "login_verifier=" in lowered_current:
+                        self._log(f"follow[{hop + 1}] oauth2/auth (login_verifier)")
+                    else:
+                        self._log(f"follow[{hop + 1}] oauth2/auth")
+                elif "/api/accounts/consent" in lowered_current or "consent_challenge=" in lowered_current:
+                    self._log(f"follow[{hop + 1}] accounts/consent")
+                elif "sign-in-with-chatgpt/codex/consent" in lowered_current:
+                    self._log(f"follow[{hop + 1}] codex consent page")
+
                 headers = self._headers(
                     current_url,
                     user_agent=user_agent,
@@ -706,6 +766,15 @@ class OAuthClient:
                 )
                 if not location:
                     return None, self._state_from_url(last_url or current_url)
+                lowered_location = location.lower()
+                if "/api/accounts/consent" in lowered_location or "consent_challenge=" in lowered_location:
+                    self._log(f"follow[{hop + 1}] -> consent_challenge")
+                elif "/api/oauth/oauth2/auth" in lowered_location and "consent_verifier=" in lowered_location:
+                    self._log(f"follow[{hop + 1}] -> oauth2/auth(consent_verifier)")
+                elif "/api/oauth/oauth2/auth" in lowered_location and "login_verifier=" in lowered_location:
+                    self._log(f"follow[{hop + 1}] -> oauth2/auth(login_verifier)")
+                elif "http://localhost" in lowered_location or "https://localhost" in lowered_location:
+                    self._log(f"follow[{hop + 1}] -> localhost callback")
                 code = self._extract_code_from_url(location)
                 if code:
                     return code, self._state_from_url(location)
@@ -1025,8 +1094,6 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
         payload = {"username": {"kind": "email", "value": email}}
-        if screen_hint:
-            payload["screen_hint"] = str(screen_hint).strip()
 
         try:
             kwargs = {
@@ -1334,7 +1401,7 @@ class OAuthClient:
         try:
             kwargs = {
                 "headers": headers,
-                "allow_redirects": True,
+                "allow_redirects": False,
                 "timeout": 30,
             }
             if impersonate:
@@ -1343,6 +1410,17 @@ class OAuthClient:
             self._browser_pause()
             r = self.session.get(request_url, **kwargs)
             self._log(f"/email-otp/send -> {r.status_code}")
+            if r.status_code in (301, 302, 303, 307, 308):
+                location = normalize_flow_url(
+                    r.headers.get("Location", "") or f"{self.oauth_issuer}/email-verification",
+                    auth_base=self.oauth_issuer,
+                )
+                self._log(f"/email-otp/send -> redirect {location[:120]}")
+                flow_state = self._state_from_url(location)
+                if not self._state_is_email_otp(flow_state):
+                    flow_state = self._state_from_url(f"{self.oauth_issuer}/email-verification")
+                self._log(f"注册 OTP 已触发 {describe_flow_state(flow_state)}")
+                return flow_state
             if r.status_code != 200:
                 self._set_error(f"发送注册 OTP 失败: {r.status_code} - {r.text[:180]}")
                 return None
@@ -1481,6 +1559,7 @@ class OAuthClient:
             return None
 
         self._log(f"OAuth 注册状态起点: {describe_flow_state(state)}")
+        self._log_oauth_state_markers(state)
         referer = continue_referer
         seen_states = {}
         register_submitted = False
@@ -1488,6 +1567,7 @@ class OAuthClient:
         for step in range(24):
             self.last_state = state
             self._log(f"注册状态步进[{step + 1}/24]: {describe_flow_state(state)}")
+            self._log_oauth_state_markers(state)
             signature = self._state_signature(state)
             seen_states[signature] = seen_states.get(signature, 0) + 1
             if seen_states[signature] > 2:
@@ -1950,6 +2030,7 @@ class OAuthClient:
             return None
 
         self._log(f"OAuth 状态起点: {describe_flow_state(state)}")
+        self._log_oauth_state_markers(state)
         seen_states = {}
         referer = continue_referer
 
@@ -1967,6 +2048,7 @@ class OAuthClient:
         for step in range(20):
             self.last_state = state
             self._log(f"状态步进[{step + 1}/20]: {describe_flow_state(state)}")
+            self._log_oauth_state_markers(state)
             signature = self._state_signature(state)
             seen_states[signature] = seen_states.get(signature, 0) + 1
             if seen_states[signature] > 2:
@@ -2409,6 +2491,11 @@ class OAuthClient:
                         data, current_url=str(r.url)
                     )
                     continue_url = workspace_state.continue_url
+                    self._log(
+                        f"workspace/select 响应状态: {describe_flow_state(workspace_state)}"
+                    )
+                    if continue_url:
+                        self._log(f"workspace/select continue_url: {continue_url[:180]}")
 
                     if orgs:
                         org_id = (orgs[0] or {}).get("id")
@@ -2498,6 +2585,12 @@ class OAuthClient:
 
                     # 如果有 continue_url，跟随它
                     if continue_url:
+                        if "login_verifier=" in continue_url:
+                            self._log("workspace/select -> oauth2/auth(login_verifier)")
+                        elif "consent_verifier=" in continue_url:
+                            self._log("workspace/select -> oauth2/auth(consent_verifier)")
+                        elif "consent_challenge=" in continue_url:
+                            self._log("workspace/select -> accounts/consent")
                         code, _ = self._oauth_follow_for_code(
                             continue_url, consent_url, user_agent, impersonate
                         )

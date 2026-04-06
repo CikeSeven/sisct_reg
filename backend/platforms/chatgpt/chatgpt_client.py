@@ -377,7 +377,14 @@ class ChatGPTClient:
         return (
             state.page_type == "email_otp_verification"
             or "email-verification" in target
-            or "email-otp" in target
+            or ("email-otp" in target and "email-otp/send" not in target)
+        )
+
+    def _state_is_email_otp_send(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type == "email_otp_send"
+            or "email-otp/send" in target
         )
 
     def _state_is_about_you(self, state: FlowState):
@@ -792,7 +799,7 @@ class ChatGPTClient:
         )
         return ok
 
-    def register_user(self, email, password):
+    def register_user(self, email, password, return_state=False):
         """
         注册用户（邮箱 + 密码）
 
@@ -831,10 +838,18 @@ class ChatGPTClient:
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
 
             if r.status_code == 200:
-                data = r.json()
+                try:
+                    data = r.json()
+                except Exception:
+                    data = {}
+                next_state = self._state_from_payload(
+                    data,
+                    current_url=str(r.url) or f"{self.AUTH}/api/accounts/email-otp/send",
+                )
                 self._log("注册成功")
                 self._log(f"authorize_continue/register_user 响应 URL: {str(r.url)[:120]}")
-                return True, "注册成功"
+                self._log(f"register_user 响应状态: {describe_flow_state(next_state)}")
+                return (True, next_state) if return_state else (True, "注册成功")
             else:
                 try:
                     error_data = r.json()
@@ -848,11 +863,11 @@ class ChatGPTClient:
             self._log(f"注册异常: {e}")
             return False, str(e)
 
-    def send_email_otp(self, referer=None):
+    def send_email_otp(self, referer=None, target_url=None, return_state=False):
         """触发发送邮箱验证码"""
         self._enter_stage("otp", "send email otp")
         self._log("触发发送验证码...")
-        url = f"{self.AUTH}/api/accounts/email-otp/send"
+        url = target_url or f"{self.AUTH}/api/accounts/email-otp/send"
 
         try:
             self._browser_pause()
@@ -860,17 +875,27 @@ class ChatGPTClient:
                 url,
                 headers=self._headers(
                     url,
-                    accept="application/json, text/plain, */*",
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     referer=referer or f"{self.AUTH}/create-account/password",
+                    navigation=True,
                     fetch_site="same-origin",
                 ),
-                allow_redirects=True,
+                allow_redirects=False,
                 timeout=30,
             )
             self._log(f"验证码发送状态: {r.status_code}")
+            if r.status_code in {301, 302, 303, 307, 308}:
+                location = normalize_flow_url(
+                    r.headers.get("location") or f"{self.AUTH}/email-verification",
+                    auth_base=self.AUTH,
+                )
+                self._log(f"验证码发送跳转: {location[:120]}")
+                next_state = self._state_from_url(location)
+                return (True, next_state) if return_state else True
+
             if r.status_code != 200:
                 self._log(f"验证码发送失败响应: {r.text[:180]}")
-                return False
+                return (False, FlowState()) if return_state else False
 
             try:
                 payload = r.json()
@@ -881,12 +906,15 @@ class ChatGPTClient:
                 next_state = self._state_from_payload(payload, current_url=str(r.url) or url)
                 self._log(f"验证码发送响应: {describe_flow_state(next_state)}")
                 self._log(f"otp/send 当前 URL: {str(r.url)[:120]}")
+                return (True, next_state) if return_state else True
             else:
+                next_state = self._state_from_url(str(r.url) or f"{self.AUTH}/email-verification")
                 self._log("验证码发送响应: 非 JSON（按已触发处理）")
-            return True
+                self._log(f"验证码发送最终状态: {describe_flow_state(next_state)}")
+                return (True, next_state) if return_state else True
         except Exception as e:
             self._log(f"发送验证码失败: {e}")
-            return False
+            return (False, FlowState()) if return_state else False
 
     def verify_email_otp(self, otp_code, return_state=False):
         """
@@ -1156,21 +1184,27 @@ class ChatGPTClient:
                 self._log("全新注册流程")
                 if register_submitted:
                     return False, "注册密码阶段重复进入"
-                success, msg = self.register_user(email, password)
+                success, next_state = self.register_user(email, password, return_state=True)
                 if not success:
-                    return False, f"注册失败: {msg}"
+                    return False, f"注册失败: {next_state}"
                 register_submitted = True
+                state = next_state or self._state_from_url(f"{self.AUTH}/api/accounts/email-otp/send")
+                continue
+
+            if self._state_is_email_otp_send(state):
+                self._enter_stage("otp", describe_flow_state(state))
+                self._log("跟随注册验证码发送状态...")
                 otp_send_attempts += 1
-                self._log(f"发送注册验证码: attempt={otp_send_attempts}")
+                success, next_state = self.send_email_otp(
+                    referer=state.current_url or state.continue_url or f"{self.AUTH}/create-account/password",
+                    target_url=state.continue_url or state.current_url or f"{self.AUTH}/api/accounts/email-otp/send",
+                    return_state=True,
+                )
+                if not success:
+                    return False, "发送注册验证码失败"
                 otp_sent_at = time.time() - 15
-                if not self.send_email_otp(
-                    referer=state.current_url or state.continue_url or f"{self.AUTH}/create-account/password"
-                ):
-                    self._log("发送验证码接口返回失败，继续等待邮箱中的验证码...")
-                else:
-                    self._log("发送注册验证码成功，进入收码阶段")
-                    otp_sent_at = time.time() - 15
-                state = self._state_from_url(f"{self.AUTH}/email-verification")
+                self._log(f"发送注册验证码成功: attempt={otp_send_attempts}")
+                state = next_state or self._state_from_url(f"{self.AUTH}/email-verification")
                 continue
 
             if self._state_is_email_otp(state):

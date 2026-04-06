@@ -3,6 +3,7 @@ from __future__ import annotations
 import imaplib
 import re
 import time
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from email import message_from_bytes
@@ -209,6 +210,8 @@ class LuckMailProvider(ProviderBase):
         self._email = ""
         self._token = ""
         self._seen_ids: set[str] = set()
+        self._seen_message_keys: set[str] = set()
+        self._logged_old_message_keys: set[str] = set()
         if not self.base_url or not self.api_key:
             raise RuntimeError("LuckMail 未配置：请填写 luckmail_base_url 和 luckmail_api_key")
 
@@ -249,6 +252,126 @@ class LuckMailProvider(ProviderBase):
                 return str(item["email_address"]), str(item["token"])
         return None
 
+    @staticmethod
+    def _normalize_mail_text(subject: str, body: str, html_body: str) -> str:
+        return " ".join([str(subject or ""), str(body or ""), str(html_body or "")]).strip()
+
+    def _extract_mail_metadata(self, mail: dict) -> dict[str, object]:
+        subject = str(mail.get("subject") or "").strip()
+        body = str(mail.get("body") or "")
+        html_body = str(mail.get("html_body") or "")
+        text = self._normalize_mail_text(subject, body, html_body)
+        code = self._extract_code(text)
+        lowered = text.lower()
+        related = any(
+            keyword in lowered
+            for keyword in ("openai", "chatgpt", "verification code", "验证码")
+        )
+        message_id = str(mail.get("message_id") or "").strip()
+        return {
+            "message_id": message_id,
+            "subject": subject,
+            "text": text,
+            "code": code,
+            "related": related,
+            "timestamp": self._extract_luckmail_timestamp(mail),
+        }
+
+    @staticmethod
+    def _build_message_key(message_id: str, *, text: str, code: str = "") -> str:
+        message_id = str(message_id or "").strip()
+        code = str(code or "").strip()
+        if not message_id:
+            return ""
+        if code:
+            return f"{message_id}:code:{code}"
+        digest = hashlib.sha1(str(text or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return f"{message_id}:body:{digest}"
+
+    @staticmethod
+    def _format_luckmail_timestamp(ts: float | None) -> str:
+        if not ts:
+            return "-"
+        try:
+            return time.strftime("%H:%M:%S", time.localtime(float(ts)))
+        except Exception:
+            return "-"
+
+    @staticmethod
+    def _parse_luckmail_timestamp(value) -> float | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if numeric > 1e12:
+                numeric /= 1000.0
+            if numeric > 0:
+                return numeric
+            return None
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if re.fullmatch(r"\d{10,16}", text):
+            try:
+                numeric = float(text)
+                if numeric > 1e12:
+                    numeric /= 1000.0
+                return numeric
+            except Exception:
+                return None
+        for candidate in (
+            text,
+            text.replace("Z", "+00:00"),
+            text.replace("/", "-"),
+        ):
+            try:
+                return datetime.fromisoformat(candidate).timestamp()
+            except Exception:
+                pass
+        return None
+
+    def _extract_luckmail_timestamp(self, mail: dict) -> float | None:
+        for key in (
+            "received_at",
+            "receivedAt",
+            "created_at",
+            "createdAt",
+            "updated_at",
+            "updatedAt",
+            "date",
+            "sent_at",
+            "sentAt",
+            "timestamp",
+            "time",
+        ):
+            parsed = self._parse_luckmail_timestamp(mail.get(key))
+            if parsed:
+                return parsed
+        return None
+
+    def _list_existing_mail_state(self, token: str) -> tuple[set[str], set[str]]:
+        data = self._request("GET", f"/api/v1/openapi/email/token/{token}/mails")
+        ids: set[str] = set()
+        keys: set[str] = set()
+        for mail in data.get("mails") or []:
+            meta = self._extract_mail_metadata(mail if isinstance(mail, dict) else {})
+            message_id = str(meta.get("message_id") or "").strip()
+            if not message_id:
+                continue
+            ids.add(message_id)
+            keys.add(
+                self._build_message_key(
+                    message_id,
+                    text=str(meta.get("text") or ""),
+                    code=str(meta.get("code") or ""),
+                )
+            )
+        return ids, keys
+
+    def _initialize_mail_state(self, token: str) -> None:
+        self._seen_ids, self._seen_message_keys = self._list_existing_mail_state(token)
+        self._logged_old_message_keys = set()
+
     def create_email(self, config=None):
         if self._fixed_account:
             email = str(self._fixed_account.get("email") or "").strip()
@@ -257,7 +380,7 @@ class LuckMailProvider(ProviderBase):
                 raise RuntimeError("LuckMail 绑定令牌缺失")
             self._email = email
             self._token = token
-            self._seen_ids = self._list_message_ids(token)
+            self._initialize_mail_state(token)
             self._log(f"[LuckMail] 使用绑定令牌邮箱: {email}")
             return {
                 "email": email,
@@ -277,7 +400,7 @@ class LuckMailProvider(ProviderBase):
                 token = str(local_account.get("token") or "").strip()
                 self._email = email
                 self._token = token
-                self._seen_ids = self._list_message_ids(token)
+                self._initialize_mail_state(token)
                 self._log(f"[LuckMail] 使用本地令牌邮箱: {email}")
                 return {
                     "email": email,
@@ -295,7 +418,7 @@ class LuckMailProvider(ProviderBase):
             email, token = existing
             self._email = email
             self._token = token
-            self._seen_ids = self._list_message_ids(token)
+            self._initialize_mail_state(token)
             self._log(f"[LuckMail] 使用已购邮箱: {email}")
             return {"email": email, "token": token, "service_id": token}
 
@@ -305,7 +428,7 @@ class LuckMailProvider(ProviderBase):
             token = str(local_account.get("token") or "").strip()
             self._email = email
             self._token = token
-            self._seen_ids = self._list_message_ids(token)
+            self._initialize_mail_state(token)
             self._log(f"[LuckMail] 使用本地令牌邮箱: {email}")
             return {
                 "email": email,
@@ -334,7 +457,7 @@ class LuckMailProvider(ProviderBase):
             raise RuntimeError(f"LuckMail 返回缺少 email/token: {item}")
         self._email = email
         self._token = token
-        self._seen_ids = self._list_message_ids(token)
+        self._initialize_mail_state(token)
         self._log(f"[LuckMail] 已购邮箱: {email}")
         return {"email": email, "token": token, "service_id": token}
 
@@ -354,16 +477,22 @@ class LuckMailProvider(ProviderBase):
             mails = list(data.get("mails") or [])
             self._log(f"[LuckMail] 已获取邮件列表: count={len(mails)}")
             for mail in mails:
-                message_id = str(mail.get("message_id") or "").strip()
-                subject = str(mail.get("subject") or "").strip()
-                text = " ".join([
-                    subject,
-                    str(mail.get("body") or ""),
-                    str(mail.get("html_body") or ""),
-                ])
-                code = self._extract_code(text)
-                lowered = text.lower()
-                related = any(keyword in lowered for keyword in ("openai", "chatgpt", "verification code", "验证码"))
+                meta = self._extract_mail_metadata(mail if isinstance(mail, dict) else {})
+                message_id = str(meta.get("message_id") or "").strip()
+                subject = str(meta.get("subject") or "").strip()
+                text = str(meta.get("text") or "")
+                code = str(meta.get("code") or "").strip()
+                related = bool(meta.get("related"))
+                mail_ts = meta.get("timestamp")
+                time_label = self._format_luckmail_timestamp(mail_ts if isinstance(mail_ts, (int, float)) else None)
+                message_key = self._build_message_key(message_id, text=text, code=code)
+                seen_id = bool(message_id and message_id in self._seen_ids)
+                seen_key = bool(message_key and message_key in self._seen_message_keys)
+                too_old_for_otp = bool(
+                    otp_sent_at
+                    and isinstance(mail_ts, (int, float))
+                    and (float(mail_ts) + 30) < float(otp_sent_at)
+                )
                 if not message_id:
                     if code:
                         self._log(
@@ -374,32 +503,57 @@ class LuckMailProvider(ProviderBase):
                             f"[LuckMail] 邮件缺少 message_id: subject={self._subject_preview(subject)}"
                         )
                     continue
-                if not message_id or message_id in self._seen_ids:
-                    if code:
-                        self._log(
-                            f"[LuckMail] 旧邮件: subject={self._subject_preview(subject)} code={code}"
-                        )
-                    elif related:
-                        self._log(
-                            f"[LuckMail] 旧邮件: subject={self._subject_preview(subject)}"
-                        )
+                if too_old_for_otp:
+                    self._seen_ids.add(message_id)
+                    if message_key:
+                        self._seen_message_keys.add(message_key)
+                    if message_key and message_key not in self._logged_old_message_keys:
+                        if code:
+                            self._log(
+                                f"[LuckMail] 旧邮件(早于otp_sent_at): id={message_id} time={time_label} subject={self._subject_preview(subject)} code={code}"
+                            )
+                        else:
+                            self._log(
+                                f"[LuckMail] 旧邮件(早于otp_sent_at): id={message_id} time={time_label} subject={self._subject_preview(subject)}"
+                            )
+                        self._logged_old_message_keys.add(message_key)
+                    continue
+                if seen_key:
+                    if message_key not in self._logged_old_message_keys:
+                        if code:
+                            self._log(
+                                f"[LuckMail] 旧邮件: id={message_id} time={time_label} subject={self._subject_preview(subject)} code={code}"
+                            )
+                        else:
+                            self._log(
+                                f"[LuckMail] 旧邮件: id={message_id} time={time_label} subject={self._subject_preview(subject)}"
+                            )
+                        self._logged_old_message_keys.add(message_key)
                     continue
                 self._seen_ids.add(message_id)
-                if code:
-                    self._log(
-                        f"[LuckMail] 新邮件: subject={self._subject_preview(subject)} code={code}"
-                    )
-                elif related:
-                    self._log(
-                        f"[LuckMail] 新邮件: subject={self._subject_preview(subject)}"
-                    )
+                if message_key:
+                    self._seen_message_keys.add(message_key)
+                if seen_id:
+                    if code:
+                        self._log(
+                            f"[LuckMail] 邮件内容更新: id={message_id} time={time_label} subject={self._subject_preview(subject)} code={code}"
+                        )
+                    else:
+                        self._log(
+                            f"[LuckMail] 邮件内容更新: id={message_id} time={time_label} subject={self._subject_preview(subject)}"
+                        )
                 else:
-                    self._log(
-                        f"[LuckMail] 新邮件: subject={self._subject_preview(subject)}"
-                    )
+                    if code:
+                        self._log(
+                            f"[LuckMail] 新邮件: id={message_id} time={time_label} subject={self._subject_preview(subject)} code={code}"
+                        )
+                    else:
+                        self._log(
+                            f"[LuckMail] 新邮件: id={message_id} time={time_label} subject={self._subject_preview(subject)}"
+                        )
                 if code:
                     self._log(
-                        f"[LuckMail] 扫描到验证码: subject={self._subject_preview(subject)} code={code}"
+                        f"[LuckMail] 扫描到验证码: id={message_id} time={time_label} subject={self._subject_preview(subject)} code={code}"
                     )
                 if code and code not in exclude_codes:
                     self._log(f"[LuckMail] 命中新验证码: {code}")
