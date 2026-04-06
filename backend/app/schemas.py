@@ -10,8 +10,8 @@ MailProvider = Literal["luckmail", "tempmail_lol", "outlook_local"]
 
 
 class CreateRegisterTaskRequest(BaseModel):
-    count: int = Field(default=1, ge=1, le=50)
-    concurrency: int = Field(default=1, ge=1, le=5)
+    count: int = Field(default=1, ge=1, le=9999)
+    concurrency: int = Field(default=1, ge=1, le=100)
     register_delay_seconds: float = Field(default=0, ge=0, le=600)
     email: Optional[str] = None
     password: Optional[str] = None

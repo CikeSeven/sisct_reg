@@ -1492,11 +1492,11 @@ export default function App() {
             <div className="field-group two-col">
               <label>
                 <span>批量数量</span>
-                <input type="number" min={1} max={50} value={form.count} onChange={(e) => updateField('count', Number(e.target.value))} />
+                <input type="number" min={1} max={9999} value={form.count} onChange={(e) => updateField('count', Number(e.target.value))} />
               </label>
               <label>
                 <span>并发数</span>
-                <input type="number" min={1} max={5} value={form.concurrency} onChange={(e) => updateField('concurrency', Number(e.target.value))} />
+                <input type="number" min={1} max={100} value={form.concurrency} onChange={(e) => updateField('concurrency', Number(e.target.value))} />
               </label>
             </div>
 

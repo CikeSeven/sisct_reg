@@ -1386,7 +1386,7 @@ class RegistrationManager:
                 state.finish_attempt(attempt_index)
 
         try:
-            worker_count = max(1, min(req.concurrency, req.count, 10))
+            worker_count = max(1, min(req.concurrency, req.count, 100))
 
             def worker_loop() -> None:
                 while True:
