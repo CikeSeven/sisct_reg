@@ -191,6 +191,57 @@ def _extract_organization_id(id_token: str) -> str:
     return ""
 
 
+def _format_iso8601(dt: datetime) -> str:
+    return dt.astimezone(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+def build_sub2api_export_account(result: Any) -> dict[str, Any]:
+    token_data = generate_cpa_token_json(result)
+    access_token = str(token_data.get("access_token") or "").strip()
+    refresh_token = str(token_data.get("refresh_token") or "").strip()
+    id_token = str(token_data.get("id_token") or "").strip()
+    email = str(token_data.get("email") or getattr(result, "email", "") or "").strip()
+    access_payload = _decode_jwt_payload(access_token)
+    access_auth = _extract_auth(access_payload)
+    expires_at = access_payload.get("exp")
+    if isinstance(expires_at, int) and expires_at > 0:
+        expires_at_text = _format_iso8601(datetime.fromtimestamp(expires_at, tz=timezone.utc))
+    else:
+        expires_at_text = _format_iso8601(datetime.now(tz=timezone.utc) + timedelta(days=10))
+    token_version = int(access_payload.get("iat") or int(time.time())) * 1000
+
+    return {
+        "name": email,
+        "platform": "openai",
+        "type": "oauth",
+        "credentials": {
+            "_token_version": token_version,
+            "access_token": access_token,
+            "chatgpt_account_id": str(access_auth.get("chatgpt_account_id") or token_data.get("account_id") or "").strip(),
+            "chatgpt_user_id": str(access_auth.get("chatgpt_user_id") or "").strip(),
+            "email": email,
+            "expires_at": expires_at_text,
+            "expires_in": 864000,
+            "id_token": id_token,
+            "organization_id": _extract_organization_id(id_token),
+            "refresh_token": refresh_token,
+        },
+        "extra": {"email": email},
+        "concurrency": 10,
+        "priority": 1,
+        "rate_multiplier": 1,
+        "auto_pause_on_expired": True,
+    }
+
+
+def build_sub2api_export_payload(results: list[Any]) -> dict[str, Any]:
+    return {
+        "exported_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "proxies": [],
+        "accounts": [build_sub2api_export_account(item) for item in results],
+    }
+
+
 def upload_to_cpa(result: Any, *, api_url: str, api_key: str) -> tuple[bool, str]:
     api_url = str(api_url or "").strip()
     api_key = str(api_key or "").strip()

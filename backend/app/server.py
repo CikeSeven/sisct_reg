@@ -18,6 +18,7 @@ from .schemas import (
     CreateRegisterTaskRequest,
     DeleteAccountRequest,
     DeleteAccountsBatchRequest,
+    ExportAccountsBatchRequest,
     UpdateConfigRequest,
     UploadAccountsBatchRequest,
 )
@@ -178,6 +179,19 @@ def upload_register_accounts(body: UploadAccountsBatchRequest):
             raise HTTPException(409, str(result.get("message") or "上传配置未填写"))
         raise HTTPException(400, str(result.get("message") or "上传失败"))
     return result
+
+
+@app.post("/api/register/accounts/export")
+def export_register_accounts(body: ExportAccountsBatchRequest):
+    result = manager.export_accounts_bundle(body.items)
+    if not result.get("ok"):
+        raise HTTPException(400, str(result.get("message") or "导出失败"))
+    filename = str(result.get("filename") or "accounts_export.zip")
+    return StreamingResponse(
+        iter([result.get("content") or b""]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/register/tasks/{task_id}/events")

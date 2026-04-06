@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
+from io import BytesIO
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import requests
 
@@ -44,7 +48,13 @@ from .db import (
     update_task_run,
 )
 from .defaults import DEFAULT_CONFIG
-from .external_uploads import sync_chatgpt_result, upload_to_cpa, upload_to_sub2api
+from .external_uploads import (
+    build_sub2api_export_payload,
+    generate_cpa_token_json,
+    sync_chatgpt_result,
+    upload_to_cpa,
+    upload_to_sub2api,
+)
 from .mail_providers import build_mail_provider
 from .schemas import CreateRegisterTaskRequest
 
@@ -1262,6 +1272,93 @@ class RegistrationManager:
             "failed": failed,
             "skipped": skipped,
             "items": results,
+        }
+
+    @staticmethod
+    def _build_export_file_stem(email: str, created_at: float | int | None = None) -> str:
+        email_text = str(email or "").strip().lower()
+        sanitized_email = re.sub(r"[^a-z0-9._-]+", "_", email_text.replace("@", "_"))
+        timestamp = int(float(created_at or 0) or time.time())
+        return f"token_{sanitized_email}_{timestamp}"
+
+    def export_accounts_bundle(self, items: list[Any]) -> dict[str, Any]:
+        selected_rows: list[dict[str, Any]] = []
+        seen_result_ids: set[int] = set()
+        skipped = 0
+
+        for raw_item in items or []:
+            item = raw_item.model_dump() if hasattr(raw_item, "model_dump") else (dict(raw_item) if isinstance(raw_item, dict) else {})
+            task_id = str(item.get("task_id") or "").strip()
+            try:
+                attempt_index = int(item.get("attempt_index") or 0)
+            except Exception:
+                attempt_index = 0
+            candidate_refs = self._collect_account_candidate_refs(
+                task_id,
+                attempt_index,
+                task_ids=item.get("task_ids") if isinstance(item.get("task_ids"), list) else [],
+                refs=item.get("refs") if isinstance(item.get("refs"), list) else [],
+            )
+            candidates: list[dict[str, Any]] = []
+            for candidate_task_id, candidate_attempt_index in candidate_refs:
+                if get_task_run(candidate_task_id) is None:
+                    continue
+                for row in get_task_results(candidate_task_id):
+                    if int(row.get("attempt_index") or 0) != int(candidate_attempt_index):
+                        continue
+                    if str(row.get("status") or "").strip().lower() != "success":
+                        continue
+                    candidates.append(row)
+            if not candidates:
+                skipped += 1
+                continue
+
+            row = max(
+                candidates,
+                key=lambda value: (
+                    float(value.get("created_at") or 0),
+                    int(value.get("id") or 0),
+                ),
+            )
+            row_id = int(row.get("id") or 0)
+            if row_id > 0 and row_id in seen_result_ids:
+                skipped += 1
+                continue
+            if row_id > 0:
+                seen_result_ids.add(row_id)
+            selected_rows.append(row)
+
+        if not selected_rows:
+            return {"ok": False, "reason": "no_success_accounts", "message": "没有可导出的成功账号"}
+
+        bundle_results = [self._result_to_upload_payload(row) for row in selected_rows]
+        zip_buffer = BytesIO()
+        with ZipFile(zip_buffer, "w", compression=ZIP_DEFLATED) as archive:
+            for row, payload in zip(selected_rows, bundle_results):
+                file_stem = self._build_export_file_stem(
+                    str(row.get("email") or ""),
+                    row.get("created_at"),
+                )
+                archive.writestr(
+                    f"CPA/{file_stem}.json",
+                    json.dumps(generate_cpa_token_json(payload), ensure_ascii=False),
+                )
+            archive.writestr(
+                "sub2api/sub2api_accounts.json",
+                json.dumps(
+                    build_sub2api_export_payload(bundle_results),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+
+        zip_buffer.seek(0)
+        return {
+            "ok": True,
+            "filename": f"accounts_export_{int(time.time())}.zip",
+            "content": zip_buffer.getvalue(),
+            "exported": len(selected_rows),
+            "skipped": skipped,
         }
 
     def stop_task(self, task_id: str) -> dict[str, Any]:

@@ -389,6 +389,7 @@ export default function App() {
   const [testingProxyId, setTestingProxyId] = useState<number | null>(null)
   const [retryingResultId, setRetryingResultId] = useState<number | null>(null)
   const [deletingAccounts, setDeletingAccounts] = useState(false)
+  const [exportingZip, setExportingZip] = useState(false)
   const [uploadingTarget, setUploadingTarget] = useState<UploadTarget | null>(null)
   const [stoppingAccountKeys, setStoppingAccountKeys] = useState<string[]>([])
   const [accountPage, setAccountPage] = useState(1)
@@ -1189,6 +1190,50 @@ export default function App() {
     }
   }
 
+  async function exportSelectedAccounts() {
+    const targets = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && item.status === 'success' && item.task_id)
+    if (targets.length === 0) return
+    setExportingZip(true)
+    setError('')
+    try {
+      const response = await fetch('/api/register/accounts/export', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          items: targets.map((item) => ({
+            task_id: item.task_id,
+            task_ids: item.task_ids || [],
+            refs: item.task_refs || [],
+            attempt_index: item.attempt_index,
+          })),
+        }),
+      })
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(text || '导出失败')
+      }
+      const blob = await response.blob()
+      const disposition = response.headers.get('Content-Disposition') || ''
+      const match = disposition.match(/filename="?([^"]+)"?/)
+      const filename = match?.[1] || `accounts_export_${Date.now()}.zip`
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '导出失败')
+    } finally {
+      setExportingZip(false)
+    }
+  }
+
   async function stopAccount(item: AccountItem) {
     const actionTaskId = item.action_task_id || item.task_id
     const actionAttemptIndex = Number(item.action_attempt_index || item.attempt_index || 0)
@@ -1694,6 +1739,9 @@ export default function App() {
             </button>
             <button className="ghost-btn" type="button" onClick={() => void uploadSelectedAccounts('sub2api')} disabled={uploadingTarget !== null || selectedUploadableCount === 0}>
               {uploadingTarget === 'sub2api' ? '上传中...' : '上传Sub2API'}
+            </button>
+            <button className="ghost-btn" type="button" onClick={() => void exportSelectedAccounts()} disabled={exportingZip || selectedUploadableCount === 0}>
+              {exportingZip ? '导出中...' : '导出ZIP'}
             </button>
             <button className="ghost-btn" type="button" onClick={() => void deleteSelectedAccounts()} disabled={deletingAccounts || selectedCount === 0}>
               {deletingAccounts ? '删除中...' : '删除选中'}
