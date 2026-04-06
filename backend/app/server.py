@@ -14,7 +14,13 @@ from .luckmail_pool import router as luckmail_pool_router
 from .manager import manager
 from .outlook_pool import router as outlook_router
 from .proxy_pool import router as proxy_router
-from .schemas import CreateRegisterTaskRequest, DeleteAccountRequest, DeleteAccountsBatchRequest, UpdateConfigRequest
+from .schemas import (
+    CreateRegisterTaskRequest,
+    DeleteAccountRequest,
+    DeleteAccountsBatchRequest,
+    UpdateConfigRequest,
+    UploadAccountsBatchRequest,
+)
 
 app = FastAPI(title="ChatGPT Register Workbench", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -159,6 +165,19 @@ def delete_register_accounts_batch(body: DeleteAccountsBatchRequest):
                 }
             )
     return {"ok": True, "deleted": deleted, "skipped": skipped}
+
+
+@app.post("/api/register/accounts/upload")
+def upload_register_accounts(body: UploadAccountsBatchRequest):
+    result = manager.upload_accounts(body.target, body.items)
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "")
+        if reason == "invalid_target":
+            raise HTTPException(400, "上传目标无效")
+        if reason == "target_not_configured":
+            raise HTTPException(409, str(result.get("message") or "上传配置未填写"))
+        raise HTTPException(400, str(result.get("message") or "上传失败"))
+    return result
 
 
 @app.get("/api/register/tasks/{task_id}/events")

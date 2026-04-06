@@ -6,6 +6,7 @@ type Executor = 'protocol' | 'headless' | 'headed'
 type SettingsTab = 'base' | 'mail' | 'uploads' | 'outlook'
 type OutlookDeleteScope = 'all' | 'taken'
 type ProxyDeleteScope = 'all'
+type UploadTarget = 'cpa' | 'sub2api'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -388,6 +389,7 @@ export default function App() {
   const [testingProxyId, setTestingProxyId] = useState<number | null>(null)
   const [retryingResultId, setRetryingResultId] = useState<number | null>(null)
   const [deletingAccounts, setDeletingAccounts] = useState(false)
+  const [uploadingTarget, setUploadingTarget] = useState<UploadTarget | null>(null)
   const [stoppingAccountKeys, setStoppingAccountKeys] = useState<string[]>([])
   const [accountPage, setAccountPage] = useState(1)
   const [accountPageSize, setAccountPageSize] = useState(20)
@@ -579,6 +581,7 @@ export default function App() {
   )
 
   const selectedCount = selectedAccounts.length
+  const selectedUploadableCount = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && item.status === 'success' && item.task_id).length
   const currentPageSelectedCount = currentPageSelectableKeys.filter((key) => selectedAccounts.includes(key)).length
   const isCurrentPageAllSelected = currentPageSelectableKeys.length > 0 && currentPageSelectedCount === currentPageSelectableKeys.length
 
@@ -1150,6 +1153,42 @@ export default function App() {
     requestDeleteAccounts(targets)
   }
 
+  async function uploadSelectedAccounts(target: UploadTarget) {
+    const targets = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && item.status === 'success' && item.task_id)
+    if (targets.length === 0) return
+    setUploadingTarget(target)
+    setError('')
+    try {
+      const response = await apiFetch<{ ok: boolean; uploaded: number; failed: number; skipped: number; items: Array<{ ok: boolean; message: string }> }>(
+        '/api/register/accounts/upload',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            target,
+            items: targets.map((item) => ({
+              task_id: item.task_id,
+              task_ids: item.task_ids || [],
+              refs: item.task_refs || [],
+              attempt_index: item.attempt_index,
+            })),
+          }),
+        },
+      )
+      if (response.failed > 0) {
+        const firstError = response.items.find((item) => !item.ok)?.message || '上传失败'
+        setError(firstError)
+      } else if (response.uploaded === 0) {
+        setError('没有可上传的成功账号')
+      } else {
+        setError('')
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '上传失败')
+    } finally {
+      setUploadingTarget(null)
+    }
+  }
+
   async function stopAccount(item: AccountItem) {
     const actionTaskId = item.action_task_id || item.task_id
     const actionAttemptIndex = Number(item.action_attempt_index || item.attempt_index || 0)
@@ -1650,6 +1689,12 @@ export default function App() {
               取消选择
             </button>
             <div className="selected-count-chip">{selectedCount}</div>
+            <button className="ghost-btn" type="button" onClick={() => void uploadSelectedAccounts('cpa')} disabled={uploadingTarget !== null || selectedUploadableCount === 0}>
+              {uploadingTarget === 'cpa' ? '上传中...' : '上传CPA'}
+            </button>
+            <button className="ghost-btn" type="button" onClick={() => void uploadSelectedAccounts('sub2api')} disabled={uploadingTarget !== null || selectedUploadableCount === 0}>
+              {uploadingTarget === 'sub2api' ? '上传中...' : '上传Sub2API'}
+            </button>
             <button className="ghost-btn" type="button" onClick={() => void deleteSelectedAccounts()} disabled={deletingAccounts || selectedCount === 0}>
               {deletingAccounts ? '删除中...' : '删除选中'}
             </button>

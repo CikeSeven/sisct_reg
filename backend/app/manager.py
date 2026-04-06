@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 import requests
@@ -43,7 +44,7 @@ from .db import (
     update_task_run,
 )
 from .defaults import DEFAULT_CONFIG
-from .external_uploads import sync_chatgpt_result
+from .external_uploads import sync_chatgpt_result, upload_to_cpa, upload_to_sub2api
 from .mail_providers import build_mail_provider
 from .schemas import CreateRegisterTaskRequest
 
@@ -1080,6 +1081,188 @@ class RegistrationManager:
                     if not task_accounts:
                         self._task_accounts.pop(candidate_task_id, None)
         return {"ok": True, "deleted_results": deleted_results, "deleted_events": deleted_events}
+
+    @staticmethod
+    def _collect_account_candidate_refs(
+        task_id: str,
+        attempt_index: int,
+        *,
+        task_ids: list[str] | None = None,
+        refs: list[dict[str, Any]] | None = None,
+    ) -> list[tuple[str, int]]:
+        candidate_refs: list[tuple[str, int]] = []
+        seen_refs: set[tuple[str, int]] = set()
+
+        for ref in refs or []:
+            ref_payload = ref.model_dump() if hasattr(ref, "model_dump") else (dict(ref) if isinstance(ref, dict) else {})
+            ref_task_id = str((ref_payload or {}).get("task_id") or "").strip()
+            try:
+                ref_attempt_index = int((ref_payload or {}).get("attempt_index") or 0)
+            except Exception:
+                ref_attempt_index = 0
+            if ref_task_id and ref_attempt_index > 0 and (ref_task_id, ref_attempt_index) not in seen_refs:
+                seen_refs.add((ref_task_id, ref_attempt_index))
+                candidate_refs.append((ref_task_id, ref_attempt_index))
+
+        for value in [task_id, *(task_ids or [])]:
+            task_value = str(value or "").strip()
+            if task_value and int(attempt_index) > 0 and (task_value, int(attempt_index)) not in seen_refs:
+                seen_refs.add((task_value, int(attempt_index)))
+                candidate_refs.append((task_value, int(attempt_index)))
+
+        return candidate_refs
+
+    @staticmethod
+    def _result_to_upload_payload(row: dict[str, Any]) -> Any:
+        extra = row.get("extra_json") if isinstance(row.get("extra_json"), dict) else {}
+        metadata = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+        return SimpleNamespace(
+            email=str(row.get("email") or "").strip(),
+            password=str(row.get("password") or "").strip(),
+            access_token=str(row.get("access_token") or "").strip(),
+            refresh_token=str(row.get("refresh_token") or "").strip(),
+            session_token=str(row.get("session_token") or "").strip(),
+            workspace_id=str(row.get("workspace_id") or "").strip(),
+            account_id=str(extra.get("account_id") or "").strip(),
+            id_token=str(extra.get("id_token") or "").strip(),
+            metadata=metadata,
+        )
+
+    def upload_accounts(
+        self,
+        target: str,
+        items: list[Any],
+    ) -> dict[str, Any]:
+        target_name = str(target or "").strip().lower()
+        if target_name not in {"cpa", "sub2api"}:
+            return {"ok": False, "reason": "invalid_target"}
+
+        config = self._get_current_runtime_defaults()
+        if target_name == "cpa":
+            api_url = str(config.get("cpa_api_url") or "").strip()
+            api_key = str(config.get("cpa_api_key") or "").strip()
+            if not api_url:
+                return {"ok": False, "reason": "target_not_configured", "message": "CPA 上传未配置"}
+        else:
+            api_url = str(config.get("sub2api_api_url") or "").strip()
+            api_key = str(config.get("sub2api_api_key") or "").strip()
+            group_ids = config.get("sub2api_group_ids")
+            if not api_url or not api_key:
+                return {"ok": False, "reason": "target_not_configured", "message": "Sub2API 上传未配置"}
+
+        uploaded = 0
+        failed = 0
+        skipped = 0
+        results: list[dict[str, Any]] = []
+        seen_result_ids: set[int] = set()
+
+        for raw_item in items or []:
+            item = raw_item.model_dump() if hasattr(raw_item, "model_dump") else (dict(raw_item) if isinstance(raw_item, dict) else {})
+            task_id = str(item.get("task_id") or "").strip()
+            try:
+                attempt_index = int(item.get("attempt_index") or 0)
+            except Exception:
+                attempt_index = 0
+            candidate_refs = self._collect_account_candidate_refs(
+                task_id,
+                attempt_index,
+                task_ids=item.get("task_ids") if isinstance(item.get("task_ids"), list) else [],
+                refs=item.get("refs") if isinstance(item.get("refs"), list) else [],
+            )
+            if not candidate_refs:
+                skipped += 1
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "attempt_index": attempt_index,
+                        "ok": False,
+                        "reason": "account_not_found",
+                        "message": "账号不存在",
+                    }
+                )
+                continue
+
+            candidates: list[dict[str, Any]] = []
+            for candidate_task_id, candidate_attempt_index in candidate_refs:
+                task = get_task_run(candidate_task_id)
+                if task is None:
+                    continue
+                for row in get_task_results(candidate_task_id):
+                    if int(row.get("attempt_index") or 0) != int(candidate_attempt_index):
+                        continue
+                    if str(row.get("status") or "").strip().lower() != "success":
+                        continue
+                    candidates.append(row)
+
+            if not candidates:
+                skipped += 1
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "attempt_index": attempt_index,
+                        "ok": False,
+                        "reason": "account_not_success",
+                        "message": "账号未注册成功",
+                    }
+                )
+                continue
+
+            row = max(
+                candidates,
+                key=lambda value: (
+                    float(value.get("created_at") or 0),
+                    int(value.get("id") or 0),
+                ),
+            )
+            row_id = int(row.get("id") or 0)
+            if row_id > 0 and row_id in seen_result_ids:
+                skipped += 1
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "attempt_index": attempt_index,
+                        "ok": False,
+                        "reason": "duplicate_result",
+                        "message": "已跳过重复账号",
+                    }
+                )
+                continue
+            if row_id > 0:
+                seen_result_ids.add(row_id)
+
+            payload = self._result_to_upload_payload(row)
+            if target_name == "cpa":
+                ok, message = upload_to_cpa(payload, api_url=api_url, api_key=api_key)
+            else:
+                ok, message = upload_to_sub2api(
+                    payload,
+                    api_url=api_url,
+                    api_key=api_key,
+                    group_ids=group_ids,
+                )
+            if ok:
+                uploaded += 1
+            else:
+                failed += 1
+            results.append(
+                {
+                    "task_id": str(row.get("task_id") or task_id),
+                    "attempt_index": int(row.get("attempt_index") or attempt_index),
+                    "result_id": row_id or None,
+                    "email": str(row.get("email") or "").strip(),
+                    "ok": ok,
+                    "message": str(message or "").strip(),
+                }
+            )
+
+        return {
+            "ok": True,
+            "target": target_name,
+            "uploaded": uploaded,
+            "failed": failed,
+            "skipped": skipped,
+            "items": results,
+        }
 
     def stop_task(self, task_id: str) -> dict[str, Any]:
         self._ensure_task_exists(task_id)

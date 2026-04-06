@@ -41,3 +41,11 @@ class DeleteAccountRequest(BaseModel):
 
 class DeleteAccountsBatchRequest(BaseModel):
     items: list[DeleteAccountRequest] = Field(default_factory=list)
+
+
+UploadTarget = Literal["cpa", "sub2api"]
+
+
+class UploadAccountsBatchRequest(BaseModel):
+    target: UploadTarget
+    items: list[DeleteAccountRequest] = Field(default_factory=list)
