@@ -221,6 +221,9 @@ class RegistrationManager:
         return ip, ""
 
     def _preflight_network(self, task_id: str, req: CreateRegisterTaskRequest) -> None:
+        if not bool(getattr(req, "use_proxy", True)):
+            return
+
         proxy_value = str(req.proxy or "").strip()
         if proxy_value:
             self._log(task_id, "正在检测代理连通性...")
@@ -461,6 +464,7 @@ class RegistrationManager:
         retry_origin: str,
         current_proxy: str | None,
         retry_email_binding: dict[str, Any] | None = None,
+        use_proxy: bool = True,
     ) -> bool:
         state = self._get_task_execution_state(task_id)
         if state is None:
@@ -484,6 +488,7 @@ class RegistrationManager:
                     "email": email or None,
                     "password": None,
                     "proxy": current_proxy,
+                    "use_proxy": bool(use_proxy),
                 },
                 merged_config_overrides={
                     "retry_resume_stage": retry_stage,
@@ -845,7 +850,10 @@ class RegistrationManager:
             return {"ok": False, "reason": "retry_not_supported"}
 
         current_defaults = self._get_current_runtime_defaults()
-        current_proxy = None if self._enabled_proxy_pool_exists() else (str(current_defaults.get("proxy") or "").strip() or None)
+        current_use_proxy = bool(current_defaults.get("use_proxy", True))
+        current_proxy = None
+        if current_use_proxy and not self._enabled_proxy_pool_exists():
+            current_proxy = str(current_defaults.get("proxy") or "").strip() or None
         source_task_id = str(result.get("task_id") or "").strip()
         source_task_row = get_task_run(source_task_id) if source_task_id else None
 
@@ -864,6 +872,7 @@ class RegistrationManager:
                 retry_origin=failure_origin,
                 current_proxy=current_proxy,
                 retry_email_binding=retry_email_binding,
+                use_proxy=current_use_proxy,
             )
             if queued:
                 return {"ok": True, "task_id": source_task_id, "queued": True}
@@ -875,6 +884,7 @@ class RegistrationManager:
             email=email,
             password=str(result.get("password") or "") or None,
             proxy=current_proxy,
+            use_proxy=current_use_proxy,
             executor_type=request_payload.get("executor_type") or merged_config.get("executor_type") or "protocol",
             mail_provider=mail_provider,
             provider_config=request_payload.get("provider_config") or {},
@@ -924,7 +934,10 @@ class RegistrationManager:
             return {"ok": False, "reason": "retry_not_supported"}
 
         current_defaults = self._get_current_runtime_defaults()
-        current_proxy = None if self._enabled_proxy_pool_exists() else (str(current_defaults.get("proxy") or "").strip() or None)
+        current_use_proxy = bool(current_defaults.get("use_proxy", True))
+        current_proxy = None
+        if current_use_proxy and not self._enabled_proxy_pool_exists():
+            current_proxy = str(current_defaults.get("proxy") or "").strip() or None
 
         if (
             self._task_store.exists(task_id)
@@ -938,6 +951,7 @@ class RegistrationManager:
                 retry_stage=str(target.get("failure_stage") or "").strip(),
                 retry_origin=str(target.get("failure_origin") or "").strip(),
                 current_proxy=current_proxy,
+                use_proxy=current_use_proxy,
                 retry_email_binding=(
                     dict(target.get("retry_email_binding") or {})
                     if isinstance(target.get("retry_email_binding"), dict)
@@ -954,6 +968,7 @@ class RegistrationManager:
             email=email or None,
             password=None,
             proxy=current_proxy,
+            use_proxy=current_use_proxy,
             executor_type=request_payload.get("executor_type") or merged_config.get("executor_type") or "protocol",
             mail_provider=mail_provider,
             provider_config=request_payload.get("provider_config") or {},
@@ -1102,8 +1117,11 @@ class RegistrationManager:
         config["executor_type"] = req.executor_type
         config["chatgpt_registration_mode"] = "refresh_token"
         config["captcha_solver"] = "yescaptcha"
-        if req.proxy:
+        config["use_proxy"] = bool(getattr(req, "use_proxy", True))
+        if req.proxy and bool(getattr(req, "use_proxy", True)):
             config["proxy"] = req.proxy
+        elif not bool(getattr(req, "use_proxy", True)):
+            config["proxy"] = ""
         return config
 
     def _make_engine(
@@ -1293,7 +1311,7 @@ class RegistrationManager:
                     )
                     return AttemptResult.stopped(message)
 
-                if not str(attempt_req.proxy or "").strip() and self._enabled_proxy_pool_exists():
+                if bool(getattr(attempt_req, "use_proxy", True)) and not str(attempt_req.proxy or "").strip() and self._enabled_proxy_pool_exists():
                     try:
                         selected_proxy, selected_proxy_id = self._acquire_checked_proxy_for_attempt(
                             task_id=task_id,
@@ -1308,7 +1326,7 @@ class RegistrationManager:
                     if selected_proxy:
                         attempt_req = attempt_req.model_copy(update={"proxy": selected_proxy})
                         proxy_entry_id = int(selected_proxy_id or 0) or None
-                elif str(attempt_req.proxy or "").strip():
+                elif bool(getattr(attempt_req, "use_proxy", True)) and str(attempt_req.proxy or "").strip():
                     attempt_log("正在检测代理连通性...")
                     try:
                         proxy_ip, proxy_country = self._query_egress_info(str(attempt_req.proxy or "").strip())

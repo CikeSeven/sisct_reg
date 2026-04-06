@@ -20,6 +20,7 @@ type FormState = {
   concurrency: number
   register_delay_seconds: number
   proxy: string
+  use_proxy: boolean
   executor_type: Executor
   mail_provider: MailProvider
   luckmail_base_url: string
@@ -197,6 +198,7 @@ const defaultForm: FormState = {
   concurrency: 1,
   register_delay_seconds: 0,
   proxy: '',
+  use_proxy: true,
   executor_type: 'protocol',
   mail_provider: 'luckmail',
   luckmail_base_url: 'https://mails.luckyous.com/',
@@ -763,6 +765,7 @@ export default function App() {
           values: {
             executor_type: form.executor_type,
             mail_provider: form.mail_provider,
+            use_proxy: form.use_proxy,
             luckmail_base_url: form.luckmail_base_url,
             luckmail_api_key: form.luckmail_api_key,
             luckmail_email_type: form.luckmail_email_type,
@@ -925,8 +928,10 @@ export default function App() {
         method: 'POST',
       })
       setProxySummary(result.summary)
+      await loadProxySummary()
     } catch (err) {
       setError(err instanceof Error ? err.message : '代理检测失败')
+      await loadProxySummary()
     } finally {
       setTestingProxies(false)
     }
@@ -940,6 +945,7 @@ export default function App() {
         method: 'POST',
       })
       setProxySummary(result.summary)
+      await loadProxySummary()
     } catch (err) {
       setError(err instanceof Error ? err.message : '代理检测失败')
       await loadProxySummary()
@@ -994,6 +1000,7 @@ export default function App() {
           email: null,
           password: null,
           proxy: null,
+          use_proxy: form.use_proxy,
           executor_type: form.executor_type,
           mail_provider: form.mail_provider,
           provider_config: {
@@ -1152,6 +1159,11 @@ export default function App() {
                 </select>
               </label>
             </div>
+
+            <label className="checkbox-row settings-checkbox-row">
+              <input type="checkbox" checked={form.use_proxy} onChange={(e) => updateField('use_proxy', e.target.checked)} />
+              <span>默认使用代理</span>
+            </label>
           </div>
 
           <div className="sub-block">
@@ -1541,6 +1553,11 @@ export default function App() {
                 </select>
               </label>
             </div>
+
+            <label className="checkbox-row">
+              <input type="checkbox" checked={form.use_proxy} onChange={(e) => updateField('use_proxy', e.target.checked)} />
+              <span>使用代理</span>
+            </label>
 
             <label>
               <span>邮箱 provider</span>

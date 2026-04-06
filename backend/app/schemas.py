@@ -16,6 +16,7 @@ class CreateRegisterTaskRequest(BaseModel):
     email: Optional[str] = None
     password: Optional[str] = None
     proxy: Optional[str] = None
+    use_proxy: bool = True
     executor_type: ExecutorType = "protocol"
     mail_provider: MailProvider = "luckmail"
     provider_config: dict[str, Any] = Field(default_factory=dict)

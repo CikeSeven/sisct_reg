@@ -6,6 +6,7 @@ DEFAULT_CONFIG = {
     "count": 1,
     "concurrency": 1,
     "register_delay_seconds": 0,
+    "use_proxy": True,
     "proxy": "",
     "luckmail_base_url": "https://mails.luckyous.com/",
     "luckmail_api_key": "",

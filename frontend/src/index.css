@@ -1110,3 +1110,25 @@ button:disabled {
   justify-content: flex-end;
   width: 100%;
 }
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #d9dde7;
+}
+
+.checkbox-row input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.checkbox-row span {
+  margin: 0;
+}
+
+.settings-checkbox-row {
+  margin-top: 2px;
+}
