@@ -14,6 +14,7 @@ from core.proxy_utils import build_requests_proxy_config, isolate_proxy_session,
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
+    DeferAttemptRequested,
     RegisterTaskStore,
     SkipCurrentAttemptRequested,
     StopCurrentAttemptRequested,
@@ -53,6 +54,7 @@ class QueuedAttempt:
     req_overrides: dict[str, Any] = field(default_factory=dict)
     merged_config_overrides: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
+    not_before: float = 0.0
 
 
 @dataclass
@@ -90,13 +92,25 @@ class TaskExecutionState:
         with self.condition:
             while True:
                 if self.pending_attempts:
-                    item = self.pending_attempts.pop(0)
-                    self.queued_indexes.discard(item.attempt_index)
-                    self.active_indexes.add(item.attempt_index)
-                    return item
+                    now = time.time()
+                    ready_index = next(
+                        (idx for idx, item in enumerate(self.pending_attempts) if float(getattr(item, "not_before", 0.0) or 0.0) <= now),
+                        None,
+                    )
+                    if ready_index is not None:
+                        item = self.pending_attempts.pop(ready_index)
+                        self.queued_indexes.discard(item.attempt_index)
+                        self.active_indexes.add(item.attempt_index)
+                        return item
                 if stop_requested or (self.initial_enqueued and not self.active_indexes):
-                    return None
-                self.condition.wait(timeout=0.25)
+                    if not self.pending_attempts:
+                        return None
+                next_ready_in = None
+                if self.pending_attempts:
+                    now = time.time()
+                    next_ready_at = min(float(getattr(item, "not_before", 0.0) or 0.0) for item in self.pending_attempts)
+                    next_ready_in = max(0.0, next_ready_at - now)
+                self.condition.wait(timeout=min(0.25, next_ready_in) if next_ready_in is not None else 0.25)
 
     def finish_attempt(self, attempt_index: int) -> None:
         with self.condition:
@@ -1232,6 +1246,7 @@ class RegistrationManager:
             nonlocal next_start_time
             attempt_id: int | None = None
             proxy_entry_id: int | None = None
+            deferred_queued_attempt: QueuedAttempt | None = None
             attempt_index = int(queued_attempt.attempt_index)
             proxy_retry_count = max(0, int((queued_attempt.meta or {}).get("proxy_retry_count") or 0))
             attempt_req = req.model_copy(deep=True, update=queued_attempt.req_overrides or {})
@@ -1429,6 +1444,44 @@ class RegistrationManager:
                 state.apply_outcome(AttemptOutcome.STOPPED)
                 self._sync_task_progress(task_id, state)
                 return AttemptResult.stopped(message)
+            except DeferAttemptRequested as exc:
+                suspend_message = str(exc) or "等待验证码超时，已挂起"
+                suspend_meta = dict(getattr(exc, "metadata", None) or {})
+                delay_seconds = max(1, int(getattr(exc, "delay_seconds", 120) or 120))
+                merged_overrides = dict(queued_attempt.merged_config_overrides or {})
+                merged_overrides.update(
+                    dict(suspend_meta.get("config_overrides") or {})
+                    if isinstance(suspend_meta.get("config_overrides"), dict)
+                    else {}
+                )
+                retry_email_binding = (
+                    dict(merged_overrides.get("retry_email_binding") or {})
+                    if isinstance(merged_overrides.get("retry_email_binding"), dict)
+                    else {}
+                )
+                if not retry_email_binding and isinstance(suspend_meta.get("email_binding"), dict):
+                    retry_email_binding = dict(suspend_meta.get("email_binding") or {})
+                if retry_email_binding:
+                    merged_overrides["retry_email_binding"] = retry_email_binding
+                if suspend_meta.get("retry_resume_stage"):
+                    merged_overrides["retry_resume_stage"] = str(suspend_meta.get("retry_resume_stage") or "")
+                if suspend_meta.get("retry_resume_origin"):
+                    merged_overrides["retry_resume_origin"] = str(suspend_meta.get("retry_resume_origin") or "")
+                deferred_queued_attempt = QueuedAttempt(
+                    attempt_index=attempt_index,
+                    req_overrides=dict(queued_attempt.req_overrides or {}),
+                    merged_config_overrides=merged_overrides,
+                    meta=dict(queued_attempt.meta or {}),
+                    not_before=time.time() + delay_seconds,
+                )
+                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="pending", error="")
+                self._log(
+                    task_id,
+                    f"[WAIT] {suspend_message}，已挂起 {delay_seconds}s 后继续",
+                    level="warning",
+                    attempt_index=attempt_index,
+                )
+                return AttemptResult.stopped(suspend_message)
             except Exception as exc:
                 message = str(exc)
                 failure_meta: dict[str, Any] = {}
@@ -1468,6 +1521,8 @@ class RegistrationManager:
             finally:
                 control.finish_attempt(attempt_id)
                 state.finish_attempt(attempt_index)
+                if deferred_queued_attempt is not None:
+                    state.enqueue(deferred_queued_attempt)
 
         try:
             worker_count = max(1, min(req.concurrency, req.count, 100))

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
-from core.task_runtime import TaskInterruption
+from core.task_runtime import DeferAttemptRequested, TaskInterruption
 
 from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
@@ -312,6 +312,7 @@ class RefreshTokenRegistrationEngine:
             proxy=self.proxy_url,
             verbose=False,
             browser_mode=self.browser_mode,
+            extra_config=self.extra_config,
         )
         client._log = lambda msg: self._log(f"[注册流程] {msg}")
         return client
@@ -637,6 +638,12 @@ class RefreshTokenRegistrationEngine:
             return result
 
         except TaskInterruption:
+            raise
+        except DeferAttemptRequested as exc:
+            metadata = dict(getattr(exc, "metadata", None) or {})
+            if isinstance((self.email_info or {}).get("account"), dict) and not isinstance(metadata.get("email_binding"), dict):
+                metadata["email_binding"] = dict((self.email_info or {}).get("account") or {})
+            exc.metadata = metadata
             raise
         except Exception as e:
             self._log(f"RT 注册主链路异常: {e}", "error")

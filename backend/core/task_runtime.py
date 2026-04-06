@@ -34,6 +34,21 @@ class StopCurrentAttemptRequested(TaskInterruption):
         super().__init__(message)
 
 
+class DeferAttemptRequested(RuntimeError):
+    """当前账号临时挂起，稍后重新排队执行。"""
+
+    def __init__(
+        self,
+        message: str = "当前账号已挂起",
+        *,
+        delay_seconds: int = 120,
+        metadata: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.delay_seconds = max(1, int(delay_seconds or 1))
+        self.metadata = dict(metadata or {})
+
+
 class AttemptOutcome(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
@@ -353,6 +368,7 @@ class RegisterTaskStore:
 __all__ = [
     "AttemptOutcome",
     "AttemptResult",
+    "DeferAttemptRequested",
     "RegisterTaskControl",
     "RegisterTaskRecord",
     "RegisterTaskStore",

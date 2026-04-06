@@ -256,6 +256,21 @@ function getStatusLabel(status: string) {
   return mapping[status] || status
 }
 
+function getStageLabel(stage: string) {
+  const mapping: Record<string, string> = {
+    create_email: '创建邮箱',
+    authorize_continue: '进入授权',
+    otp: '邮箱验证码',
+    about_you: '资料提交',
+    workspace_select: '工作区选择',
+    token_exchange: '令牌获取',
+    oauth_login: 'OAuth 登录',
+    register_flow: '注册流程',
+    network_precheck: '网络检测',
+  }
+  return mapping[stage] || stage
+}
+
 function formatAccountLog(line: string) {
   const raw = String(line || '').trim()
   if (!raw) return ''
@@ -307,6 +322,37 @@ function getAccountStatusRank(status: string) {
 
 function isTerminalAccountStatus(status: string) {
   return ['success', 'failed', 'stopped', 'skipped'].includes(String(status || '').toLowerCase())
+}
+
+function getActiveFlowLabel(item: AccountItem) {
+  if (!isActiveAccountStatus(item.status)) return getStatusLabel(item.status)
+
+  const logs = Array.isArray(item.logs) ? item.logs : []
+  for (let index = logs.length - 1; index >= 0; index -= 1) {
+    const raw = String(logs[index] || '').trim()
+    if (!raw) continue
+
+    const stageMatch = raw.match(/\[stage=([^\]]+)\]/)
+    if (stageMatch?.[1]) {
+      return getStageLabel(stageMatch[1].trim())
+    }
+
+    const formatted = formatAccountLog(raw)
+    if (!formatted) continue
+
+    if (formatted.includes('正在等待邮箱') || formatted.includes('等待邮箱验证码')) return '等待邮箱验证码'
+    if (formatted.includes('验证 OTP') || formatted.includes('verify email otp') || formatted.includes('尝试 OTP')) return '验证邮箱验证码'
+    if (formatted.includes('创建邮箱')) return '创建邮箱'
+    if (formatted.includes('about_you') || formatted.includes('提交姓名和生日') || formatted.includes('提交资料')) return '资料提交'
+    if (formatted.includes('工作区') || formatted.includes('workspace')) return '工作区选择'
+    if (formatted.includes('Bootstrap OAuth session') || formatted.includes('/oauth/authorize')) return '初始化 OAuth'
+    if (formatted.includes('authorize_continue') || formatted.includes('进入授权') || formatted.includes('Authorize')) return '进入授权'
+    if (formatted.includes('passwordless')) return 'Passwordless 验证'
+    if (formatted.includes('邮箱验证码') || formatted.includes('email-verification') || formatted.includes('email_otp')) return '邮箱验证码'
+    if (formatted.includes('注册状态推进') || formatted.includes('注册状态起点') || formatted.includes('注册用户')) return '注册流程'
+  }
+
+  return '注册中'
 }
 
 export default function App() {
@@ -1634,7 +1680,7 @@ export default function App() {
                         <span className="account-title-row">
                           <strong>{getAccountTitle(item)}</strong>
                           <span className={`account-inline-status ${getInlineStatusClass(item.status)}`}>
-                            {getStatusLabel(item.status)}
+                            {isActiveAccountStatus(item.status) ? getActiveFlowLabel(item) : getStatusLabel(item.status)}
                           </span>
                         </span>
                       </button>

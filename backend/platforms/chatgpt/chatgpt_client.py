@@ -8,7 +8,7 @@ import uuid
 import time
 from urllib.parse import urlparse
 from core.proxy_utils import build_requests_proxy_config, instrument_session_proxy_requests
-from core.task_runtime import TaskInterruption
+from core.task_runtime import DeferAttemptRequested, TaskInterruption
 
 try:
     from curl_cffi import requests as curl_requests
@@ -76,7 +76,7 @@ class ChatGPTClient:
     BASE = "https://chatgpt.com"
     AUTH = "https://auth.openai.com"
 
-    def __init__(self, proxy=None, verbose=True, browser_mode="protocol"):
+    def __init__(self, proxy=None, verbose=True, browser_mode="protocol", extra_config=None):
         """
         初始化 ChatGPT 客户端
 
@@ -88,6 +88,7 @@ class ChatGPTClient:
         self.proxy = proxy
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
+        self.config = dict(extra_config or {})
         self.device_id = str(uuid.uuid4())
         self.accept_language = random.choice(
             [
@@ -133,6 +134,76 @@ class ChatGPTClient:
         seed_oai_device_cookie(self.session, self.device_id)
         self.last_registration_state = FlowState()
         self.last_stage = ""
+
+    def _otp_suspend_settings(self, prefix: str) -> tuple[int, int, int]:
+        suspend_after = max(
+            90,
+            int(self.config.get(f"{prefix}_otp_suspend_after_seconds", 180) or 180),
+        )
+        suspend_poll = max(
+            30,
+            int(self.config.get(f"{prefix}_otp_suspend_poll_seconds", 120) or 120),
+        )
+        total_timeout = max(
+            suspend_after,
+            int(self.config.get(f"{prefix}_otp_total_timeout_seconds", 1800) or 1800),
+        )
+        return suspend_after, suspend_poll, total_timeout
+
+    @staticmethod
+    def _otp_wait_interval(
+        *,
+        elapsed_seconds: int,
+        remaining_seconds: int,
+        suspend_after: int,
+        suspended_probe_seconds: int = 10,
+    ) -> int:
+        if elapsed_seconds >= suspend_after:
+            return max(1, min(int(suspended_probe_seconds or 10), remaining_seconds))
+
+        wait_time = 30
+        if elapsed_seconds >= 90:
+            wait_time = min(90, 30 + (((elapsed_seconds - 90) // 30) + 1) * 15)
+        return max(1, min(wait_time, remaining_seconds))
+
+    def _clear_otp_suspend_state(self, prefix: str) -> None:
+        for key in (
+            f"{prefix}_otp_started_at",
+            f"{prefix}_otp_total_deadline_at",
+            f"{prefix}_otp_sent_at",
+            f"{prefix}_otp_next_resend_at",
+            f"{prefix}_otp_send_attempts",
+        ):
+            self.config.pop(key, None)
+
+    def _build_otp_defer(
+        self,
+        *,
+        prefix: str,
+        origin: str,
+        stage: str,
+        started_at: float,
+        deadline_at: float,
+        otp_sent_at: float,
+        next_resend_at: float,
+        otp_send_attempts: int,
+        delay_seconds: int,
+    ) -> DeferAttemptRequested:
+        return DeferAttemptRequested(
+            "等待验证码超过 3 分钟，先挂起当前账号",
+            delay_seconds=delay_seconds,
+            metadata={
+                "retry_resume_stage": stage,
+                "retry_resume_origin": origin,
+                "config_overrides": {
+                    f"{prefix}_otp_started_at": float(started_at),
+                    f"{prefix}_otp_total_deadline_at": float(deadline_at),
+                    f"{prefix}_otp_sent_at": float(otp_sent_at),
+                    f"{prefix}_otp_next_resend_at": float(next_resend_at),
+                    f"{prefix}_otp_send_attempts": int(otp_send_attempts),
+                },
+            },
+        )
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
@@ -1105,15 +1176,39 @@ class ChatGPTClient:
             if self._state_is_email_otp(state):
                 self._enter_stage("otp", describe_flow_state(state))
                 self._log("等待邮箱验证码...")
-                if otp_sent_at <= 0:
-                    otp_sent_at = time.time() - 15
-                otp_deadline = time.time() + otp_wait_timeout
-                next_resend_at = min(otp_deadline, time.time() + otp_resend_wait_timeout)
+                suspend_after, suspend_poll, total_timeout = self._otp_suspend_settings("chatgpt_register")
+                now = time.time()
+                otp_started_at = float(self.config.get("chatgpt_register_otp_started_at") or now)
+                otp_deadline = float(
+                    self.config.get("chatgpt_register_otp_total_deadline_at")
+                    or (otp_started_at + total_timeout)
+                )
+                self.config["chatgpt_register_otp_started_at"] = float(otp_started_at)
+                self.config["chatgpt_register_otp_total_deadline_at"] = float(otp_deadline)
+                if otp_deadline <= now:
+                    self._clear_otp_suspend_state("chatgpt_register")
+                    return False, "等待邮箱验证码超时 (30分钟)"
+                otp_sent_at = float(self.config.get("chatgpt_register_otp_sent_at") or otp_sent_at or (now - 15))
+                next_resend_at = float(
+                    self.config.get("chatgpt_register_otp_next_resend_at")
+                    or min(otp_deadline, now + otp_resend_wait_timeout)
+                )
+                otp_send_attempts = max(
+                    int(self.config.get("chatgpt_register_otp_send_attempts") or 0),
+                    otp_send_attempts,
+                )
                 otp_code = ""
 
                 while time.time() < otp_deadline:
-                    remaining = max(1, int(otp_deadline - time.time()))
-                    wait_time = min(30, remaining)
+                    now = time.time()
+                    elapsed = max(0, int(now - otp_started_at))
+                    remaining = max(1, int(otp_deadline - now))
+                    is_suspended_cycle = elapsed >= suspend_after
+                    wait_time = self._otp_wait_interval(
+                        elapsed_seconds=elapsed,
+                        remaining_seconds=remaining,
+                        suspend_after=suspend_after,
+                    )
                     try:
                         otp_code = str(
                             skymail_client.wait_for_verification_code(
@@ -1140,9 +1235,24 @@ class ChatGPTClient:
                             if resend_ok:
                                 self._log(f"重发验证码成功: attempt={otp_send_attempts}")
                                 otp_sent_at = time.time() - 15
+                                self.config["chatgpt_register_otp_sent_at"] = float(otp_sent_at)
                             else:
                                 self._log(f"重发验证码失败: attempt={otp_send_attempts}")
                             next_resend_at = min(otp_deadline, time.time() + otp_resend_wait_timeout)
+                            self.config["chatgpt_register_otp_next_resend_at"] = float(next_resend_at)
+                            self.config["chatgpt_register_otp_send_attempts"] = int(otp_send_attempts)
+                        if is_suspended_cycle and time.time() < otp_deadline:
+                            raise self._build_otp_defer(
+                                prefix="chatgpt_register",
+                                origin="register",
+                                stage="otp",
+                                started_at=otp_started_at,
+                                deadline_at=otp_deadline,
+                                otp_sent_at=otp_sent_at,
+                                next_resend_at=next_resend_at,
+                                otp_send_attempts=otp_send_attempts,
+                                delay_seconds=suspend_poll,
+                            )
                         continue
 
                     tried_otp_codes.add(otp_code)
@@ -1151,6 +1261,7 @@ class ChatGPTClient:
                         otp_verified = True
                         state = next_state
                         self.last_registration_state = state
+                        self._clear_otp_suspend_state("chatgpt_register")
                         break
 
                     failure_text = str(next_state or "")
@@ -1168,10 +1279,12 @@ class ChatGPTClient:
                                 self._log(f"重发验证码失败: attempt={otp_send_attempts}")
                             next_resend_at = min(otp_deadline, time.time() + otp_resend_wait_timeout)
                         continue
+                    self._clear_otp_suspend_state("chatgpt_register")
                     return False, f"验证码失败: {next_state}"
 
                 if not otp_verified:
-                    return False, "未收到可用验证码"
+                    self._clear_otp_suspend_state("chatgpt_register")
+                    return False, "等待邮箱验证码超时 (30分钟)"
                 continue
 
             if (
