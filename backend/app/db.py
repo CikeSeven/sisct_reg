@@ -96,6 +96,21 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_task_results_task_id_id ON task_results(task_id, id);
 
+            CREATE TABLE IF NOT EXISTS task_account_states (
+                task_id TEXT NOT NULL,
+                attempt_index INTEGER NOT NULL,
+                email TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(task_id, attempt_index),
+                FOREIGN KEY(task_id) REFERENCES task_runs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_account_states_task_id_attempt_index
+                ON task_account_states(task_id, attempt_index);
+
             CREATE TABLE IF NOT EXISTS outlook_accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL UNIQUE,
@@ -399,6 +414,74 @@ def get_task_results(task_id: str) -> list[dict[str, Any]]:
     return items
 
 
+def get_task_account_states(task_id: str) -> list[dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id, attempt_index, email, label, status, error, created_at, updated_at
+            FROM task_account_states
+            WHERE task_id = ?
+            ORDER BY attempt_index ASC
+            """,
+            (task_id,),
+        ).fetchall()
+    return [row_to_dict(row) or {} for row in rows]
+
+
+def upsert_task_account_state(
+    task_id: str,
+    attempt_index: int,
+    *,
+    email: str = "",
+    label: str = "",
+    status: str = "pending",
+    error: str = "",
+    created_at: float | None = None,
+    updated_at: float | None = None,
+) -> None:
+    created = float(created_at or time.time())
+    updated = float(updated_at or time.time())
+    with connection(write=True) as conn:
+        existing = conn.execute(
+            """
+            SELECT created_at, email, label, status, error
+            FROM task_account_states
+            WHERE task_id = ? AND attempt_index = ?
+            LIMIT 1
+            """,
+            (task_id, int(attempt_index)),
+        ).fetchone()
+        existing_data = row_to_dict(existing) or {}
+        final_created = float(existing_data.get("created_at") or created)
+        final_email = str(email or existing_data.get("email") or "")
+        final_label = str(label or existing_data.get("label") or final_email or f"第 {int(attempt_index)} 个账号")
+        final_status = str(status or existing_data.get("status") or "pending")
+        final_error = str(error if error is not None else existing_data.get("error") or "")
+        conn.execute(
+            """
+            INSERT INTO task_account_states(
+                task_id, attempt_index, email, label, status, error, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, attempt_index) DO UPDATE SET
+                email = excluded.email,
+                label = excluded.label,
+                status = excluded.status,
+                error = excluded.error,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task_id,
+                int(attempt_index),
+                final_email,
+                final_label,
+                final_status,
+                final_error,
+                final_created,
+                updated,
+            ),
+        )
+
+
 def delete_task_result(task_id: str, attempt_index: int) -> int:
     with connection(write=True) as conn:
         row = conn.execute(
@@ -426,12 +509,21 @@ def delete_task_account(task_id: str, attempt_index: int) -> dict[str, int]:
         ).fetchone()
         deleted_results = int((row_to_dict(result_row) or {}).get("total") or 0)
         deleted_events = int((row_to_dict(event_row) or {}).get("total") or 0)
+        state_row = conn.execute(
+            "SELECT COUNT(*) AS total FROM task_account_states WHERE task_id = ? AND attempt_index = ?",
+            (task_id, int(attempt_index)),
+        ).fetchone()
+        deleted_states = int((row_to_dict(state_row) or {}).get("total") or 0)
         conn.execute(
             "DELETE FROM task_results WHERE task_id = ? AND attempt_index = ?",
             (task_id, int(attempt_index)),
         )
         conn.execute(
             "DELETE FROM task_events WHERE task_id = ? AND attempt_index = ?",
+            (task_id, int(attempt_index)),
+        )
+        conn.execute(
+            "DELETE FROM task_account_states WHERE task_id = ? AND attempt_index = ?",
             (task_id, int(attempt_index)),
         )
 
@@ -443,16 +535,23 @@ def delete_task_account(task_id: str, attempt_index: int) -> dict[str, int]:
             "SELECT COUNT(*) AS total FROM task_events WHERE task_id = ? AND attempt_index IS NOT NULL",
             (task_id,),
         ).fetchone()
+        remain_state_row = conn.execute(
+            "SELECT COUNT(*) AS total FROM task_account_states WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
         remain_results = int((row_to_dict(remain_result_row) or {}).get("total") or 0)
         remain_events = int((row_to_dict(remain_event_row) or {}).get("total") or 0)
+        remain_states = int((row_to_dict(remain_state_row) or {}).get("total") or 0)
 
-        if remain_results <= 0 and remain_events <= 0:
+        if remain_results <= 0 and remain_events <= 0 and remain_states <= 0:
             conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM task_account_states WHERE task_id = ?", (task_id,))
             conn.execute("DELETE FROM task_runs WHERE id = ?", (task_id,))
 
     return {
         "deleted_results": deleted_results,
         "deleted_events": deleted_events,
+        "deleted_states": deleted_states,
     }
 
 

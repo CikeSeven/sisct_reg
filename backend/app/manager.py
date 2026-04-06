@@ -37,6 +37,7 @@ from .db import (
     delete_task_account,
     get_config,
     get_task_events,
+    get_task_account_states,
     get_task_result,
     get_task_results,
     get_task_run,
@@ -44,6 +45,7 @@ from .db import (
     list_task_runs,
     list_enabled_proxy_pool,
     parse_config_row_values,
+    upsert_task_account_state,
     update_proxy_check_result,
     update_task_run,
 )
@@ -360,6 +362,21 @@ class RegistrationManager:
             if error is not None:
                 item["error"] = str(error)
             item["updated_at"] = now
+            persisted_email = str(item.get("email") or "")
+            persisted_label = str(item.get("label") or f"第 {attempt_index} 个账号")
+            persisted_status = str(item.get("status") or "pending")
+            persisted_error = str(item.get("error") or "")
+            persisted_created = float(item.get("created_at") or now)
+        upsert_task_account_state(
+            task_id,
+            int(attempt_index),
+            email=persisted_email,
+            label=persisted_label,
+            status=persisted_status,
+            error=persisted_error,
+            created_at=persisted_created,
+            updated_at=now,
+        )
 
     def _append_task_account_log(
         self,
@@ -563,7 +580,16 @@ class RegistrationManager:
         ).strip()
         logs_by_attempt: dict[int, list[str]] = {}
         email_by_attempt: dict[int, str] = {}
+        state_by_attempt: dict[int, dict[str, Any]] = {}
         current_attempt_index: int | None = None
+        for account_state in get_task_account_states(task_id):
+            try:
+                idx = int(account_state.get("attempt_index") or 0)
+            except Exception:
+                idx = 0
+            if idx <= 0:
+                continue
+            state_by_attempt[idx] = dict(account_state or {})
         all_events = get_task_events(task_id, after_seq=0)
         for event in all_events:
             attempt_index = event.get("attempt_index")
@@ -619,6 +645,7 @@ class RegistrationManager:
             attempt_index = int(result.get("attempt_index") or 0)
             result_attempts.add(attempt_index)
             email = str(result.get("email") or retry_email_binding.get("email") or email_by_attempt.get(attempt_index) or "").strip()
+            persisted_state = state_by_attempt.get(attempt_index) or {}
             items.append(
                 {
                     "id": result.get("id"),
@@ -626,10 +653,10 @@ class RegistrationManager:
                     "email": email,
                     "label": email or f"第 {attempt_index} 个账号",
                     "status": str(result.get("status") or ""),
-                    "error": str(result.get("error") or ""),
+                    "error": str(result.get("error") or persisted_state.get("error") or ""),
                     "logs": logs_by_attempt.get(attempt_index, []),
-                    "created_at": result.get("created_at") or 0,
-                    "updated_at": result.get("created_at") or 0,
+                    "created_at": persisted_state.get("created_at") or result.get("created_at") or 0,
+                    "updated_at": persisted_state.get("updated_at") or result.get("created_at") or 0,
                     "flow_status": "success" if result.get("status") == "success" else "failed",
                     "failure_stage": failure_stage,
                     "failure_stage_label": self._stage_label(failure_stage),
@@ -641,10 +668,17 @@ class RegistrationManager:
             )
 
         fallback_status = "failed" if task_status == "failed" else ("stopped" if task_status == "stopped" else "registering")
-        for attempt_index, logs in sorted(logs_by_attempt.items()):
+        all_attempt_indexes = sorted(set(logs_by_attempt.keys()) | set(state_by_attempt.keys()))
+        for attempt_index in all_attempt_indexes:
+            logs = logs_by_attempt.get(attempt_index, [])
             if attempt_index in result_attempts:
                 continue
-            email = str(email_by_attempt.get(attempt_index) or "").strip()
+            persisted_state = state_by_attempt.get(attempt_index) or {}
+            email = str(
+                persisted_state.get("email")
+                or email_by_attempt.get(attempt_index)
+                or ""
+            ).strip()
             failure_stage = self._extract_stage_from_logs(logs)
             failure_detail = ""
             for line in reversed(logs):
@@ -652,23 +686,26 @@ class RegistrationManager:
                 if "失败" in text or "异常" in text or "超时" in text or "错误" in text:
                     failure_detail = text
                     break
+            persisted_status = str(persisted_state.get("status") or "").strip()
+            item_status = persisted_status or fallback_status
+            persisted_error = str(persisted_state.get("error") or "").strip()
             items.append(
                 {
                     "id": None,
                     "attempt_index": int(attempt_index),
                     "email": email,
-                    "label": email or f"第 {attempt_index} 个账号",
-                    "status": fallback_status,
-                    "error": failure_detail if fallback_status in {"failed", "stopped"} else "",
+                    "label": str(persisted_state.get("label") or email or f"第 {attempt_index} 个账号"),
+                    "status": item_status,
+                    "error": persisted_error or (failure_detail if item_status in {"failed", "stopped"} else ""),
                     "logs": logs,
-                    "created_at": 0,
-                    "updated_at": 0,
-                    "flow_status": "failed" if fallback_status in {"failed", "stopped"} else "running",
+                    "created_at": persisted_state.get("created_at") or 0,
+                    "updated_at": persisted_state.get("updated_at") or 0,
+                    "flow_status": "failed" if item_status in {"failed", "stopped"} else "running",
                     "failure_stage": failure_stage,
                     "failure_stage_label": self._stage_label(failure_stage),
                     "failure_origin": "",
-                    "failure_detail": failure_detail,
-                    "retry_supported": fallback_status in {"failed", "stopped"} and self._supports_retry(mail_provider, email),
+                    "failure_detail": persisted_error or failure_detail,
+                    "retry_supported": item_status in {"failed", "stopped"} and self._supports_retry(mail_provider, email),
                 }
             )
 

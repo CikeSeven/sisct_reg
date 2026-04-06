@@ -609,6 +609,7 @@ class OutlookLocalProvider(ProviderBase):
         self._last_oauth_error: str = ""
         self._last_provider_errors: dict[str, str] = {}
         self._preferred_provider: str = ""
+        self._strict_provider_lock = False
         self._provider_order_with_oauth = ("graph_api", "imap_old", "imap_new")
         self._provider_order_without_oauth = ("password_imap",)
         self._mailboxes = (
@@ -631,6 +632,53 @@ class OutlookLocalProvider(ProviderBase):
             "archive",
         )
 
+    @staticmethod
+    def _is_service_abuse_error(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        return "service abuse mode" in lowered
+
+    @staticmethod
+    def _is_invalid_grant_error(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        return "invalid_grant" in lowered
+
+    def _is_permanent_oauth_failure(self, provider_name: str, error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        if self._is_service_abuse_error(lowered):
+            return True
+        if provider_name == "graph_api" and self._is_invalid_grant_error(lowered):
+            return True
+        return False
+
+    def _lock_provider(self, provider_name: str, *, strict: bool = False) -> None:
+        self._preferred_provider = str(provider_name or "").strip()
+        if strict:
+            self._strict_provider_lock = True
+
+    def _preflight_oauth_mailbox(self) -> None:
+        if not self._account:
+            return
+        client_id = str(self._account.get("client_id") or "").strip()
+        refresh_token = str(self._account.get("refresh_token") or "").strip()
+        if not (client_id and refresh_token):
+            self._seen_ids = self._list_current_ids()
+            return
+        try:
+            messages = self._fetch_graph_messages(limit=5)
+            self._seen_ids = {
+                f"graph_api:{str(item.get('_folder') or 'graph')}:{str(item.get('id') or '').strip()}"
+                for item in messages
+                if str(item.get("id") or "").strip()
+            }
+            self._lock_provider("graph_api", strict=True)
+            self._log(f"[OutlookLocal] Graph API 预检成功: count={len(messages)}，已锁定 graph_api")
+        except Exception as exc:
+            message = str(exc or "").strip()
+            if self._is_permanent_oauth_failure("graph_api", message):
+                raise RuntimeError(f"微软邮箱已失效: {message}")
+            self._log(f"[OutlookLocal] Graph API 预检失败，继续尝试其他方式: {message}")
+            self._seen_ids = self._list_current_ids()
+
     def create_email(self, config=None):
         if self._fixed_account:
             account = dict(self._fixed_account)
@@ -647,7 +695,9 @@ class OutlookLocalProvider(ProviderBase):
             raise RuntimeError(f"微软邮箱记录缺少密码或 OAuth 令牌: {account.get('email')}")
 
         self._account = account
-        self._seen_ids = self._list_current_ids()
+        self._strict_provider_lock = False
+        self._preferred_provider = ""
+        self._preflight_oauth_mailbox()
         auth_desc = "OAuth" if account.get("client_id") and account.get("refresh_token") else "密码登录"
         self._log(f"[OutlookLocal] 已取出账号: {account.get('email')}（{auth_desc}）")
         return {
@@ -843,6 +893,8 @@ class OutlookLocalProvider(ProviderBase):
             order = list(self._provider_order_without_oauth)
         preferred = str(self._preferred_provider or "").strip()
         if preferred and preferred in order:
+            if self._strict_provider_lock:
+                return (preferred,)
             return tuple([preferred, *[item for item in order if item != preferred]])
         return tuple(order)
 
@@ -1110,7 +1162,7 @@ class OutlookLocalProvider(ProviderBase):
                     f"subject={self._subject_preview(subject)} code={code}"
                 )
             if code and code not in exclude_codes:
-                self._preferred_provider = "graph_api"
+                self._lock_provider("graph_api", strict=True)
                 self._log("[OutlookLocal] 已锁定收码方式: graph_api")
                 self._log(f"[OutlookLocal] 命中新验证码: {code}")
                 return code
@@ -1170,7 +1222,7 @@ class OutlookLocalProvider(ProviderBase):
                             f"subject={self._subject_preview(subject)} code={code}"
                         )
                     if code and code not in exclude_codes:
-                        self._preferred_provider = provider_name
+                        self._lock_provider(provider_name, strict=True)
                         self._log(f"[OutlookLocal] 已锁定收码方式: {provider_name}")
                         self._log(f"[OutlookLocal] 命中新验证码: {code}")
                         return code
@@ -1318,7 +1370,6 @@ class OutlookLocalProvider(ProviderBase):
         exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         provider_order = self._read_provider_order()
-        consecutive_full_auth_failures = 0
         fixed_preferred_provider = str(self._preferred_provider or "").strip()
 
         try:
@@ -1347,11 +1398,7 @@ class OutlookLocalProvider(ProviderBase):
                         continue
 
                 if fatal_errors and len(fatal_errors) == len(current_order) and not poll_had_success:
-                    consecutive_full_auth_failures += 1
-                    if consecutive_full_auth_failures >= 2:
-                        raise RuntimeError(" ; ".join(fatal_errors))
-                else:
-                    consecutive_full_auth_failures = 0
+                    raise RuntimeError(" ; ".join(fatal_errors))
                 self._sleep_interruptibly(1, interrupt_check)
         finally:
             pass
