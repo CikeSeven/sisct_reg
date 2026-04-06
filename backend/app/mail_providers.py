@@ -1,0 +1,662 @@
+from __future__ import annotations
+
+import imaplib
+import re
+import time
+from dataclasses import dataclass
+from email import message_from_bytes
+from email.header import decode_header
+from email.policy import default as email_default_policy
+from email.utils import parsedate_to_datetime
+from typing import Optional
+
+import requests
+
+from core.proxy_utils import build_requests_proxy_config
+
+from .db import get_outlook_account_by_email, take_outlook_account
+
+
+class _ServiceType:
+    def __init__(self, value: str):
+        self.value = value
+
+
+@dataclass
+class ProviderBase:
+    proxy: str | None = None
+    log_fn: callable | None = None
+    fixed_email: str | None = None
+
+    def _log(self, message: str) -> None:
+        if callable(self.log_fn):
+            self.log_fn(message)
+
+    @property
+    def proxies(self):
+        return build_requests_proxy_config(self.proxy)
+
+    def _extract_code(self, text: str) -> Optional[str]:
+        text = str(text or "")
+        patterns = [
+            r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})",
+            r"(?is)\bcode\b[^0-9]{0,12}(\d{6})",
+            r"(?<!\d)(\d{6})(?!\d)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1) if match.groups() else match.group(0)
+        return None
+
+    def _decode_raw_content(self, raw: str) -> str:
+        import html
+        import quopri
+
+        text = str(raw or "")
+        if not text:
+            return ""
+        if "\r\n\r\n" in text:
+            text = text.split("\r\n\r\n", 1)[1]
+        elif "\n\n" in text:
+            text = text.split("\n\n", 1)[1]
+        try:
+            text = quopri.decodestring(text).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        text = html.unescape(text)
+        text = re.sub(r"(?im)^content-(?:type|transfer-encoding):.*$", " ", text)
+        text = re.sub(r"(?im)^--+[_=\w.-]+$", " ", text)
+        text = re.sub(r"(?i)----=_part_[\w.]+", " ", text)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+
+class TempMailLolProvider(ProviderBase):
+    service_type = _ServiceType("tempmail_lol")
+
+    def __init__(self, *, api_base: str = "https://api.tempmail.lol/v2", **kwargs):
+        super().__init__(**kwargs)
+        self.api_base = api_base.rstrip("/")
+        self._token = ""
+        self._email = ""
+        self._seen_ids: set[str] = set()
+        if self.fixed_email:
+            raise RuntimeError("tempmail_lol 不支持预置固定邮箱")
+
+    def create_email(self, config=None):
+        response = requests.post(f"{self.api_base}/inbox/create", json={}, proxies=self.proxies, timeout=20)
+        payload = response.json()
+        email = str(payload.get("address") or payload.get("email") or "").strip()
+        token = str(payload.get("token") or "").strip()
+        if not email or not token:
+            raise RuntimeError(f"tempmail.lol 返回异常: {payload}")
+        self._email = email
+        self._token = token
+        self._seen_ids = self._list_ids()
+        self._log(f"[TempMail] 已创建邮箱: {email}")
+        return {"email": email, "token": token, "service_id": token}
+
+    def _list_ids(self) -> set[str]:
+        if not self._token:
+            return set()
+        response = requests.get(
+            f"{self.api_base}/inbox",
+            params={"token": self._token},
+            proxies=self.proxies,
+            timeout=15,
+        )
+        payload = response.json()
+        return {str(item.get("id")) for item in (payload.get("emails") or []) if item.get("id") is not None}
+
+    def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
+        exclude_codes = {str(item) for item in (exclude_codes or set()) if item}
+        deadline = time.monotonic() + max(int(timeout or 0), 1)
+        while time.monotonic() < deadline:
+            response = requests.get(
+                f"{self.api_base}/inbox",
+                params={"token": self._token},
+                proxies=self.proxies,
+                timeout=15,
+            )
+            payload = response.json()
+            emails = sorted(payload.get("emails") or [], key=lambda item: item.get("date", 0), reverse=True)
+            for mail in emails:
+                message_id = str(mail.get("id") or "")
+                if not message_id or message_id in self._seen_ids:
+                    continue
+                if otp_sent_at and (mail.get("date", 0) / 1000) < otp_sent_at:
+                    continue
+                self._seen_ids.add(message_id)
+                text = " ".join([
+                    str(mail.get("subject") or ""),
+                    str(mail.get("body") or ""),
+                    str(mail.get("html") or ""),
+                ])
+                code = self._extract_code(text)
+                if code and code not in exclude_codes:
+                    return code
+            time.sleep(3)
+        raise TimeoutError(f"TempMail.lol 等待验证码超时 ({timeout}s)")
+
+
+class LuckMailProvider(ProviderBase):
+    service_type = _ServiceType("luckmail")
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        project_code: str = "openai",
+        email_type: str = "",
+        domain: str = "",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.project_code = project_code or "openai"
+        self.email_type = email_type or None
+        self.domain = domain or None
+        self._email = ""
+        self._token = ""
+        self._seen_ids: set[str] = set()
+        if not self.base_url or not self.api_key:
+            raise RuntimeError("LuckMail 未配置：请填写 luckmail_base_url 和 luckmail_api_key")
+
+    @property
+    def headers(self):
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-API-Key": self.api_key,
+        }
+
+    def _request(self, method: str, path: str, **kwargs):
+        response = requests.request(
+            method,
+            f"{self.base_url}{path}",
+            headers={**self.headers, **kwargs.pop("headers", {})},
+            proxies=self.proxies,
+            timeout=kwargs.pop("timeout", 30),
+            **kwargs,
+        )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"LuckMail 返回非 JSON: {response.text[:200]}")
+        if payload.get("code") != 0:
+            raise RuntimeError(str(payload.get("message") or payload))
+        return payload.get("data") or {}
+
+    def _find_existing_purchase(self, email: str) -> tuple[str, str] | None:
+        data = self._request(
+            "GET",
+            "/api/v1/openapi/email/purchases",
+            params={"page": 1, "page_size": 100, "keyword": email},
+        )
+        for item in data.get("list") or []:
+            matched = str(item.get("email_address") or "").strip().lower()
+            if matched == email.strip().lower() and item.get("token"):
+                return str(item["email_address"]), str(item["token"])
+        return None
+
+    def create_email(self, config=None):
+        if self.fixed_email:
+            existing = self._find_existing_purchase(self.fixed_email)
+            if not existing:
+                raise RuntimeError("LuckMail 固定邮箱模式下未找到对应已购邮箱和 token")
+            email, token = existing
+            self._email = email
+            self._token = token
+            self._seen_ids = self._list_message_ids(token)
+            self._log(f"[LuckMail] 使用已购邮箱: {email}")
+            return {"email": email, "token": token, "service_id": token}
+
+        body = {"project_code": self.project_code, "quantity": 1}
+        if self.email_type:
+            body["email_type"] = self.email_type
+        if self.domain:
+            body["domain"] = self.domain
+        data = self._request("POST", "/api/v1/openapi/email/purchase", json=body)
+        purchases = data.get("purchases") or []
+        if not purchases:
+            raise RuntimeError(f"LuckMail 购买邮箱返回为空: {data}")
+        item = purchases[0]
+        email = str(item.get("email_address") or "").strip()
+        token = str(item.get("token") or "").strip()
+        if not email or not token:
+            raise RuntimeError(f"LuckMail 返回缺少 email/token: {item}")
+        self._email = email
+        self._token = token
+        self._seen_ids = self._list_message_ids(token)
+        self._log(f"[LuckMail] 已购邮箱: {email}")
+        return {"email": email, "token": token, "service_id": token}
+
+    def _list_message_ids(self, token: str) -> set[str]:
+        data = self._request("GET", f"/api/v1/openapi/email/token/{token}/mails")
+        return {str(item.get("message_id")) for item in (data.get("mails") or []) if item.get("message_id")}
+
+    def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
+        if not self._token:
+            raise RuntimeError("LuckMail token 不存在，无法获取验证码")
+        exclude_codes = {str(item) for item in (exclude_codes or set()) if item}
+        deadline = time.monotonic() + max(int(timeout or 0), 1)
+        while time.monotonic() < deadline:
+            data = self._request("GET", f"/api/v1/openapi/email/token/{self._token}/mails")
+            for mail in data.get("mails") or []:
+                message_id = str(mail.get("message_id") or "").strip()
+                if not message_id or message_id in self._seen_ids:
+                    continue
+                self._seen_ids.add(message_id)
+                text = " ".join([
+                    str(mail.get("subject") or ""),
+                    str(mail.get("body") or ""),
+                    str(mail.get("html_body") or ""),
+                ])
+                code = self._extract_code(text)
+                if code and code not in exclude_codes:
+                    return code
+            time.sleep(4)
+        raise TimeoutError(f"LuckMail 等待验证码超时 ({timeout}s)")
+
+
+class OutlookLocalProvider(ProviderBase):
+    service_type = _ServiceType("outlook_local")
+
+    def __init__(
+        self,
+        *,
+        imap_server: str = "",
+        imap_port: int | str = 993,
+        token_endpoint: str = "",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._imap_servers: list[str] = []
+        if imap_server:
+            self._imap_servers.append(str(imap_server).strip())
+        else:
+            try:
+                from platforms.chatgpt.constants import OUTLOOK_IMAP_SERVERS
+
+                self._imap_servers.extend(
+                    [
+                        str(OUTLOOK_IMAP_SERVERS.get("NEW") or "").strip(),
+                        str(OUTLOOK_IMAP_SERVERS.get("OLD") or "").strip(),
+                    ]
+                )
+            except Exception:
+                self._imap_servers.extend(["outlook.live.com", "outlook.office365.com"])
+        self._imap_servers = [host for host in self._imap_servers if host]
+        try:
+            self._imap_port = int(imap_port or 993)
+        except Exception:
+            self._imap_port = 993
+        self._token_endpoint = str(token_endpoint or "").strip()
+        self._account: dict | None = None
+        self._seen_ids: set[str] = set()
+        self._oauth_access_token: str = ""
+        self._oauth_access_token_expires_at: float = 0.0
+        self._mailboxes = (
+            "INBOX",
+            "Junk",
+            '"Junk Email"',
+            "Junk Email",
+            "Spam",
+            '"[Gmail]/Spam"',
+            '"垃圾邮件"',
+            "垃圾邮件",
+        )
+
+    def create_email(self, config=None):
+        if self.fixed_email:
+            account = get_outlook_account_by_email(self.fixed_email)
+        else:
+            account = take_outlook_account(preferred_email=None)
+        if not account:
+            if self.fixed_email:
+                raise RuntimeError(f"本地微软邮箱池中不存在账号: {self.fixed_email}")
+            raise RuntimeError("本地微软邮箱池为空，请先导入 Outlook 账号")
+
+        if not account.get("password") and not (account.get("client_id") and account.get("refresh_token")):
+            raise RuntimeError(f"微软邮箱记录缺少密码或 OAuth 令牌: {account.get('email')}")
+
+        self._account = account
+        self._seen_ids = self._list_current_ids()
+        auth_desc = "OAuth" if account.get("client_id") and account.get("refresh_token") else "密码登录"
+        self._log(f"[OutlookLocal] 已取出账号: {account.get('email')}（{auth_desc}）")
+        return {
+            "email": str(account.get("email") or "").strip(),
+            "token": f"local-outlook-{account.get('id')}",
+            "service_id": str(account.get("id") or ""),
+        }
+
+    def _token_endpoints(self) -> list[str]:
+        if self._token_endpoint:
+            return [self._token_endpoint]
+        try:
+            from platforms.chatgpt.constants import MICROSOFT_TOKEN_ENDPOINTS
+
+            return [
+                str(MICROSOFT_TOKEN_ENDPOINTS.get("CONSUMERS") or "").strip(),
+                str(MICROSOFT_TOKEN_ENDPOINTS.get("LIVE") or "").strip(),
+                str(MICROSOFT_TOKEN_ENDPOINTS.get("COMMON") or "").strip(),
+            ]
+        except Exception:
+            return [
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                "https://login.live.com/oauth20_token.srf",
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            ]
+
+    def _fetch_oauth_token(self, *, email: str, client_id: str, refresh_token: str) -> str:
+        if not client_id or not refresh_token:
+            return ""
+
+        now = time.time()
+        if self._oauth_access_token and now < max(0.0, self._oauth_access_token_expires_at - 120):
+            return self._oauth_access_token
+
+        scope = ""
+        try:
+            from platforms.chatgpt.constants import MICROSOFT_SCOPES
+
+            scope = str(MICROSOFT_SCOPES.get("IMAP_NEW") or "").strip()
+        except Exception:
+            scope = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+
+        for endpoint in self._token_endpoints():
+            if not endpoint:
+                continue
+            payload = {
+                "client_id": client_id,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }
+            if scope:
+                payload["scope"] = scope
+            try:
+                response = requests.post(endpoint, data=payload, proxies=self.proxies, timeout=20)
+                if response.status_code >= 400:
+                    continue
+                data = response.json() if response.content else {}
+                access_token = str(data.get("access_token") or "").strip()
+                if access_token:
+                    try:
+                        expires_in = int(data.get("expires_in") or 3600)
+                    except Exception:
+                        expires_in = 3600
+                    self._oauth_access_token = access_token
+                    self._oauth_access_token_expires_at = time.time() + max(300, expires_in)
+                    self._log(f"[OutlookLocal] 微软 access token 获取成功: {email}")
+                    return access_token
+            except Exception:
+                continue
+        return ""
+
+    def _imap_auth_oauth(self, conn: imaplib.IMAP4_SSL, *, email: str, access_token: str) -> None:
+        auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
+        conn.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
+
+    def _open_imap(self) -> imaplib.IMAP4_SSL:
+        if not self._account:
+            raise RuntimeError("本地微软邮箱尚未初始化")
+
+        email_addr = str(self._account.get("email") or "").strip()
+        password = str(self._account.get("password") or "").strip()
+        client_id = str(self._account.get("client_id") or "").strip()
+        refresh_token = str(self._account.get("refresh_token") or "").strip()
+        access_token = self._fetch_oauth_token(email=email_addr, client_id=client_id, refresh_token=refresh_token)
+
+        last_error: Exception | None = None
+        for host in self._imap_servers:
+            if access_token:
+                conn: imaplib.IMAP4_SSL | None = None
+                try:
+                    conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                    self._imap_auth_oauth(conn, email=email_addr, access_token=access_token)
+                    return conn
+                except Exception as exc:
+                    last_error = exc
+                    self._oauth_access_token = ""
+                    self._oauth_access_token_expires_at = 0.0
+                    try:
+                        if conn:
+                            conn.logout()
+                    except Exception:
+                        pass
+            if password:
+                conn = None
+                try:
+                    conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
+                    conn.login(email_addr, password)
+                    return conn
+                except Exception as exc:
+                    last_error = exc
+                    try:
+                        if conn:
+                            conn.logout()
+                    except Exception:
+                        pass
+
+        raise RuntimeError(f"Outlook IMAP 登录失败: {last_error}")
+
+    def _decode_header_value(self, value: str) -> str:
+        if not value:
+            return ""
+        decoded: list[str] = []
+        for part, charset in decode_header(value):
+            if isinstance(part, bytes):
+                try:
+                    decoded.append(part.decode(charset or "utf-8", errors="ignore"))
+                except Exception:
+                    decoded.append(part.decode("utf-8", errors="ignore"))
+            else:
+                decoded.append(str(part))
+        return "".join(decoded)
+
+    def _extract_message_text(self, message) -> str:
+        subject = self._decode_header_value(message.get("Subject", ""))
+        body_chunks: list[str] = []
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_maintype() == "multipart":
+                    continue
+                if part.get_content_type() not in {"text/plain", "text/html"}:
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    body_chunks.append(payload.decode(charset, errors="ignore"))
+                except Exception:
+                    body_chunks.append(payload.decode("utf-8", errors="ignore"))
+        else:
+            payload = message.get_payload(decode=True)
+            if payload is None:
+                payload = message.get_payload()
+            if isinstance(payload, bytes):
+                try:
+                    body_chunks.append(payload.decode("utf-8", errors="ignore"))
+                except Exception:
+                    body_chunks.append(payload.decode("latin1", errors="ignore"))
+            elif payload:
+                body_chunks.append(str(payload))
+        return self._decode_raw_content((subject + " " + " ".join(body_chunks)).strip())
+
+    def _select_mailbox(self, conn: imaplib.IMAP4_SSL, mailbox: str) -> bool:
+        try:
+            status, _ = conn.select(mailbox, readonly=True)
+            return status == "OK"
+        except Exception:
+            return False
+
+    def _subject_preview(self, subject: str) -> str:
+        text = re.sub(r"\s+", " ", str(subject or "")).strip()
+        if len(text) <= 80:
+            return text or "(无主题)"
+        return f"{text[:77]}..."
+
+    def _is_recent_message(self, message, otp_sent_at) -> bool:
+        if not otp_sent_at:
+            return True
+        try:
+            sent_at = parsedate_to_datetime(message.get("Date") or "").timestamp()
+        except Exception:
+            return True
+        return sent_at + 300 >= float(otp_sent_at)
+
+    def _list_current_ids(self) -> set[str]:
+        conn = None
+        seen: set[str] = set()
+        try:
+            conn = self._open_imap()
+            for mailbox in self._mailboxes:
+                if not self._select_mailbox(conn, mailbox):
+                    continue
+                status, data = conn.uid("search", None, "ALL")
+                if status != "OK":
+                    continue
+                ids = data[0].split() if data and data[0] else []
+                for uid in ids:
+                    uid_text = uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid)
+                    if uid_text:
+                        seen.add(f"{mailbox}:{uid_text}")
+        except Exception:
+            return set()
+        finally:
+            try:
+                if conn:
+                    conn.logout()
+            except Exception:
+                pass
+        return seen
+
+    def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
+        if not self._account:
+            raise RuntimeError("本地微软邮箱尚未创建")
+
+        exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
+        deadline = time.monotonic() + max(int(timeout or 0), 1)
+        conn = None
+
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    if conn is None:
+                        conn = self._open_imap()
+                    else:
+                        try:
+                            conn.noop()
+                        except Exception:
+                            try:
+                                conn.logout()
+                            except Exception:
+                                pass
+                            conn = self._open_imap()
+                except Exception:
+                    conn = None
+                    time.sleep(5)
+                    continue
+
+                try:
+                    for mailbox in self._mailboxes:
+                        if not self._select_mailbox(conn, mailbox):
+                            continue
+                        status, data = conn.uid("search", None, "ALL")
+                        if status != "OK":
+                            continue
+                        ids = data[0].split() if data and data[0] else []
+                        if len(ids) > 50:
+                            ids = ids[-50:]
+                        for uid in reversed(ids):
+                            uid_text = uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid)
+                            seen_key = f"{mailbox}:{uid_text}"
+                            if not uid_text or seen_key in self._seen_ids:
+                                continue
+                            self._seen_ids.add(seen_key)
+                            status, msg_data = conn.uid("fetch", uid, "(RFC822)")
+                            if status != "OK":
+                                continue
+                            raw = None
+                            for item in msg_data or []:
+                                if isinstance(item, tuple) and item[1]:
+                                    raw = item[1]
+                                    break
+                            if not raw:
+                                continue
+                            msg = message_from_bytes(raw, policy=email_default_policy)
+                            subject = self._decode_header_value(msg.get("Subject", ""))
+                            if not self._is_recent_message(msg, otp_sent_at):
+                                continue
+                            text = self._extract_message_text(msg)
+                            code = self._extract_code(text)
+                            if code and code not in exclude_codes:
+                                self._log(f"[OutlookLocal] 在 {mailbox} 收到验证码邮件: {self._subject_preview(subject)}")
+                                return code
+                            if code and code in exclude_codes:
+                                self._log(f"[OutlookLocal] 在 {mailbox} 收到重复验证码，继续等待")
+                                continue
+                            lowered = text.lower()
+                            subject_lower = subject.lower()
+                            from_header = self._decode_header_value(msg.get("From", "")).lower()
+                            if any(keyword in lowered or keyword in subject_lower or keyword in from_header for keyword in ("openai", "chatgpt", "verification code", "验证码")):
+                                self._log(f"[OutlookLocal] 在 {mailbox} 发现相关邮件但未提取到验证码: {self._subject_preview(subject)}")
+                except Exception:
+                    try:
+                        if conn:
+                            conn.logout()
+                    except Exception:
+                        pass
+                    conn = None
+                time.sleep(5)
+        finally:
+            try:
+                if conn:
+                    conn.logout()
+            except Exception:
+                pass
+
+        raise TimeoutError(f"Outlook 本地邮箱等待验证码超时 ({timeout}s)")
+
+
+def build_mail_provider(
+    provider: str,
+    *,
+    config: dict,
+    proxy: str | None = None,
+    fixed_email: str | None = None,
+    log_fn=None,
+):
+    name = str(provider or "luckmail").strip().lower()
+    if name == "tempmail_lol":
+        return TempMailLolProvider(
+            api_base=str(config.get("tempmail_api_base") or "https://api.tempmail.lol/v2"),
+            proxy=proxy,
+            log_fn=log_fn,
+            fixed_email=fixed_email,
+        )
+    if name == "luckmail":
+        return LuckMailProvider(
+            base_url=str(config.get("luckmail_base_url") or "https://mails.luckyous.com/"),
+            api_key=str(config.get("luckmail_api_key") or ""),
+            project_code="openai",
+            email_type=str(config.get("luckmail_email_type") or ""),
+            domain=str(config.get("luckmail_domain") or ""),
+            proxy=proxy,
+            log_fn=log_fn,
+            fixed_email=fixed_email,
+        )
+    if name == "outlook_local":
+        return OutlookLocalProvider(
+            imap_server=str(config.get("outlook_imap_server") or ""),
+            imap_port=config.get("outlook_imap_port") or 993,
+            token_endpoint=str(config.get("outlook_token_endpoint") or ""),
+            proxy=proxy,
+            log_fn=log_fn,
+            fixed_email=fixed_email,
+        )
+    raise RuntimeError(f"不支持的邮箱 provider: {provider}")
