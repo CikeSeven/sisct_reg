@@ -351,11 +351,10 @@ class LuckMailProvider(ProviderBase):
         while time.monotonic() < deadline:
             self._interrupt(interrupt_check)
             data = self._request("GET", f"/api/v1/openapi/email/token/{self._token}/mails")
-            for mail in data.get("mails") or []:
+            mails = list(data.get("mails") or [])
+            self._log(f"[LuckMail] 已获取邮件列表: count={len(mails)}")
+            for mail in mails:
                 message_id = str(mail.get("message_id") or "").strip()
-                if not message_id or message_id in self._seen_ids:
-                    continue
-                self._seen_ids.add(message_id)
                 subject = str(mail.get("subject") or "").strip()
                 text = " ".join([
                     subject,
@@ -363,6 +362,41 @@ class LuckMailProvider(ProviderBase):
                     str(mail.get("html_body") or ""),
                 ])
                 code = self._extract_code(text)
+                lowered = text.lower()
+                related = any(keyword in lowered for keyword in ("openai", "chatgpt", "verification code", "验证码"))
+                if not message_id:
+                    if code:
+                        self._log(
+                            f"[LuckMail] 邮件缺少 message_id: subject={self._subject_preview(subject)} code={code}"
+                        )
+                    elif related:
+                        self._log(
+                            f"[LuckMail] 邮件缺少 message_id: subject={self._subject_preview(subject)}"
+                        )
+                    continue
+                if not message_id or message_id in self._seen_ids:
+                    if code:
+                        self._log(
+                            f"[LuckMail] 旧邮件: subject={self._subject_preview(subject)} code={code}"
+                        )
+                    elif related:
+                        self._log(
+                            f"[LuckMail] 旧邮件: subject={self._subject_preview(subject)}"
+                        )
+                    continue
+                self._seen_ids.add(message_id)
+                if code:
+                    self._log(
+                        f"[LuckMail] 新邮件: subject={self._subject_preview(subject)} code={code}"
+                    )
+                elif related:
+                    self._log(
+                        f"[LuckMail] 新邮件: subject={self._subject_preview(subject)}"
+                    )
+                else:
+                    self._log(
+                        f"[LuckMail] 新邮件: subject={self._subject_preview(subject)}"
+                    )
                 if code:
                     self._log(
                         f"[LuckMail] 扫描到验证码: subject={self._subject_preview(subject)} code={code}"
@@ -373,8 +407,7 @@ class LuckMailProvider(ProviderBase):
                 if code and code in exclude_codes:
                     self._log(f"[LuckMail] 跳过旧验证码: {code}")
                     continue
-                lowered = text.lower()
-                if any(keyword in lowered for keyword in ("openai", "chatgpt", "verification code", "验证码")):
+                if related:
                     self._log(f"[LuckMail] 发现相关邮件但未提取到验证码: {self._subject_preview(subject)}")
             self._sleep_interruptibly(4, interrupt_check)
         raise TimeoutError(f"LuckMail 等待验证码超时 ({timeout}s)")
