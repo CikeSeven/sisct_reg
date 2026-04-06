@@ -297,6 +297,10 @@ class ChatGPTClient:
     def _state_is_password_registration(self, state: FlowState):
         return state.page_type in {"create_account_password", "password"}
 
+    def _state_is_login_password(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return state.page_type == "login_password" or "log-in/password" in target
+
     def _state_is_email_otp(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return (
@@ -1169,6 +1173,16 @@ class ChatGPTClient:
                 if not otp_verified:
                     return False, "未收到可用验证码"
                 continue
+
+            if (
+                self._state_is_login_password(state)
+                and (not register_submitted)
+                and (not otp_verified)
+                and (not account_created)
+            ):
+                self._enter_stage("authorize_continue", describe_flow_state(state))
+                self._log("命中 login_password，当前会话已转入登录链路", "warning")
+                return False, "redirected_to_login_password"
 
             if self._state_is_about_you(state):
                 self._enter_stage("about_you", describe_flow_state(state))

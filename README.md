@@ -4,6 +4,11 @@
 
 基于 FastAPI + React + Vite 的注册工作台。
 
+## 参考项目
+
+- any-auto-register: https://github.com/zc-zhangchen/any-auto-register.git
+- codex-console: https://github.com/Cong0707/codex-console.git
+
 ## 项目结构
 
 ```text

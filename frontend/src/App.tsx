@@ -352,10 +352,37 @@ export default function App() {
 
   const taskStats = useMemo(() => {
     const summary = activeTask?.summary || {}
+    const accounts = activeTask?.accounts || []
+    let accountSuccess = 0
+    let accountFailed = 0
+    let accountSkipped = 0
+    let accountCompleted = 0
+
+    for (const item of accounts) {
+      const status = String(item.status || '').toLowerCase()
+      if (status === 'success') {
+        accountSuccess += 1
+        accountCompleted += 1
+      } else if (status === 'failed') {
+        accountFailed += 1
+        accountCompleted += 1
+      } else if (status === 'stopped' || status === 'skipped') {
+        accountSkipped += 1
+        accountCompleted += 1
+      }
+    }
+
+    const rawTotal = String(activeTask?.progress || '0/0').split('/')[1]
+    const parsedTotal = Number(rawTotal || 0)
+    const requestTotal = Number((activeTask?.request?.count as number | undefined) ?? 0)
+    const total = Math.max(parsedTotal || 0, requestTotal || 0, accounts.length)
+
     return {
-      success: Number(activeTask?.success ?? summary.success ?? 0),
-      skipped: Number(activeTask?.skipped ?? summary.skipped ?? 0),
-      failed: Number(activeTask?.failed ?? (summary as Record<string, unknown>).failed ?? activeTask?.errors?.length ?? 0),
+      success: Math.max(Number(activeTask?.success ?? summary.success ?? 0), accountSuccess),
+      skipped: Math.max(Number(activeTask?.skipped ?? summary.skipped ?? 0), accountSkipped),
+      failed: Math.max(Number(activeTask?.failed ?? (summary as Record<string, unknown>).failed ?? activeTask?.errors?.length ?? 0), accountFailed),
+      completed: accountCompleted,
+      total,
     }
   }, [activeTask])
 
@@ -1547,7 +1574,7 @@ export default function App() {
 
           <div className="stats-grid compact-stats">
             <StatCard label="状态" value={getStatusLabel(activeTask?.status || 'idle')} tone={isRunning ? 'info' : 'default'} />
-            <StatCard label="进度" value={activeTask?.progress || '0/0'} />
+            <StatCard label="进度" value={`${taskStats.completed}/${taskStats.total}`} />
             <StatCard label="成功" value={taskStats.success} tone="success" />
             <StatCard label="失败" value={taskStats.failed} tone="danger" />
           </div>

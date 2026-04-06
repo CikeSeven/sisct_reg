@@ -302,6 +302,8 @@ class RefreshTokenRegistrationEngine:
             "please login instead",
             "add_phone",
             "add-phone",
+            "redirected_to_login_password",
+            "login_password",
         )
         return any(marker in text for marker in markers)
 

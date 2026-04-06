@@ -418,7 +418,7 @@ class RegistrationManager:
     ) -> tuple[str | None, int | None]:
         tried_proxy_ids: list[int] = []
         enabled_count = len(list_enabled_proxy_pool())
-        candidate_limit = max(1, min(enabled_count or 1, max_candidates))
+        candidate_limit = max(1, enabled_count or 1)
         last_error = ""
 
         for _ in range(candidate_limit):
@@ -570,6 +570,11 @@ class RegistrationManager:
             failure_stage = str(extra.get("failure_stage") or metadata.get("failure_stage") or "").strip()
             failure_origin = str(extra.get("failure_origin") or metadata.get("failure_origin") or "").strip()
             failure_detail = str(extra.get("failure_detail") or metadata.get("failure_detail") or result.get("error") or "").strip()
+            retry_email_binding = (
+                dict(metadata.get("email_binding") or {})
+                if isinstance(metadata.get("email_binding"), dict)
+                else {}
+            )
             retry_supported = bool(
                 extra.get("retry_supported")
                 if "retry_supported" in extra
@@ -577,9 +582,13 @@ class RegistrationManager:
             )
             if not retry_supported and str(result.get("status") or "") == "stopped":
                 retry_supported = True
+            if not retry_supported and str(result.get("status") or "") == "failed" and (
+                failure_stage == "network_precheck" or bool(retry_email_binding)
+            ):
+                retry_supported = True
             attempt_index = int(result.get("attempt_index") or 0)
             result_attempts.add(attempt_index)
-            email = str(result.get("email") or email_by_attempt.get(attempt_index) or "").strip()
+            email = str(result.get("email") or retry_email_binding.get("email") or email_by_attempt.get(attempt_index) or "").strip()
             items.append(
                 {
                     "id": result.get("id"),
@@ -597,11 +606,7 @@ class RegistrationManager:
                     "failure_origin": failure_origin,
                     "failure_detail": failure_detail,
                     "retry_supported": bool(retry_supported) and self._supports_retry(mail_provider, email),
-                    "retry_email_binding": (
-                        dict(metadata.get("email_binding") or {})
-                        if isinstance(metadata.get("email_binding"), dict)
-                        else {}
-                    ),
+                    "retry_email_binding": retry_email_binding,
                 }
             )
 
@@ -1210,6 +1215,7 @@ class RegistrationManager:
             attempt_id: int | None = None
             proxy_entry_id: int | None = None
             attempt_index = int(queued_attempt.attempt_index)
+            proxy_retry_count = max(0, int((queued_attempt.meta or {}).get("proxy_retry_count") or 0))
             attempt_req = req.model_copy(deep=True, update=queued_attempt.req_overrides or {})
             attempt_merged_config = deepcopy(merged_config)
             attempt_merged_config.update(queued_attempt.merged_config_overrides or {})
@@ -1236,18 +1242,78 @@ class RegistrationManager:
                     self._log(task_id, message, level=level, attempt_index=attempt_index)
                     control.checkpoint(attempt_id=attempt_id)
 
-                if not str(attempt_req.proxy or "").strip() and self._enabled_proxy_pool_exists():
-                    selected_proxy, selected_proxy_id = self._acquire_checked_proxy_for_attempt(
-                        task_id=task_id,
-                        attempt_index=attempt_index,
-                        attempt_log=attempt_log,
+                def build_network_precheck_failure(message: str) -> RuntimeError:
+                    failure_detail = str(message or "").strip()
+                    retry_email_binding = (
+                        dict(attempt_merged_config.get("retry_email_binding") or {})
+                        if isinstance(attempt_merged_config.get("retry_email_binding"), dict)
+                        else {}
                     )
+                    metadata = {
+                        "failure_stage": "network_precheck",
+                        "failure_origin": "network_precheck",
+                        "failure_detail": failure_detail,
+                        "resume_supported": self._supports_retry(attempt_req.mail_provider, attempt_req.email or ""),
+                        "email_binding": retry_email_binding,
+                    }
+                    error = RuntimeError(failure_detail)
+                    error.__cause__ = Exception(str(metadata))
+                    return error
+
+                def requeue_attempt_for_proxy_retry(message: str) -> AttemptResult | None:
+                    if str(attempt_req.proxy or "").strip():
+                        return None
+                    if not self._enabled_proxy_pool_exists():
+                        return None
+                    max_proxy_retry_rounds = 5
+                    if proxy_retry_count >= max_proxy_retry_rounds:
+                        return None
+                    retry_meta = dict(queued_attempt.meta or {})
+                    retry_meta["proxy_retry_count"] = proxy_retry_count + 1
+                    queued = state.enqueue(
+                        QueuedAttempt(
+                            attempt_index=attempt_index,
+                            req_overrides=dict(queued_attempt.req_overrides or {}),
+                            merged_config_overrides=dict(queued_attempt.merged_config_overrides or {}),
+                            meta=retry_meta,
+                        )
+                    )
+                    if not queued:
+                        return None
+                    self._upsert_task_account(
+                        task_id,
+                        attempt_index,
+                        email=attempt_req.email or "",
+                        status="pending",
+                        error="",
+                    )
+                    attempt_log(
+                        f"{message}，已重新排队 ({retry_meta['proxy_retry_count']}/{max_proxy_retry_rounds})",
+                        level="warning",
+                    )
+                    return AttemptResult.stopped(message)
+
+                if not str(attempt_req.proxy or "").strip() and self._enabled_proxy_pool_exists():
+                    try:
+                        selected_proxy, selected_proxy_id = self._acquire_checked_proxy_for_attempt(
+                            task_id=task_id,
+                            attempt_index=attempt_index,
+                            attempt_log=attempt_log,
+                        )
+                    except Exception as exc:
+                        retry_result = requeue_attempt_for_proxy_retry(str(exc))
+                        if retry_result is not None:
+                            return retry_result
+                        raise build_network_precheck_failure(str(exc))
                     if selected_proxy:
                         attempt_req = attempt_req.model_copy(update={"proxy": selected_proxy})
                         proxy_entry_id = int(selected_proxy_id or 0) or None
                 elif str(attempt_req.proxy or "").strip():
                     attempt_log("正在检测代理连通性...")
-                    proxy_ip, proxy_country = self._query_egress_info(str(attempt_req.proxy or "").strip())
+                    try:
+                        proxy_ip, proxy_country = self._query_egress_info(str(attempt_req.proxy or "").strip())
+                    except Exception as exc:
+                        raise build_network_precheck_failure(f"代理检测失败: {exc}")
                     if proxy_country:
                         attempt_log(f"代理出口: {proxy_ip} ({proxy_country})")
                     else:
