@@ -739,6 +739,8 @@ class OAuthClient:
 
     def _state_supports_workspace_resolution(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
+        if self._state_is_oauth2_auth(state):
+            return False
         if state.page_type in {
             "consent",
             "workspace_selection",
@@ -1806,6 +1808,30 @@ class OAuthClient:
                 self._log(f"follow state -> {describe_flow_state(state)}")
                 continue
 
+            if self._state_is_oauth2_auth(state):
+                self._log("步骤6: 当前处于 oauth2/auth，继续跟随跳转")
+                code, next_state = self._follow_flow_state(
+                    state,
+                    referer=referer,
+                    user_agent=user_agent,
+                    impersonate=impersonate,
+                )
+                if code:
+                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("步骤7: POST /oauth/token")
+                    tokens = self._exchange_code_for_tokens(
+                        code, code_verifier, user_agent, impersonate
+                    )
+                    if tokens:
+                        self._log("✅ OAuth 登录成功")
+                    else:
+                        self._log("换取 tokens 失败")
+                    return tokens
+                referer = state.current_url or referer
+                state = next_state
+                self._log(f"oauth2/auth -> {describe_flow_state(state)}")
+                continue
+
             if self._state_supports_workspace_resolution(state):
                 self._log("步骤6: 执行 workspace/org 选择")
                 consent_entry = (
@@ -2426,6 +2452,30 @@ class OAuthClient:
                 referer = state.current_url or referer
                 state = next_state
                 self._log(f"follow state -> {describe_flow_state(state)}")
+                continue
+
+            if self._state_is_oauth2_auth(state):
+                self._log("步骤6: 当前处于 oauth2/auth，继续跟随跳转")
+                code, next_state = self._follow_flow_state(
+                    state,
+                    referer=referer,
+                    user_agent=user_agent,
+                    impersonate=impersonate,
+                )
+                if code:
+                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("步骤7: POST /oauth/token")
+                    tokens = self._exchange_code_for_tokens(
+                        code, code_verifier, user_agent, impersonate
+                    )
+                    if tokens:
+                        self._log("✅ OAuth 注册成功")
+                    else:
+                        self._log("换取 tokens 失败")
+                    return tokens
+                referer = state.current_url or referer
+                state = next_state
+                self._log(f"oauth2/auth -> {describe_flow_state(state)}")
                 continue
 
             if self._state_supports_workspace_resolution(state):
