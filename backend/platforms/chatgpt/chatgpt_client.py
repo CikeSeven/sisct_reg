@@ -4,6 +4,8 @@ ChatGPT 注册客户端模块
 """
 
 import random
+import queue
+import threading
 import uuid
 import time
 from urllib.parse import urlparse
@@ -209,33 +211,82 @@ class ChatGPTClient:
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
         for attempt in range(2):
             if prefer_browser:
+                token, source = self._get_sentinel_token_race(flow=flow, page_url=page_url)
+                if token:
+                    if source == "browser":
+                        self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
+                    else:
+                        self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+                    return token
+
+            token = None
+            if not prefer_browser:
+                token = build_sentinel_token(
+                    self.session,
+                    self.device_id,
+                    flow=flow,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                )
+                if token:
+                    self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+                    return token
+            if attempt < 1:
+                self._log(f"{flow}: sentinel 获取失败，准备重试")
+                time.sleep(1.0)
+        return None
+
+    def _get_sentinel_token_race(self, *, flow: str, page_url: str | None = None) -> tuple[str | None, str]:
+        result_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        done = threading.Event()
+
+        def browser_runner() -> None:
+            try:
                 token = get_sentinel_token_via_browser(
                     flow=flow,
                     proxy=self.proxy,
                     page_url=page_url,
                     headless=self.browser_mode != "headed",
                     device_id=self.device_id,
-                    log_fn=lambda msg: self._log(msg),
+                    log_fn=lambda msg: (not done.is_set()) and self._log(msg),
                 )
-                if token:
-                    self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
-                    return token
+            except Exception:
+                token = None
+            if token and not done.is_set():
+                result_queue.put(("browser", token))
 
-            token = build_sentinel_token(
-                self.session,
-                self.device_id,
-                flow=flow,
-                user_agent=self.ua,
-                sec_ch_ua=self.sec_ch_ua,
-                impersonate=self.impersonate,
-            )
-            if token:
-                self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
-                return token
-            if attempt < 1:
-                self._log(f"{flow}: sentinel 获取失败，准备重试")
-                time.sleep(1.0)
-        return None
+        def http_runner() -> None:
+            try:
+                token = build_sentinel_token(
+                    self.session,
+                    self.device_id,
+                    flow=flow,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                )
+            except Exception:
+                token = None
+            if token and not done.is_set():
+                result_queue.put(("http", token))
+
+        browser_thread = threading.Thread(target=browser_runner, daemon=True)
+        http_thread = threading.Thread(target=http_runner, daemon=True)
+        browser_thread.start()
+        http_thread.start()
+
+        deadline = time.time() + 16
+        while time.time() < deadline:
+            try:
+                source, token = result_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            done.set()
+            return token, source
+
+        done.set()
+        return None, ""
 
     def _log(self, msg):
         """输出日志"""

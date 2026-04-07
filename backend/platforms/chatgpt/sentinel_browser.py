@@ -28,7 +28,7 @@ def get_sentinel_token_via_browser(
     *,
     flow: str,
     proxy: Optional[str] = None,
-    timeout_ms: int = 45000,
+    timeout_ms: int = 15000,
     page_url: Optional[str] = None,
     headless: bool = True,
     device_id: Optional[str] = None,
@@ -96,7 +96,7 @@ def get_sentinel_token_via_browser(
             page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_function(
                 "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
-                timeout=min(timeout_ms, 15000),
+                timeout=min(timeout_ms, 8000),
             )
 
             result = page.evaluate(

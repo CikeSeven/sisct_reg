@@ -7,6 +7,8 @@ import secrets
 import uuid
 import json
 import random
+import queue
+import threading
 from urllib.parse import urlparse, parse_qs
 from core.proxy_utils import build_requests_proxy_config, instrument_session_proxy_requests, isolate_proxy_session
 from core.task_runtime import DeferAttemptRequested, TaskInterruption
@@ -291,38 +293,101 @@ class OAuthClient:
                     page_url = candidate
                     break
             token = None
-            browser_failed = False
             if browser_first:
+                token, source = self._get_sentinel_token_race(
+                    flow=flow,
+                    device_id=device_id,
+                    page_url=page_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    log_prefix=log_prefix,
+                )
+                if token:
+                    if source == "browser":
+                        self._log(f"{log_prefix}已通过 Playwright SentinelSDK 获取 token")
+                    else:
+                        self._log(f"{log_prefix}已通过 HTTP PoW 获取 token")
+                    return token
+
+            if not browser_first:
+                token = build_sentinel_token(
+                    self.session,
+                    device_id,
+                    flow=flow,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                if token:
+                    self._log(f"{log_prefix}已通过 HTTP PoW 获取 token")
+                    return token
+
+            if attempt < 1:
+                self._log(f"{log_prefix}sentinel 获取失败，准备重试")
+                time.sleep(1.0)
+        return None
+
+    def _get_sentinel_token_race(
+        self,
+        *,
+        flow: str,
+        device_id: str,
+        page_url: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        log_prefix: str = "",
+    ) -> tuple[str | None, str]:
+        result_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        done = threading.Event()
+
+        def browser_runner() -> None:
+            try:
                 token = get_sentinel_token_via_browser(
                     flow=flow,
                     proxy=self.proxy,
                     page_url=page_url,
                     headless=self.browser_mode != "headed",
                     device_id=device_id,
-                    log_fn=lambda msg: self._log(f"{log_prefix}{msg}"),
+                    log_fn=lambda msg: (not done.is_set()) and self._log(f"{log_prefix}{msg}"),
                 )
-                if token:
-                    self._log(f"{log_prefix}已通过 Playwright SentinelSDK 获取 token")
-                    return token
-                browser_failed = True
+            except Exception:
+                token = None
+            if token and not done.is_set():
+                result_queue.put(("browser", token))
 
-            token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow=flow,
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if token:
-                self._log(f"{log_prefix}已通过 HTTP PoW 获取 token")
-                return token
+        def http_runner() -> None:
+            try:
+                token = build_sentinel_token(
+                    self.session,
+                    device_id,
+                    flow=flow,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+            except Exception:
+                token = None
+            if token and not done.is_set():
+                result_queue.put(("http", token))
 
-            if attempt < 1:
-                if browser_failed:
-                    self._log(f"{log_prefix}sentinel 获取失败，准备重试")
-                time.sleep(1.0)
-        return None
+        browser_thread = threading.Thread(target=browser_runner, daemon=True)
+        http_thread = threading.Thread(target=http_runner, daemon=True)
+        browser_thread.start()
+        http_thread.start()
+
+        deadline = time.time() + 16
+        while time.time() < deadline:
+            try:
+                source, token = result_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            done.set()
+            return token, source
+
+        done.set()
+        return None, ""
 
     @staticmethod
     def _random_chrome_fingerprint():
