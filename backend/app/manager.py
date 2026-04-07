@@ -200,6 +200,7 @@ class RegistrationManager:
         self._log_sequences: dict[str, int] = {}
         self._task_accounts: dict[str, dict[int, dict[str, Any]]] = {}
         self._task_execution_states: dict[str, TaskExecutionState] = {}
+        self._snapshot_cache: dict[tuple[str, bool], tuple[float, dict[str, Any]]] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -359,6 +360,11 @@ class RegistrationManager:
             self._log_sequences[task_id] = seq
             return seq
 
+    def _invalidate_task_snapshot_cache(self, task_id: str) -> None:
+        with self._lock:
+            self._snapshot_cache.pop((task_id, False), None)
+            self._snapshot_cache.pop((task_id, True), None)
+
     def _upsert_task_account(
         self,
         task_id: str,
@@ -407,6 +413,7 @@ class RegistrationManager:
             created_at=persisted_created,
             updated_at=now,
         )
+        self._invalidate_task_snapshot_cache(task_id)
 
     def _append_task_account_log(
         self,
@@ -441,6 +448,7 @@ class RegistrationManager:
                 self._task_execution_states.pop(task_id, None)
             else:
                 self._task_execution_states[task_id] = state
+        self._invalidate_task_snapshot_cache(task_id)
 
     def _get_task_execution_state(self, task_id: str) -> TaskExecutionState | None:
         with self._lock:
@@ -891,6 +899,7 @@ class RegistrationManager:
     def _clear_live_accounts(self, task_id: str) -> None:
         with self._lock:
             self._task_accounts.pop(task_id, None)
+        self._invalidate_task_snapshot_cache(task_id)
 
     def _finalize_incomplete_accounts(
         self,
@@ -936,6 +945,7 @@ class RegistrationManager:
                 entry,
                 discovered_email=self._guess_email_from_message(text),
             )
+        self._invalidate_task_snapshot_cache(task_id)
 
     def _ensure_task_exists(self, task_id: str) -> None:
         if self._task_store.exists(task_id):
@@ -944,6 +954,12 @@ class RegistrationManager:
             raise KeyError(task_id)
 
     def get_task_snapshot(self, task_id: str, *, lite: bool = False) -> dict[str, Any] | None:
+        cache_key = (task_id, bool(lite))
+        now = time.time()
+        with self._lock:
+            cached = self._snapshot_cache.get(cache_key)
+        if cached and (now - float(cached[0])) < 0.8:
+            return deepcopy(cached[1])
         db_task = get_task_run(task_id)
         request_payload = db_task.get("request_json") or {} if db_task is not None else {}
         source = str(request_payload.get("source") or "manual")
@@ -965,13 +981,15 @@ class RegistrationManager:
             snapshot['accounts'] = self._merged_accounts_snapshot(task_id, request_payload=request_payload, log_limit=account_log_limit)
             snapshot['logs'] = []
             snapshot['is_active'] = True
+            with self._lock:
+                self._snapshot_cache[cache_key] = (time.time(), deepcopy(snapshot))
             return snapshot
         
         if db_task is None:
             return None
         events = get_task_events(task_id, after_seq=0)
         results = get_task_results(task_id)
-        return {
+        snapshot = {
             "id": db_task["id"],
             "status": db_task["status"],
             "is_active": False,
@@ -989,6 +1007,9 @@ class RegistrationManager:
             "summary": db_task.get("summary_json") or {},
             "accounts": self._build_db_accounts(task_id, request_payload=db_task.get("request_json") or {}, log_limit=account_log_limit),
         }
+        with self._lock:
+            self._snapshot_cache[cache_key] = (time.time(), deepcopy(snapshot))
+        return snapshot
 
     def list_history(self, *, page: int, page_size: int) -> dict[str, Any]:
         total = count_task_runs()

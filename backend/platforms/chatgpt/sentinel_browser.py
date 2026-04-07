@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Callable, Optional
 
 from core.browser_runtime import (
@@ -10,6 +11,9 @@ from core.browser_runtime import (
     resolve_browser_headless,
 )
 from core.proxy_utils import build_playwright_proxy_config
+
+
+_SENTINEL_BROWSER_SEMAPHORE = threading.BoundedSemaphore(2)
 
 
 def _flow_page_url(flow: str) -> str:
@@ -63,85 +67,92 @@ def get_sentinel_token_via_browser(
 
     logger(f"Sentinel Browser 启动: flow={flow}, url={target_url}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_args)
-        try:
-            context = browser.new_context(
-                viewport={"width": 1440, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.7103.92 Safari/537.36"
-                ),
-                ignore_https_errors=True,
-            )
-            if device_id:
+    if not _SENTINEL_BROWSER_SEMAPHORE.acquire(blocking=False):
+        logger("Sentinel Browser 忙，直接回退 HTTP PoW")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**launch_args)
+            try:
+                context = browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.7103.92 Safari/537.36"
+                    ),
+                    ignore_https_errors=True,
+                )
+                if device_id:
+                    try:
+                        context.add_cookies(
+                            [
+                                {
+                                    "name": "oai-did",
+                                    "value": str(device_id),
+                                    "url": "https://auth.openai.com/",
+                                    "path": "/",
+                                    "secure": True,
+                                    "sameSite": "Lax",
+                                }
+                            ]
+                        )
+                    except Exception:
+                        pass
+
+                page = context.new_page()
+                page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_function(
+                    "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                    timeout=min(timeout_ms, 8000),
+                )
+
+                result = page.evaluate(
+                    """
+                    async ({ flow }) => {
+                        try {
+                            const token = await window.SentinelSDK.token(flow);
+                            return { success: true, token };
+                        } catch (e) {
+                            return {
+                                success: false,
+                                error: (e && (e.message || String(e))) || "unknown",
+                            };
+                        }
+                    }
+                    """,
+                    {"flow": flow},
+                )
+
+                if not result or not result.get("success") or not result.get("token"):
+                    logger(
+                        "Sentinel Browser 未取到 token，回退 HTTP PoW: "
+                        + str((result or {}).get("error") or "no result")
+                    )
+                    return None
+
+                token = str(result["token"] or "").strip()
+                if not token:
+                    logger("Sentinel Browser 返回空 token")
+                    return None
+
                 try:
-                    context.add_cookies(
-                        [
-                            {
-                                "name": "oai-did",
-                                "value": str(device_id),
-                                "url": "https://auth.openai.com/",
-                                "path": "/",
-                                "secure": True,
-                                "sameSite": "Lax",
-                            }
-                        ]
+                    parsed = json.loads(token)
+                    logger(
+                        "Sentinel Browser 成功: "
+                        f"p={'✓' if parsed.get('p') else '✗'} "
+                        f"t={'✓' if parsed.get('t') else '✗'} "
+                        f"c={'✓' if parsed.get('c') else '✗'}"
                     )
                 except Exception:
-                    pass
+                    logger(f"Sentinel Browser 成功: len={len(token)}")
 
-            page = context.new_page()
-            page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_function(
-                "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
-                timeout=min(timeout_ms, 8000),
-            )
-
-            result = page.evaluate(
-                """
-                async ({ flow }) => {
-                    try {
-                        const token = await window.SentinelSDK.token(flow);
-                        return { success: true, token };
-                    } catch (e) {
-                        return {
-                            success: false,
-                            error: (e && (e.message || String(e))) || "unknown",
-                        };
-                    }
-                }
-                """,
-                {"flow": flow},
-            )
-
-            if not result or not result.get("success") or not result.get("token"):
-                logger(
-                    "Sentinel Browser 未取到 token，回退 HTTP PoW: "
-                    + str((result or {}).get("error") or "no result")
-                )
+                return token
+            except Exception as e:
+                logger(f"Sentinel Browser 超时，回退 HTTP PoW: {e}")
                 return None
-
-            token = str(result["token"] or "").strip()
-            if not token:
-                logger("Sentinel Browser 返回空 token")
-                return None
-
-            try:
-                parsed = json.loads(token)
-                logger(
-                    "Sentinel Browser 成功: "
-                    f"p={'✓' if parsed.get('p') else '✗'} "
-                    f"t={'✓' if parsed.get('t') else '✗'} "
-                    f"c={'✓' if parsed.get('c') else '✗'}"
-                )
-            except Exception:
-                logger(f"Sentinel Browser 成功: len={len(token)}")
-
-            return token
-        except Exception as e:
-            logger(f"Sentinel Browser 超时，回退 HTTP PoW: {e}")
-            return None
-        finally:
-            browser.close()
+            finally:
+                browser.close()
+    finally:
+        _SENTINEL_BROWSER_SEMAPHORE.release()

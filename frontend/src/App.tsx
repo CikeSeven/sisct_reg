@@ -630,7 +630,7 @@ export default function App() {
 
   useEffect(() => {
     const hasActiveTasks = taskSnapshots.some((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status))
-    if (!hasActiveTasks) return
+    if (!hasActiveTasks || eventSourceRef.current) return
 
     const timer = window.setInterval(() => {
       void (async () => {
@@ -643,10 +643,10 @@ export default function App() {
           return snapshots.find((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status)) || snapshots[0] || null
         })
       })()
-    }, 2000)
+    }, 5000)
 
     return () => window.clearInterval(timer)
-  }, [taskSnapshots, activeTask?.id])
+  }, [taskSnapshots, activeTask?.id, eventSourceRef.current])
 
   async function bootstrap() {
     try {
