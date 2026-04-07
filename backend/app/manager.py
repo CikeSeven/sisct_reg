@@ -69,6 +69,7 @@ class QueuedAttempt:
     merged_config_overrides: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
     not_before: float = 0.0
+    priority: int = 0
 
 
 @dataclass
@@ -111,10 +112,17 @@ class TaskExecutionState:
                     return None
                 if self.pending_attempts:
                     now = time.time()
-                    ready_index = next(
-                        (idx for idx, item in enumerate(self.pending_attempts) if float(getattr(item, "not_before", 0.0) or 0.0) <= now),
-                        None,
-                    )
+                    ready_candidates = [
+                        (idx, item)
+                        for idx, item in enumerate(self.pending_attempts)
+                        if float(getattr(item, "not_before", 0.0) or 0.0) <= now
+                    ]
+                    ready_index = None
+                    if ready_candidates:
+                        ready_index = min(
+                            ready_candidates,
+                            key=lambda pair: (-int(getattr(pair[1], "priority", 0) or 0), pair[0]),
+                        )[0]
                     if ready_index is not None:
                         item = self.pending_attempts.pop(ready_index)
                         self.queued_indexes.discard(item.attempt_index)
@@ -608,6 +616,7 @@ class RegistrationManager:
                     "retry_from_attempt_index": int(attempt_index),
                     "retry_email_binding": dict(retry_email_binding or {}),
                 },
+                priority=10,
             )
         )
         if queued:
@@ -645,6 +654,7 @@ class RegistrationManager:
                 merged_config_overrides=dict(item.merged_config_overrides or {}),
                 meta=dict(item.meta or {}),
                 not_before=float(item.not_before or 0.0),
+                priority=int(item.priority or 0),
             )
             if not state.enqueue(queued_item):
                 continue
@@ -1146,6 +1156,7 @@ class RegistrationManager:
                                 "retry_from_attempt_index": int(result.get("attempt_index") or 0),
                                 "retry_email_binding": retry_email_binding,
                             },
+                            priority=10,
                         )
                     ],
                 )
@@ -1270,6 +1281,7 @@ class RegistrationManager:
                                     else {}
                                 ),
                             },
+                            priority=10,
                         )
                     ],
                 )
@@ -1953,6 +1965,7 @@ class RegistrationManager:
             attempt_id: int | None = None
             proxy_entry_id: int | None = None
             deferred_queued_attempt: QueuedAttempt | None = None
+            auto_retry_queued_attempt: QueuedAttempt | None = None
             attempt_index = int(queued_attempt.attempt_index)
             proxy_retry_count = max(0, int((queued_attempt.meta or {}).get("proxy_retry_count") or 0))
             attempt_req = req.model_copy(deep=True, update=queued_attempt.req_overrides or {})
@@ -2015,6 +2028,7 @@ class RegistrationManager:
                             req_overrides=dict(queued_attempt.req_overrides or {}),
                             merged_config_overrides=dict(queued_attempt.merged_config_overrides or {}),
                             meta=retry_meta,
+                            priority=2,
                         )
                     )
                     if not queued:
@@ -2190,6 +2204,7 @@ class RegistrationManager:
                     merged_config_overrides=merged_overrides,
                     meta=dict(queued_attempt.meta or {}),
                     not_before=time.time() + delay_seconds,
+                    priority=-1,
                 )
                 self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="pending", error="")
                 self._log(
@@ -2213,6 +2228,69 @@ class RegistrationManager:
                                 failure_meta = parsed
                         except Exception:
                             failure_meta = {}
+                failure_stage = str(failure_meta.get("failure_stage") or "").strip().lower()
+                retry_email_binding = (
+                    dict(failure_meta.get("email_binding") or {})
+                    if isinstance(failure_meta.get("email_binding"), dict)
+                    else {}
+                )
+                auto_retry_count = max(0, int((queued_attempt.meta or {}).get("auto_retry_count") or 0))
+                should_auto_retry = (
+                    auto_retry_count < 1
+                    and failure_stage != "workspace_select"
+                    and not bool(failure_meta.get("stop_task_on_failure"))
+                    and not control.is_stop_requested()
+                )
+                if should_auto_retry:
+                    retry_meta = dict(queued_attempt.meta or {})
+                    retry_meta["auto_retry_count"] = auto_retry_count + 1
+                    retry_merged_overrides = dict(queued_attempt.merged_config_overrides or {})
+                    if failure_stage:
+                        retry_merged_overrides["retry_resume_stage"] = failure_stage
+                    if failure_meta.get("failure_origin"):
+                        retry_merged_overrides["retry_resume_origin"] = str(failure_meta.get("failure_origin") or "")
+                    if retry_email_binding:
+                        retry_merged_overrides["retry_email_binding"] = retry_email_binding
+                    auto_retry_queued_attempt = QueuedAttempt(
+                        attempt_index=attempt_index,
+                        req_overrides={
+                            "email": str(
+                                failure_meta.get("email")
+                                or retry_email_binding.get("email")
+                                or attempt_req.email
+                                or ""
+                            ).strip() or None,
+                            "password": str(
+                                failure_meta.get("password")
+                                or attempt_req.password
+                                or ""
+                            ).strip() or None,
+                            "proxy": attempt_req.proxy,
+                            "use_proxy": bool(getattr(attempt_req, "use_proxy", True)),
+                        },
+                        merged_config_overrides=retry_merged_overrides,
+                        meta=retry_meta,
+                        priority=10,
+                    )
+                    self._upsert_task_account(
+                        task_id,
+                        attempt_index,
+                        email=str(
+                            failure_meta.get("email")
+                            or retry_email_binding.get("email")
+                            or attempt_req.email
+                            or ""
+                        ).strip(),
+                        status="pending",
+                        error="",
+                    )
+                    self._log(
+                        task_id,
+                        f"[RETRY] 非工作区错误，自动重试 1/1: {message}",
+                        level="warning",
+                        attempt_index=attempt_index,
+                    )
+                    return AttemptResult.stopped(message)
                 insert_task_result(
                     task_id,
                     attempt_index=attempt_index,
@@ -2240,6 +2318,8 @@ class RegistrationManager:
                 state.finish_attempt(attempt_index)
                 if deferred_queued_attempt is not None:
                     state.enqueue(deferred_queued_attempt)
+                if auto_retry_queued_attempt is not None:
+                    state.enqueue(auto_retry_queued_attempt)
 
         try:
             worker_count = max(1, min(req.concurrency, req.count, 100))
