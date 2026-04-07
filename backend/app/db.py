@@ -284,6 +284,26 @@ def update_task_run(task_id: str, **fields: Any) -> None:
         conn.execute(f"UPDATE task_runs SET {columns} WHERE id = ?", values)
 
 
+def update_task_request_count(task_id: str, count: int) -> None:
+    with connection(write=True) as conn:
+        row = conn.execute(
+            "SELECT request_json FROM task_runs WHERE id = ? LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        data = row_to_dict(row) or {}
+        try:
+            payload = json.loads(data.get("request_json") or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["count"] = int(count)
+        conn.execute(
+            "UPDATE task_runs SET request_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(payload, ensure_ascii=False), time.time(), task_id),
+        )
+
+
 def append_task_event(
     task_id: str,
     *,

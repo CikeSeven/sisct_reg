@@ -47,6 +47,7 @@ from .db import (
     parse_config_row_values,
     upsert_task_account_state,
     update_proxy_check_result,
+    update_task_request_count,
     update_task_run,
 )
 from .defaults import DEFAULT_CONFIG
@@ -139,6 +140,13 @@ class TaskExecutionState:
             self.drain_requested = True
             self.drain_reason = str(reason or "").strip()
             self.condition.notify_all()
+
+    def extend_total(self, count: int) -> int:
+        with self.condition:
+            start_index = int(self.total) + 1
+            self.total += max(0, int(count or 0))
+            self.condition.notify_all()
+            return start_index
 
     def cancel_pending_attempt(self, attempt_index: int) -> QueuedAttempt | None:
         with self.condition:
@@ -574,6 +582,50 @@ class RegistrationManager:
         )
         return False
 
+    def _append_attempts_to_active_task(
+        self,
+        task_id: str,
+        items: list[QueuedAttempt],
+        *,
+        task_status: str = "running",
+    ) -> dict[str, Any]:
+        state = self._get_task_execution_state(task_id)
+        if state is None:
+            return {"ok": False, "reason": "task_not_active"}
+        normalized_items = [item for item in items if isinstance(item, QueuedAttempt)]
+        if not normalized_items:
+            return {"ok": False, "reason": "no_items"}
+        start_index = state.extend_total(len(normalized_items))
+        enqueued = 0
+        appended_indexes: list[int] = []
+        for offset, item in enumerate(normalized_items):
+            next_index = start_index + offset
+            queued_item = QueuedAttempt(
+                attempt_index=next_index,
+                req_overrides=dict(item.req_overrides or {}),
+                merged_config_overrides=dict(item.merged_config_overrides or {}),
+                meta=dict(item.meta or {}),
+                not_before=float(item.not_before or 0.0),
+            )
+            if not state.enqueue(queued_item):
+                continue
+            email = str((queued_item.req_overrides or {}).get("email") or "").strip()
+            self._upsert_task_account(
+                task_id,
+                next_index,
+                email=email,
+                status="pending",
+                error="",
+            )
+            appended_indexes.append(next_index)
+            enqueued += 1
+        if enqueued <= 0:
+            return {"ok": False, "reason": "append_failed"}
+        update_task_run(task_id, total=state.total, status=task_status, progress=f"{state.completed}/{state.total}")
+        update_task_request_count(task_id, state.total)
+        self._sync_task_progress(task_id, state, status=task_status, summary_total=state.total)
+        return {"ok": True, "task_id": task_id, "appended": enqueued, "attempt_indexes": appended_indexes}
+
     @staticmethod
     def _guess_email_from_message(message: str) -> str:
         import re
@@ -956,7 +1008,7 @@ class RegistrationManager:
             )
         return exported
 
-    def retry_result(self, result_id: int) -> dict[str, Any]:
+    def retry_result(self, result_id: int, *, target_task_id: str | None = None) -> dict[str, Any]:
         result = get_task_result(result_id)
         if result is None:
             return {"ok": False, "reason": "result_not_found"}
@@ -1012,6 +1064,43 @@ class RegistrationManager:
             if queued:
                 return {"ok": True, "task_id": source_task_id, "queued": True}
 
+        target_task_value = str(target_task_id or "").strip()
+        if target_task_value and target_task_value != source_task_id:
+            target_task_row = get_task_run(target_task_value)
+            if (
+                target_task_row is not None
+                and self._task_store.exists(target_task_value)
+                and str(target_task_row.get("status") or "").strip().lower() in {"pending", "running"}
+            ):
+                append_result = self._append_attempts_to_active_task(
+                    target_task_value,
+                    [
+                        QueuedAttempt(
+                            attempt_index=0,
+                            req_overrides={
+                                "email": email or None,
+                                "password": str(result.get("password") or "") or None,
+                                "proxy": current_proxy,
+                                "use_proxy": bool(current_use_proxy),
+                                "executor_type": request_payload.get("executor_type") or merged_config.get("executor_type") or "protocol",
+                                "mail_provider": mail_provider,
+                                "provider_config": request_payload.get("provider_config") or {},
+                                "phone_config": request_payload.get("phone_config") or {},
+                            },
+                            merged_config_overrides={
+                                "retry_resume_stage": failure_stage,
+                                "retry_resume_origin": failure_origin,
+                                "retry_from_result_id": int(result_id),
+                                "retry_from_task_id": str(result.get("task_id") or ""),
+                                "retry_from_attempt_index": int(result.get("attempt_index") or 0),
+                                "retry_email_binding": retry_email_binding,
+                            },
+                        )
+                    ],
+                )
+                if append_result.get("ok"):
+                    return {"ok": True, "task_id": target_task_value, "queued": True, "appended": True}
+
         req = CreateRegisterTaskRequest(
             count=1,
             concurrency=1,
@@ -1045,7 +1134,7 @@ class RegistrationManager:
         )
         return {"ok": True, "task_id": task_id}
 
-    def retry_attempt(self, task_id: str, attempt_index: int) -> dict[str, Any]:
+    def retry_attempt(self, task_id: str, attempt_index: int, *, target_task_id: str | None = None) -> dict[str, Any]:
         task = get_task_run(task_id)
         if task is None:
             return {"ok": False, "reason": "task_not_found"}
@@ -1096,6 +1185,46 @@ class RegistrationManager:
             if queued:
                 return {"ok": True, "task_id": task_id, "queued": True}
 
+        target_task_value = str(target_task_id or "").strip()
+        if target_task_value and target_task_value != task_id:
+            target_task_row = get_task_run(target_task_value)
+            if (
+                target_task_row is not None
+                and self._task_store.exists(target_task_value)
+                and str(target_task_row.get("status") or "").strip().lower() in {"pending", "running"}
+            ):
+                append_result = self._append_attempts_to_active_task(
+                    target_task_value,
+                    [
+                        QueuedAttempt(
+                            attempt_index=0,
+                            req_overrides={
+                                "email": email or None,
+                                "password": None,
+                                "proxy": current_proxy,
+                                "use_proxy": bool(current_use_proxy),
+                                "executor_type": request_payload.get("executor_type") or merged_config.get("executor_type") or "protocol",
+                                "mail_provider": mail_provider,
+                                "provider_config": request_payload.get("provider_config") or {},
+                                "phone_config": request_payload.get("phone_config") or {},
+                            },
+                            merged_config_overrides={
+                                "retry_resume_stage": str(target.get("failure_stage") or "").strip(),
+                                "retry_resume_origin": str(target.get("failure_origin") or "").strip(),
+                                "retry_from_task_id": task_id,
+                                "retry_from_attempt_index": int(attempt_index),
+                                "retry_email_binding": (
+                                    dict(target.get("retry_email_binding") or {})
+                                    if isinstance(target.get("retry_email_binding"), dict)
+                                    else {}
+                                ),
+                            },
+                        )
+                    ],
+                )
+                if append_result.get("ok"):
+                    return {"ok": True, "task_id": target_task_value, "queued": True, "appended": True}
+
         req = CreateRegisterTaskRequest(
             count=1,
             concurrency=1,
@@ -1129,6 +1258,24 @@ class RegistrationManager:
             },
         )
         return {"ok": True, "task_id": new_task_id}
+
+    def append_to_task(self, task_id: str, *, count: int) -> dict[str, Any]:
+        self._ensure_task_exists(task_id)
+        if not self._task_store.exists(task_id):
+            return {"ok": False, "reason": "task_not_active"}
+        task = get_task_run(task_id)
+        if task is None:
+            return {"ok": False, "reason": "task_not_found"}
+        if str(task.get("status") or "").strip().lower() not in {"pending", "running"}:
+            return {"ok": False, "reason": "task_not_active"}
+        append_result = self._append_attempts_to_active_task(
+            task_id,
+            [QueuedAttempt(attempt_index=0) for _ in range(max(1, int(count or 0)))],
+            task_status=str(task.get("status") or "running"),
+        )
+        if append_result.get("ok"):
+            self._log(task_id, f"已追加 {int(count)} 个账号，当前目标 {self._get_task_execution_state(task_id).total if self._get_task_execution_state(task_id) else '-'}")
+        return append_result
 
     def delete_account(
         self,

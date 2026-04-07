@@ -536,6 +536,15 @@ export default function App() {
     return items
   }, [taskSnapshots])
 
+  const currentTaskAccounts = useMemo(() => {
+    const activeTaskId = String(activeTask?.id || '').trim()
+    if (!activeTaskId) return []
+    return sortedAccounts.filter((item) => {
+      const taskIds = Array.isArray(item.task_ids) ? item.task_ids.map((taskId) => String(taskId || '').trim()) : []
+      return taskIds.includes(activeTaskId) || String(item.action_task_id || '').trim() === activeTaskId || String(item.task_id || '').trim() === activeTaskId
+    })
+  }, [activeTask?.id, sortedAccounts])
+
   const taskStats = useMemo(() => {
     const summary = activeTask?.summary || {}
     let accountSuccess = 0
@@ -543,7 +552,7 @@ export default function App() {
     let accountSkipped = 0
     let accountCompleted = 0
 
-    for (const item of sortedAccounts) {
+    for (const item of currentTaskAccounts) {
       const status = String(item.status || '').toLowerCase()
       if (status === 'success') {
         accountSuccess += 1
@@ -560,7 +569,7 @@ export default function App() {
     const rawTotal = String(activeTask?.progress || '0/0').split('/')[1]
     const parsedTotal = Number(rawTotal || 0)
     const requestTotal = Number((activeTask?.request?.count as number | undefined) ?? 0)
-    const total = Math.max(parsedTotal || 0, requestTotal || 0, sortedAccounts.length)
+    const total = Math.max(parsedTotal || 0, requestTotal || 0, currentTaskAccounts.length)
 
     return {
       success: Math.max(Number(activeTask?.success ?? summary.success ?? 0), accountSuccess),
@@ -569,7 +578,7 @@ export default function App() {
       completed: Math.max(accountCompleted, Math.min(total, accountSuccess + accountFailed + accountSkipped)),
       total,
     }
-  }, [activeTask, sortedAccounts])
+  }, [activeTask, currentTaskAccounts])
 
   const totalAccountPages = useMemo(
     () => Math.max(1, Math.ceil(sortedAccounts.length / accountPageSize)),
@@ -1048,33 +1057,38 @@ export default function App() {
     setError('')
     setExpandedAccounts([])
     try {
-      const response = await apiFetch<{ task_id: string }>('/api/register/tasks', {
-        method: 'POST',
-        body: JSON.stringify({
-          count: Number(form.count),
-          concurrency: Number(form.concurrency),
-          register_delay_seconds: Number(form.register_delay_seconds),
-          email: null,
-          password: null,
-          proxy: null,
-          use_proxy: form.use_proxy,
-          executor_type: form.executor_type,
-          mail_provider: form.mail_provider,
-          provider_config: {
-            luckmail_base_url: form.luckmail_base_url,
-            luckmail_api_key: form.luckmail_api_key,
-            luckmail_email_type: form.luckmail_email_type,
-            luckmail_domain: form.luckmail_domain,
-            tempmail_api_base: form.tempmail_api_base,
-          },
-          phone_config: {},
-        }),
-      })
+      const response = isRunning && activeTask
+        ? await apiFetch<{ task_id: string }>(`/api/register/tasks/${activeTask.id}/append`, {
+            method: 'POST',
+            body: JSON.stringify({ count: Number(form.count) }),
+          })
+        : await apiFetch<{ task_id: string }>('/api/register/tasks', {
+            method: 'POST',
+            body: JSON.stringify({
+              count: Number(form.count),
+              concurrency: Number(form.concurrency),
+              register_delay_seconds: Number(form.register_delay_seconds),
+              email: null,
+              password: null,
+              proxy: null,
+              use_proxy: form.use_proxy,
+              executor_type: form.executor_type,
+              mail_provider: form.mail_provider,
+              provider_config: {
+                luckmail_base_url: form.luckmail_base_url,
+                luckmail_api_key: form.luckmail_api_key,
+                luckmail_email_type: form.luckmail_email_type,
+                luckmail_domain: form.luckmail_domain,
+                tempmail_api_base: form.tempmail_api_base,
+              },
+              phone_config: {},
+            }),
+          })
       await loadTaskSnapshots(response.task_id)
       await refreshTask(response.task_id)
       openStream(response.task_id)
     } catch (err) {
-      setError(err instanceof Error ? err.message : '创建任务失败')
+      setError(err instanceof Error ? err.message : (isRunning ? '追加账号失败' : '创建任务失败'))
     } finally {
       setStarting(false)
     }
@@ -1086,11 +1100,12 @@ export default function App() {
     setError('')
     setExpandedAccounts([getAccountKey(item)])
     try {
+      const targetTaskId = isRunning && activeTask?.id ? activeTask.id : ''
       const response = item.id
-        ? await apiFetch<{ task_id: string }>(`/api/register/results/${item.id}/retry`, {
+        ? await apiFetch<{ task_id: string }>(`/api/register/results/${item.id}/retry${targetTaskId ? `?target_task_id=${encodeURIComponent(targetTaskId)}` : ''}`, {
             method: 'POST',
           })
-        : await apiFetch<{ task_id: string }>(`/api/register/tasks/${item.task_id}/attempts/${item.attempt_index}/retry`, {
+        : await apiFetch<{ task_id: string }>(`/api/register/tasks/${item.task_id}/attempts/${item.attempt_index}/retry${targetTaskId ? `?target_task_id=${encodeURIComponent(targetTaskId)}` : ''}`, {
             method: 'POST',
           })
       await loadTaskSnapshots(response.task_id)
@@ -1716,8 +1731,8 @@ export default function App() {
             ) : null}
 
             <div className="form-actions">
-              <button className="primary-btn" type="submit" disabled={starting || isRunning || loading}>
-                {starting ? '任务创建中...' : isRunning ? '任务进行中' : '开始注册'}
+              <button className="primary-btn" type="submit" disabled={starting || loading}>
+                {starting ? (isRunning ? '追加中...' : '任务创建中...') : isRunning ? '追加账号' : '开始注册'}
               </button>
             </div>
           </form>

@@ -53,3 +53,7 @@ class UploadAccountsBatchRequest(BaseModel):
 
 class ExportAccountsBatchRequest(BaseModel):
     items: list[DeleteAccountRequest] = Field(default_factory=list)
+
+
+class AppendTaskRequest(BaseModel):
+    count: int = Field(default=1, ge=1, le=9999)

@@ -15,6 +15,7 @@ from .manager import manager
 from .outlook_pool import router as outlook_router
 from .proxy_pool import router as proxy_router
 from .schemas import (
+    AppendTaskRequest,
     CreateRegisterTaskRequest,
     DeleteAccountRequest,
     DeleteAccountsBatchRequest,
@@ -67,6 +68,19 @@ def create_register_task(body: CreateRegisterTaskRequest):
     return {"task_id": task_id}
 
 
+@app.post("/api/register/tasks/{task_id}/append")
+def append_register_task(task_id: str, body: AppendTaskRequest):
+    result = manager.append_to_task(task_id, count=body.count)
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "")
+        if reason in {"task_not_found"}:
+            raise HTTPException(404, "任务不存在")
+        if reason in {"task_not_active"}:
+            raise HTTPException(409, "任务不在运行中")
+        raise HTTPException(400, "追加失败")
+    return result
+
+
 @app.get("/api/register/tasks/{task_id}")
 def get_register_task(task_id: str, lite: bool = False):
     task = manager.get_task_snapshot(task_id, lite=bool(lite))
@@ -105,8 +119,8 @@ def stop_register_attempt(task_id: str, attempt_index: int):
 
 
 @app.post("/api/register/results/{result_id}/retry")
-def retry_register_result(result_id: int):
-    result = manager.retry_result(result_id)
+def retry_register_result(result_id: int, target_task_id: str | None = None):
+    result = manager.retry_result(result_id, target_task_id=target_task_id)
     if not result.get("ok"):
         reason = str(result.get("reason") or "")
         if reason in {"result_not_found", "task_not_found"}:
@@ -120,8 +134,8 @@ def retry_register_result(result_id: int):
 
 
 @app.post("/api/register/tasks/{task_id}/attempts/{attempt_index}/retry")
-def retry_register_attempt(task_id: str, attempt_index: int):
-    result = manager.retry_attempt(task_id, attempt_index)
+def retry_register_attempt(task_id: str, attempt_index: int, target_task_id: str | None = None):
+    result = manager.retry_attempt(task_id, attempt_index, target_task_id=target_task_id)
     if not result.get("ok"):
         reason = str(result.get("reason") or "")
         if reason in {"task_not_found", "account_not_found"}:
