@@ -196,7 +196,7 @@ class RegistrationManager:
     PROXY_TEST_TIMEOUT_SECONDS = 10
 
     def __init__(self):
-        self._task_store = RegisterTaskStore(max_finished_tasks=200, cleanup_threshold=240)
+        self._task_store = RegisterTaskStore(max_finished_tasks=60, cleanup_threshold=80)
         self._log_sequences: dict[str, int] = {}
         self._task_accounts: dict[str, dict[int, dict[str, Any]]] = {}
         self._task_execution_states: dict[str, TaskExecutionState] = {}
@@ -432,7 +432,7 @@ class RegistrationManager:
                 },
             )
             item["logs"].append(message)
-            item["logs"] = item["logs"][-120:]
+            item["logs"] = item["logs"][-40:]
             item["updated_at"] = time.time()
 
     def _set_task_execution_state(self, task_id: str, state: TaskExecutionState | None) -> None:
@@ -963,8 +963,7 @@ class RegistrationManager:
                 snapshot['meta'] = meta
                 snapshot['request'] = request_payload
             snapshot['accounts'] = self._merged_accounts_snapshot(task_id, request_payload=request_payload, log_limit=account_log_limit)
-            if lite:
-                snapshot['logs'] = []
+            snapshot['logs'] = []
             snapshot['is_active'] = True
             return snapshot
         
@@ -1877,6 +1876,7 @@ class RegistrationManager:
             self._task_store.finish(task_id, status="stopped", success=success, skipped=skipped, errors=[str(exc)], error=str(exc))
             self._finalize_incomplete_accounts(task_id, final_status="stopped", error_message=str(exc))
             self._set_task_execution_state(task_id, None)
+            self._clear_live_accounts(task_id)
             self._task_store.cleanup()
             return
         except Exception as exc:
@@ -1919,6 +1919,7 @@ class RegistrationManager:
             )
             self._task_store.finish(task_id, status="failed", success=success, skipped=skipped, errors=[message], error=message)
             self._set_task_execution_state(task_id, None)
+            self._clear_live_accounts(task_id)
             self._task_store.cleanup()
             return
 
@@ -2257,6 +2258,7 @@ class RegistrationManager:
             self._task_store.finish(task_id, status="failed", success=success, skipped=skipped, errors=errors, error=str(exc))
             self._finalize_incomplete_accounts(task_id, final_status="failed", error_message=str(exc))
             self._set_task_execution_state(task_id, None)
+            self._clear_live_accounts(task_id)
             self._task_store.cleanup()
             return
 
@@ -2288,6 +2290,7 @@ class RegistrationManager:
             error_message=("任务已停止" if final_status == "stopped" else ""),
         )
         self._set_task_execution_state(task_id, None)
+        self._clear_live_accounts(task_id)
         self._task_store.cleanup()
 
 

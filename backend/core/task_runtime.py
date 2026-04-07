@@ -296,6 +296,7 @@ class RegisterTaskStore:
             if record is None:
                 return
             record.logs.append(entry)
+            record.logs = record.logs[-200:]
             record.updated_at = time.time()
 
     def mark_running(self, task_id: str) -> None:
