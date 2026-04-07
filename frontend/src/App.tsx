@@ -731,9 +731,12 @@ export default function App() {
         }
         return [snapshot, ...prev]
       })
+      const taskMailProvider = String(snapshot.request?.mail_provider || snapshot.meta?.mail_provider || '')
+      if (taskMailProvider === 'outlook_local') {
+        await loadOutlookSummary()
+      }
       if (['done', 'failed', 'stopped'].includes(snapshot.status)) {
         closeStream()
-        await loadOutlookSummary()
         await loadLuckmailTokenSummary()
       }
     } catch (err) {
