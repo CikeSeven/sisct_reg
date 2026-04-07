@@ -77,6 +77,8 @@ class TaskExecutionState:
     success: int = 0
     failed: int = 0
     skipped: int = 0
+    drain_requested: bool = False
+    drain_reason: str = ""
     pending_attempts: list[QueuedAttempt] = field(default_factory=list)
     queued_indexes: set[int] = field(default_factory=set)
     active_indexes: set[int] = field(default_factory=set)
@@ -104,6 +106,8 @@ class TaskExecutionState:
     def get_next(self, *, stop_requested: bool) -> QueuedAttempt | None:
         with self.condition:
             while True:
+                if self.drain_requested:
+                    return None
                 if self.pending_attempts:
                     now = time.time()
                     ready_index = next(
@@ -128,6 +132,12 @@ class TaskExecutionState:
     def finish_attempt(self, attempt_index: int) -> None:
         with self.condition:
             self.active_indexes.discard(int(attempt_index))
+            self.condition.notify_all()
+
+    def request_drain(self, reason: str = "") -> None:
+        with self.condition:
+            self.drain_requested = True
+            self.drain_reason = str(reason or "").strip()
             self.condition.notify_all()
 
     def cancel_pending_attempt(self, attempt_index: int) -> QueuedAttempt | None:
@@ -1855,6 +1865,14 @@ class RegistrationManager:
                 if not result or not getattr(result, "success", False):
                     failure_message = getattr(result, "error_message", "") or "注册失败"
                     failure_metadata = getattr(result, "metadata", None) or {}
+                    if bool(failure_metadata.get("stop_task_on_failure")):
+                        stop_reason = str(
+                            failure_metadata.get("stop_task_reason")
+                            or failure_message
+                            or "任务已停止"
+                        ).strip()
+                        state.request_drain(stop_reason)
+                        attempt_log(f"停止后续新账号创建: {stop_reason}", level="warning")
                     raise RuntimeError(failure_message) from Exception(str(failure_metadata))
 
                 upload_results = sync_chatgpt_result(result, runtime_config)
@@ -2041,13 +2059,15 @@ class RegistrationManager:
             return
 
         completed, success, failed, skipped = state.snapshot_counts()
-        final_status = "stopped" if control.is_stop_requested() else "done"
+        final_status = "stopped" if (control.is_stop_requested() or state.drain_requested) else "done"
         summary = {"success": success, "failed": failed, "skipped": skipped, "total": req.count}
         summary_text = (
             f"任务已停止: 成功 {success} 个, 跳过 {skipped} 个, 失败 {failed} 个"
             if final_status == "stopped"
             else f"完成: 成功 {success} 个, 跳过 {skipped} 个, 失败 {failed} 个"
         )
+        if state.drain_requested and state.drain_reason:
+            self._log(task_id, f"停止后续新账号创建: {state.drain_reason}", level="warning")
         self._log(task_id, summary_text)
         update_task_run(
             task_id,

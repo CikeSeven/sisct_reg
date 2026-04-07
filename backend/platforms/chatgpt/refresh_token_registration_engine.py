@@ -188,6 +188,7 @@ class RefreshTokenRegistrationEngine:
         self.password: Optional[str] = None
         self.email_info: Optional[Dict[str, Any]] = None
         self.logs: list[str] = []
+        self._create_email_error: str = ""
 
     @staticmethod
     def _stage_label(stage: str) -> str:
@@ -246,6 +247,7 @@ class RefreshTokenRegistrationEngine:
             logger.info(log_message)
 
     def _create_email(self) -> bool:
+        self._create_email_error = ""
         try:
             self._log(f"正在创建 {self.email_service.service_type.value} 邮箱...")
             self.email_info = self.email_service.create_email()
@@ -260,6 +262,9 @@ class RefreshTokenRegistrationEngine:
                     f"创建邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
                     "error",
                 )
+                self._create_email_error = (
+                    f"{self.email_service.service_type.value} 返回空邮箱地址"
+                )
                 return False
 
             if self.email_info is None:
@@ -269,6 +274,7 @@ class RefreshTokenRegistrationEngine:
             self._log(f"成功创建邮箱: {self.email}")
             return True
         except Exception as e:
+            self._create_email_error = str(e or "").strip()
             self._log(f"创建邮箱失败: {e}", "error")
             return False
 
@@ -468,8 +474,26 @@ class RefreshTokenRegistrationEngine:
 
             self._log("1. 创建邮箱...")
             if not self._create_email():
-                last_error = "创建邮箱失败"
+                last_error = self._create_email_error or "创建邮箱失败"
                 result.error_message = last_error
+                result.metadata = self._build_failure_metadata(
+                    stage="create_email",
+                    origin="create_email",
+                    detail=last_error,
+                    resume_supported=False,
+                )
+                detail_text = str(last_error or "").strip()
+                if any(
+                    marker in detail_text
+                    for marker in (
+                        "本地微软邮箱池为空",
+                        "本地微软邮箱池中不存在账号",
+                        "本地令牌池为空",
+                        "令牌池为空",
+                    )
+                ):
+                    result.metadata["stop_task_on_failure"] = True
+                    result.metadata["stop_task_reason"] = detail_text
                 return result
 
             result.email = self.email or ""
