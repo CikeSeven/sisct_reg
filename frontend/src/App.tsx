@@ -403,6 +403,8 @@ export default function App() {
   const [error, setError] = useState('')
   const eventSourceRef = useRef<EventSource | null>(null)
   const accountLogRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const refreshTimerRef = useRef<number | null>(null)
+  const refreshInFlightRef = useRef(false)
 
   const isRunning = activeTask ? Boolean(activeTask.is_active) && !['done', 'failed', 'stopped'].includes(activeTask.status) : false
 
@@ -755,6 +757,30 @@ export default function App() {
   function closeStream() {
     eventSourceRef.current?.close()
     eventSourceRef.current = null
+    if (refreshTimerRef.current !== null) {
+      window.clearTimeout(refreshTimerRef.current)
+      refreshTimerRef.current = null
+    }
+  }
+
+  function scheduleRefresh(taskId: string, delay = 250) {
+    if (!taskId) return
+    if (refreshInFlightRef.current) return
+    if (refreshTimerRef.current !== null) {
+      window.clearTimeout(refreshTimerRef.current)
+    }
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null
+      if (refreshInFlightRef.current) return
+      refreshInFlightRef.current = true
+      void (async () => {
+        try {
+          await refreshTask(taskId)
+        } finally {
+          refreshInFlightRef.current = false
+        }
+      })()
+    }, delay)
   }
 
   function openStream(taskId: string) {
@@ -765,15 +791,15 @@ export default function App() {
       try {
         const payload = JSON.parse(event.data)
         if (payload?.done || payload?.message) {
-          void refreshTask(taskId)
+          scheduleRefresh(taskId)
         }
       } catch {
-        void refreshTask(taskId)
+        scheduleRefresh(taskId)
       }
     }
     source.onerror = () => {
       if (eventSourceRef.current !== source) return
-      void refreshTask(taskId)
+      scheduleRefresh(taskId, 500)
     }
   }
 
