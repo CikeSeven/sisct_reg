@@ -483,6 +483,35 @@ class RegistrationManager:
         summary = get_proxy_pool_summary(limit=1)
         return int(summary.get("enabled") or 0) > 0
 
+    def _retry_count_for_proxy_pool(self, enabled_count: int) -> int:
+        count = max(0, int(enabled_count or 0))
+        if count <= 0:
+            return 1
+        return 5 if count < 5 else count
+
+    def _check_single_proxy_with_retries(
+        self,
+        proxy_url: str,
+        *,
+        attempt_log,
+        retry_count: int = 5,
+    ) -> tuple[str, str]:
+        last_error = ""
+        total = max(1, int(retry_count or 1))
+        for attempt_no in range(1, total + 1):
+            if attempt_no == 1:
+                attempt_log("正在检测代理连通性...")
+            else:
+                attempt_log(f"正在重试代理连通性 ({attempt_no}/{total})...")
+            try:
+                return self._query_egress_info(proxy_url)
+            except Exception as exc:
+                last_error = str(exc)
+                attempt_log(f"代理检测失败: {last_error}", level="error")
+                if attempt_no < total:
+                    attempt_log("代理检测失败，继续重试")
+        raise RuntimeError(f"代理检测失败: {last_error}" if last_error else "代理检测失败")
+
     def _acquire_checked_proxy_for_attempt(
         self,
         *,
@@ -493,10 +522,12 @@ class RegistrationManager:
     ) -> tuple[str | None, int | None]:
         tried_proxy_ids: list[int] = []
         enabled_count = len(list_enabled_proxy_pool())
-        candidate_limit = max(1, enabled_count or 1)
+        candidate_limit = self._retry_count_for_proxy_pool(enabled_count)
         last_error = ""
 
         for _ in range(candidate_limit):
+            if enabled_count > 0 and len(tried_proxy_ids) >= enabled_count:
+                tried_proxy_ids = []
             entry = acquire_proxy_pool_entry(exclude_ids=tried_proxy_ids)
             if not entry:
                 break
@@ -1995,11 +2026,14 @@ class RegistrationManager:
                         attempt_req = attempt_req.model_copy(update={"proxy": selected_proxy})
                         proxy_entry_id = int(selected_proxy_id or 0) or None
                 elif bool(getattr(attempt_req, "use_proxy", True)) and str(attempt_req.proxy or "").strip():
-                    attempt_log("正在检测代理连通性...")
                     try:
-                        proxy_ip, proxy_country = self._query_egress_info(str(attempt_req.proxy or "").strip())
+                        proxy_ip, proxy_country = self._check_single_proxy_with_retries(
+                            str(attempt_req.proxy or "").strip(),
+                            attempt_log=attempt_log,
+                            retry_count=5,
+                        )
                     except Exception as exc:
-                        raise build_network_precheck_failure(f"代理检测失败: {exc}")
+                        raise build_network_precheck_failure(str(exc))
                     if proxy_country:
                         attempt_log(f"代理出口: {proxy_ip} ({proxy_country})")
                     else:
