@@ -651,6 +651,7 @@ export default function App() {
       const nextActiveTask = runningSnapshot || snapshots[0] || null
       setActiveTask(nextActiveTask)
       if (nextActiveTask?.is_active && !['done', 'failed', 'stopped'].includes(nextActiveTask.status)) {
+        await refreshTask(nextActiveTask.id)
         openStream(nextActiveTask.id)
       }
     } catch (err) {
@@ -684,7 +685,9 @@ export default function App() {
       await Promise.all(
         orderedIds.map(async (taskId) => {
           try {
-            const snapshot = await apiFetch<TaskSnapshot>(`/api/register/tasks/${taskId}`)
+            const snapshot = await apiFetch<TaskSnapshot>(
+              `/api/register/tasks/${taskId}${preferTaskId && taskId === preferTaskId ? '' : '?lite=1'}`,
+            )
             const historyItem = historyMap.get(taskId)
             const request = historyItem?.request || {}
             return {

@@ -582,15 +582,24 @@ class RegistrationManager:
         match = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", text)
         return str(match.group(1) if match else "").strip()
 
-    def _get_live_accounts(self, task_id: str) -> list[dict[str, Any]]:
+    def _get_live_accounts(self, task_id: str, *, log_limit: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
             task_accounts = self._task_accounts.get(task_id, {})
             items = [deepcopy(item) for item in task_accounts.values()]
+        if log_limit is not None:
+            for item in items:
+                item["logs"] = list(item.get("logs") or [])[-max(int(log_limit or 0), 0):]
         active_statuses = {"pending", "registering", "running"}
         items.sort(key=lambda item: (0 if item.get("status") in active_statuses else 1, item.get("attempt_index", 0)))
         return items
 
-    def _build_db_accounts(self, task_id: str, *, request_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def _build_db_accounts(
+        self,
+        task_id: str,
+        *,
+        request_payload: dict[str, Any] | None = None,
+        log_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         request_payload = request_payload or {}
         task_row = get_task_run(task_id) or {}
         task_status = str(task_row.get("status") or "").strip().lower()
@@ -635,7 +644,10 @@ class RegistrationManager:
                 else:
                     continue
             idx = int(attempt_index)
-            logs_by_attempt.setdefault(idx, []).append(str(event.get("message") or ""))
+            logs = logs_by_attempt.setdefault(idx, [])
+            logs.append(str(event.get("message") or ""))
+            if log_limit is not None and len(logs) > max(int(log_limit or 0), 0):
+                logs_by_attempt[idx] = logs[-max(int(log_limit or 0), 0):]
             guessed_email = self._guess_email_from_message(message)
             if guessed_email and idx not in email_by_attempt:
                 email_by_attempt[idx] = guessed_email
@@ -757,9 +769,15 @@ class RegistrationManager:
         items.sort(key=lambda item: (0 if item.get("status") in active_statuses else 1, item.get("attempt_index", 0)))
         return items
 
-    def _merged_accounts_snapshot(self, task_id: str, *, request_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        db_items = self._build_db_accounts(task_id, request_payload=request_payload)
-        live_items = self._get_live_accounts(task_id)
+    def _merged_accounts_snapshot(
+        self,
+        task_id: str,
+        *,
+        request_payload: dict[str, Any] | None = None,
+        log_limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        db_items = self._build_db_accounts(task_id, request_payload=request_payload, log_limit=log_limit)
+        live_items = self._get_live_accounts(task_id, log_limit=log_limit)
         if not live_items:
             return db_items
         db_map = {int(item.get("attempt_index") or 0): item for item in db_items}
@@ -842,13 +860,14 @@ class RegistrationManager:
         if get_task_run(task_id) is None:
             raise KeyError(task_id)
 
-    def get_task_snapshot(self, task_id: str) -> dict[str, Any] | None:
+    def get_task_snapshot(self, task_id: str, *, lite: bool = False) -> dict[str, Any] | None:
         db_task = get_task_run(task_id)
         request_payload = db_task.get("request_json") or {} if db_task is not None else {}
         source = str(request_payload.get("source") or "manual")
         meta = request_payload.get("meta") if isinstance(request_payload.get("meta"), dict) else {}
         db_status = str((db_task or {}).get("status") or "").strip().lower()
         record_is_active = self._task_store.exists(task_id) and db_status not in {"done", "failed", "stopped"}
+        account_log_limit = 8 if lite else None
         if record_is_active:
             snapshot = self._task_store.snapshot(task_id)
             if db_task is not None:
@@ -860,7 +879,9 @@ class RegistrationManager:
                 snapshot['source'] = source
                 snapshot['meta'] = meta
                 snapshot['request'] = request_payload
-            snapshot['accounts'] = self._merged_accounts_snapshot(task_id, request_payload=request_payload)
+            snapshot['accounts'] = self._merged_accounts_snapshot(task_id, request_payload=request_payload, log_limit=account_log_limit)
+            if lite:
+                snapshot['logs'] = []
             snapshot['is_active'] = True
             return snapshot
         
@@ -881,10 +902,10 @@ class RegistrationManager:
             "failed": db_task["failed"],
             "skipped": db_task["skipped"],
             "errors": [item["error"] for item in results if item.get("status") == "failed" and item.get("error")],
-            "logs": [item["message"] for item in events],
+            "logs": [] if lite else [item["message"] for item in events],
             "control": {"stop_requested": db_task["status"] == "stopped"},
             "summary": db_task.get("summary_json") or {},
-            "accounts": self._build_db_accounts(task_id, request_payload=db_task.get("request_json") or {}),
+            "accounts": self._build_db_accounts(task_id, request_payload=db_task.get("request_json") or {}, log_limit=account_log_limit),
         }
 
     def list_history(self, *, page: int, page_size: int) -> dict[str, Any]:

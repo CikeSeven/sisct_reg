@@ -68,8 +68,8 @@ def create_register_task(body: CreateRegisterTaskRequest):
 
 
 @app.get("/api/register/tasks/{task_id}")
-def get_register_task(task_id: str):
-    task = manager.get_task_snapshot(task_id)
+def get_register_task(task_id: str, lite: bool = False):
+    task = manager.get_task_snapshot(task_id, lite=bool(lite))
     if not task:
         raise HTTPException(404, "任务不存在")
     return task
