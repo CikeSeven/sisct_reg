@@ -1214,6 +1214,41 @@ class OAuthClient:
                 r = self.session.post(request_url, **kwargs)
                 self._log(f"/authorize/continue(重试) -> {r.status_code}")
 
+            if (
+                r.status_code == 409
+                and "invalid_state" in (r.text or "")
+                and authorize_url
+                and authorize_params
+            ):
+                self._log("authorize_continue 命中 invalid_state，重新 bootstrap OAuth session...")
+                authorize_final_url = self._bootstrap_oauth_session(
+                    authorize_url,
+                    authorize_params,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                continue_referer = (
+                    authorize_final_url
+                    if authorize_final_url.startswith(self.oauth_issuer)
+                    else f"{self.oauth_issuer}/log-in"
+                )
+                headers["Referer"] = continue_referer
+                headers["Sec-Fetch-Site"] = "same-origin"
+                headers.update(generate_datadog_trace())
+                kwargs = {
+                    "json": payload,
+                    "headers": headers,
+                    "timeout": 30,
+                    "allow_redirects": False,
+                }
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+                self._browser_pause()
+                r = self.session.post(request_url, **kwargs)
+                self._log(f"/authorize/continue(invalid_state重试) -> {r.status_code}")
+
             if r.status_code != 200:
                 self._set_error(f"提交邮箱失败: {r.status_code} - {r.text[:180]}")
                 return None

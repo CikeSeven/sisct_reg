@@ -151,21 +151,7 @@ def delete_register_account(body: DeleteAccountRequest):
 
 @app.post("/api/register/accounts/delete-batch")
 def delete_register_accounts_batch(body: DeleteAccountsBatchRequest):
-    deleted = 0
-    skipped: list[dict[str, object]] = []
-    for item in body.items:
-        result = manager.delete_account(item.task_id, item.attempt_index, item.task_ids, item.refs)
-        if result.get("ok"):
-            deleted += 1
-        else:
-            skipped.append(
-                {
-                    "task_id": item.task_id,
-                    "attempt_index": item.attempt_index,
-                    "reason": result.get("reason") or "delete_failed",
-                }
-            )
-    return {"ok": True, "deleted": deleted, "skipped": skipped}
+    return manager.delete_accounts_batch(body.items)
 
 
 @app.post("/api/register/accounts/upload")

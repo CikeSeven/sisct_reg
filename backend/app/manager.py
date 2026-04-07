@@ -1171,6 +1171,94 @@ class RegistrationManager:
                         self._task_accounts.pop(candidate_task_id, None)
         return {"ok": True, "deleted_results": deleted_results, "deleted_events": deleted_events}
 
+    def delete_accounts_batch(self, items: list[Any]) -> dict[str, Any]:
+        grouped_refs: dict[str, list[int]] = {}
+        raw_refs: list[tuple[str, int, list[str] | None, list[dict[str, Any]] | None]] = []
+        for raw_item in items or []:
+            item = raw_item.model_dump() if hasattr(raw_item, "model_dump") else (dict(raw_item) if isinstance(raw_item, dict) else {})
+            task_id = str(item.get("task_id") or "").strip()
+            try:
+                attempt_index = int(item.get("attempt_index") or 0)
+            except Exception:
+                attempt_index = 0
+            task_ids = item.get("task_ids") if isinstance(item.get("task_ids"), list) else []
+            refs = item.get("refs") if isinstance(item.get("refs"), list) else []
+            raw_refs.append((task_id, attempt_index, task_ids, refs))
+
+        validated: list[tuple[str, int]] = []
+        skipped: list[dict[str, object]] = []
+        cache_snapshots: dict[str, dict[str, Any] | None] = {}
+
+        for task_id, attempt_index, task_ids, refs in raw_refs:
+            candidate_refs = self._collect_account_candidate_refs(
+                task_id,
+                attempt_index,
+                task_ids=task_ids,
+                refs=refs,
+            )
+            if not candidate_refs:
+                skipped.append({"task_id": task_id, "attempt_index": attempt_index, "reason": "task_not_found"})
+                continue
+            found_any = False
+            matched = False
+            for candidate_task_id, candidate_attempt_index in candidate_refs:
+                if candidate_task_id not in cache_snapshots:
+                    cache_snapshots[candidate_task_id] = self.get_task_snapshot(candidate_task_id)
+                snapshot = cache_snapshots[candidate_task_id]
+                if snapshot is None:
+                    continue
+                found_any = True
+                target = next(
+                    (
+                        item
+                        for item in (snapshot.get("accounts") or [])
+                        if int(item.get("attempt_index") or 0) == int(candidate_attempt_index)
+                    ),
+                    None,
+                )
+                if target is None:
+                    continue
+                if str(target.get("status") or "") in {"pending", "registering", "running"}:
+                    skipped.append({"task_id": candidate_task_id, "attempt_index": candidate_attempt_index, "reason": "account_running"})
+                    matched = True
+                    break
+                validated.append((candidate_task_id, int(candidate_attempt_index)))
+                matched = True
+                break
+            if not matched:
+                skipped.append(
+                    {
+                        "task_id": task_id,
+                        "attempt_index": attempt_index,
+                        "reason": "account_not_found" if found_any else "task_not_found",
+                    }
+                )
+
+        dedup_validated = list(dict.fromkeys(validated))
+        deleted = 0
+        deleted_results = 0
+        deleted_events = 0
+        for candidate_task_id, candidate_attempt_index in dedup_validated:
+            result = delete_task_account(candidate_task_id, candidate_attempt_index)
+            if int(result.get("deleted_results") or 0) > 0 or int(result.get("deleted_events") or 0) > 0 or int(result.get("deleted_states") or 0) > 0:
+                deleted += 1
+            deleted_results += int(result.get("deleted_results") or 0)
+            deleted_events += int(result.get("deleted_events") or 0)
+        with self._lock:
+            for candidate_task_id, candidate_attempt_index in dedup_validated:
+                task_accounts = self._task_accounts.get(candidate_task_id)
+                if task_accounts is not None:
+                    task_accounts.pop(int(candidate_attempt_index), None)
+                    if not task_accounts:
+                        self._task_accounts.pop(candidate_task_id, None)
+        return {
+            "ok": True,
+            "deleted": deleted,
+            "deleted_results": deleted_results,
+            "deleted_events": deleted_events,
+            "skipped": skipped,
+        }
+
     @staticmethod
     def _collect_account_candidate_refs(
         task_id: str,
