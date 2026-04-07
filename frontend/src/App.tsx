@@ -1104,6 +1104,7 @@ export default function App() {
     if (targets.length === 0) return
     setDeletingAccounts(true)
     setError('')
+    const deletedKeys = new Set(targets.map((item) => getAccountKey(item)))
     try {
       if (targets.length === 1) {
         const item = targets[0]
@@ -1129,23 +1130,25 @@ export default function App() {
           }),
         })
       }
-      const deletedKeys = new Set(targets.map((item) => getAccountKey(item)))
       setExpandedAccounts((prev) => prev.filter((key) => !deletedKeys.has(key)))
       setSelectedAccounts((prev) => prev.filter((key) => !deletedKeys.has(key)))
-      const snapshots = await loadTaskSnapshots(activeTask?.id)
-      const runningSnapshot = snapshots.find((entry) => entry.is_active && !['done', 'failed', 'stopped'].includes(entry.status))
-      setActiveTask((current) => {
-        if (current) {
-          const matched = snapshots.find((entry) => entry.id === current.id)
-          if (matched) return matched
-        }
-        return runningSnapshot || snapshots[0] || null
-      })
+      setDeleteDialog(null)
+      setDeletingAccounts(false)
+      void (async () => {
+        const snapshots = await loadTaskSnapshots(activeTask?.id)
+        const runningSnapshot = snapshots.find((entry) => entry.is_active && !['done', 'failed', 'stopped'].includes(entry.status))
+        setActiveTask((current) => {
+          if (current) {
+            const matched = snapshots.find((entry) => entry.id === current.id)
+            if (matched) return matched
+          }
+          return runningSnapshot || snapshots[0] || null
+        })
+      })()
     } catch (err) {
       setError(err instanceof Error ? err.message : targets.length === 1 ? '删除账号失败' : '批量删除失败')
-    } finally {
-      setDeletingAccounts(false)
       setDeleteDialog(null)
+      setDeletingAccounts(false)
     }
   }
 
