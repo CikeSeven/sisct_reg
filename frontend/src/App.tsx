@@ -7,6 +7,7 @@ type SettingsTab = 'base' | 'mail' | 'uploads' | 'outlook'
 type OutlookDeleteScope = 'all' | 'taken'
 type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
+type AccountFilter = 'all' | 'success' | 'failed'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -399,14 +400,26 @@ export default function App() {
   const [stoppingAccountKeys, setStoppingAccountKeys] = useState<string[]>([])
   const [accountPage, setAccountPage] = useState(1)
   const [accountPageSize, setAccountPageSize] = useState(20)
+  const [accountFilter, setAccountFilter] = useState<AccountFilter>('all')
+  const [failureStageFilter, setFailureStageFilter] = useState('')
   const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState>(null)
   const [error, setError] = useState('')
   const eventSourceRef = useRef<EventSource | null>(null)
   const accountLogRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const refreshTimerRef = useRef<number | null>(null)
   const refreshInFlightRef = useRef(false)
+  const pendingResumeTaskIdRef = useRef<string>('')
 
   const isRunning = activeTask ? Boolean(activeTask.is_active) && !['done', 'failed', 'stopped'].includes(activeTask.status) : false
+  const runningTaskId = useMemo(() => {
+    const currentActiveId = String(activeTask?.id || '').trim()
+    if (currentActiveId && Boolean(activeTask?.is_active) && !['done', 'failed', 'stopped'].includes(String(activeTask?.status || ''))) {
+      return currentActiveId
+    }
+    const runningSnapshot = taskSnapshots.find((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status))
+    if (runningSnapshot?.id) return String(runningSnapshot.id)
+    return String(pendingResumeTaskIdRef.current || '').trim()
+  }, [activeTask?.id, activeTask?.is_active, activeTask?.status, taskSnapshots])
 
   const sortedAccounts = useMemo(() => {
     const merged = new Map<string, AccountItem>()
@@ -582,15 +595,41 @@ export default function App() {
     }
   }, [activeTask, currentTaskAccounts])
 
+  const failureStageOptions = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const item of currentTaskAccounts) {
+      const status = String(item.status || '').toLowerCase()
+      if (!['failed', 'stopped'].includes(status)) continue
+      const value = String(item.failure_stage || '').trim()
+      const label = String(item.failure_stage_label || item.failure_stage || '').trim()
+      if (!value || !label) continue
+      map.set(value, label)
+    }
+    return Array.from(map.entries()).map(([value, label]) => ({ value, label }))
+  }, [currentTaskAccounts])
+
+  const filteredAccounts = useMemo(() => {
+    return sortedAccounts.filter((item) => {
+      const status = String(item.status || '').toLowerCase()
+      if (accountFilter === 'success' && status !== 'success') return false
+      if (accountFilter === 'failed' && !['failed', 'stopped'].includes(status)) return false
+      if (failureStageFilter) {
+        if (!['failed', 'stopped'].includes(status)) return false
+        if (String(item.failure_stage || '').trim() !== failureStageFilter) return false
+      }
+      return true
+    })
+  }, [sortedAccounts, accountFilter, failureStageFilter])
+
   const totalAccountPages = useMemo(
-    () => Math.max(1, Math.ceil(sortedAccounts.length / accountPageSize)),
-    [sortedAccounts.length, accountPageSize],
+    () => Math.max(1, Math.ceil(filteredAccounts.length / accountPageSize)),
+    [filteredAccounts.length, accountPageSize],
   )
 
   const pagedAccounts = useMemo(() => {
     const start = (accountPage - 1) * accountPageSize
-    return sortedAccounts.slice(start, start + accountPageSize)
-  }, [sortedAccounts, accountPage, accountPageSize])
+    return filteredAccounts.slice(start, start + accountPageSize)
+  }, [filteredAccounts, accountPage, accountPageSize])
 
   const currentPageSelectableKeys = useMemo(
     () => pagedAccounts.filter((item) => canDeleteAccount(item)).map((item) => getAccountKey(item)),
@@ -623,6 +662,10 @@ export default function App() {
       setAccountPage(totalAccountPages)
     }
   }, [accountPage, totalAccountPages])
+
+  useEffect(() => {
+    setAccountPage(1)
+  }, [accountFilter, failureStageFilter])
 
   useEffect(() => {
     const validKeys = new Set(sortedAccounts.map((item) => getAccountKey(item)))
@@ -660,6 +703,7 @@ export default function App() {
       const snapshots = await loadTaskSnapshots()
       const runningSnapshot = snapshots.find((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status))
       const nextActiveTask = runningSnapshot || snapshots[0] || null
+      pendingResumeTaskIdRef.current = runningSnapshot?.id ? String(runningSnapshot.id) : ''
       setActiveTask(nextActiveTask)
       if (nextActiveTask?.is_active && !['done', 'failed', 'stopped'].includes(nextActiveTask.status)) {
         await refreshTask(nextActiveTask.id)
@@ -723,6 +767,11 @@ export default function App() {
   async function refreshTask(taskId: string) {
     try {
       const snapshot = await apiFetch<TaskSnapshot>(`/api/register/tasks/${taskId}`)
+      if (Boolean(snapshot?.is_active) && !['done', 'failed', 'stopped'].includes(String(snapshot?.status || ''))) {
+        pendingResumeTaskIdRef.current = String(snapshot.id || '')
+      } else if (pendingResumeTaskIdRef.current === String(taskId)) {
+        pendingResumeTaskIdRef.current = ''
+      }
       setActiveTask(snapshot)
       setTaskSnapshots((prev) => {
         const existingIndex = prev.findIndex((item) => item.id === taskId)
@@ -747,6 +796,7 @@ export default function App() {
         closeStream()
         const snapshots = await loadTaskSnapshots()
         const runningSnapshot = snapshots.find((entry) => entry.is_active && !['done', 'failed', 'stopped'].includes(entry.status))
+        pendingResumeTaskIdRef.current = runningSnapshot?.id ? String(runningSnapshot.id) : ''
         setActiveTask(runningSnapshot || snapshots[0] || null)
         return
       }
@@ -1086,8 +1136,9 @@ export default function App() {
     setError('')
     setExpandedAccounts([])
     try {
-      const response = isRunning && activeTask
-        ? await apiFetch<{ task_id: string }>(`/api/register/tasks/${activeTask.id}/append`, {
+      const appendTargetTaskId = String(runningTaskId || '').trim()
+      const response = appendTargetTaskId
+        ? await apiFetch<{ task_id: string }>(`/api/register/tasks/${appendTargetTaskId}/append`, {
             method: 'POST',
             body: JSON.stringify({ count: Number(form.count) }),
           })
@@ -1129,7 +1180,7 @@ export default function App() {
     setError('')
     setExpandedAccounts([getAccountKey(item)])
     try {
-      const targetTaskId = isRunning && activeTask?.id ? activeTask.id : ''
+      const targetTaskId = String(runningTaskId || '').trim()
       const response = item.id
         ? await apiFetch<{ task_id: string }>(`/api/register/results/${item.id}/retry${targetTaskId ? `?target_task_id=${encodeURIComponent(targetTaskId)}` : ''}`, {
             method: 'POST',
@@ -1137,6 +1188,7 @@ export default function App() {
         : await apiFetch<{ task_id: string }>(`/api/register/tasks/${item.task_id}/attempts/${item.attempt_index}/retry${targetTaskId ? `?target_task_id=${encodeURIComponent(targetTaskId)}` : ''}`, {
             method: 'POST',
           })
+      pendingResumeTaskIdRef.current = String(response.task_id || '')
       await loadTaskSnapshots(response.task_id)
       await refreshTask(response.task_id)
       openStream(response.task_id)
@@ -1782,6 +1834,17 @@ export default function App() {
 
           <div className="control-row">
             <button className="ghost-btn danger" type="button" onClick={() => void sendControl('stop')} disabled={!isRunning}>停止任务</button>
+            <select className="page-size-select" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value as AccountFilter)}>
+              <option value="all">全部</option>
+              <option value="success">成功</option>
+              <option value="failed">失败</option>
+            </select>
+            <select className="page-size-select" value={failureStageFilter} onChange={(e) => setFailureStageFilter(e.target.value)} disabled={failureStageOptions.length === 0}>
+              <option value="">全部阶段</option>
+              {failureStageOptions.map((item) => (
+                <option key={item.value} value={item.value}>{item.label}</option>
+              ))}
+            </select>
             <button className="ghost-btn" type="button" onClick={() => selectCurrentPageAccounts()} disabled={currentPageSelectableKeys.length === 0 || isCurrentPageAllSelected}>
               全选
             </button>
@@ -1804,7 +1867,7 @@ export default function App() {
           </div>
 
           <div className="account-list">
-            {sortedAccounts.length === 0 ? <div className="timeline-empty">暂无账号</div> : null}
+            {filteredAccounts.length === 0 ? <div className="timeline-empty">暂无账号</div> : null}
             {pagedAccounts.map((item) => {
               const accountKey = getAccountKey(item)
               const expanded = expandedAccounts.includes(accountKey)
