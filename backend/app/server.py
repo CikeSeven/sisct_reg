@@ -16,6 +16,7 @@ from .outlook_pool import router as outlook_router
 from .proxy_pool import router as proxy_router
 from .schemas import (
     AppendTaskRequest,
+    BatchRetryRequest,
     CreateRegisterTaskRequest,
     DeleteAccountRequest,
     DeleteAccountsBatchRequest,
@@ -145,6 +146,19 @@ def retry_register_attempt(task_id: str, attempt_index: int, target_task_id: str
         if reason == "result_not_failed":
             raise HTTPException(409, "仅失败或已停止账号支持重试")
         raise HTTPException(400, "无法重试该账号")
+    return result
+
+
+@app.post("/api/register/accounts/retry-batch")
+def retry_register_accounts_batch(body: BatchRetryRequest):
+    result = manager.retry_accounts_batch(body.items, concurrency=body.concurrency)
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "")
+        if reason == "task_active":
+            raise HTTPException(409, "当前已有进行中的注册任务")
+        if reason == "no_retry_items":
+            raise HTTPException(400, "没有可重试的账号")
+        raise HTTPException(400, "批量重试失败")
     return result
 
 

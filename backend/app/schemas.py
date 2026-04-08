@@ -57,3 +57,8 @@ class ExportAccountsBatchRequest(BaseModel):
 
 class AppendTaskRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=9999)
+
+
+class BatchRetryRequest(BaseModel):
+    concurrency: int = Field(default=1, ge=1, le=100)
+    items: list[DeleteAccountRequest] = Field(default_factory=list)

@@ -638,6 +638,7 @@ export default function App() {
 
   const selectedCount = selectedAccounts.length
   const selectedUploadableCount = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && item.status === 'success' && item.task_id).length
+  const selectedRetryableCount = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && ['failed', 'stopped'].includes(String(item.status || '').toLowerCase()) && item.task_id).length
   const currentPageSelectedCount = currentPageSelectableKeys.filter((key) => selectedAccounts.includes(key)).length
   const isCurrentPageAllSelected = currentPageSelectableKeys.length > 0 && currentPageSelectedCount === currentPageSelectableKeys.length
 
@@ -1194,6 +1195,41 @@ export default function App() {
       openStream(response.task_id)
     } catch (err) {
       setError(err instanceof Error ? err.message : '重试失败')
+    } finally {
+      setRetryingResultId(null)
+    }
+  }
+
+  async function retrySelectedAccounts() {
+    if (isRunning) return
+    const targets = sortedAccounts.filter(
+      (item) =>
+        selectedAccounts.includes(getAccountKey(item)) &&
+        ['failed', 'stopped'].includes(String(item.status || '').toLowerCase()) &&
+        item.task_id,
+    )
+    if (targets.length === 0) return
+    setRetryingResultId(-1)
+    setError('')
+    try {
+      const response = await apiFetch<{ task_id: string }>(`/api/register/accounts/retry-batch`, {
+        method: 'POST',
+        body: JSON.stringify({
+          concurrency: Number(form.concurrency),
+          items: targets.map((item) => ({
+            task_id: item.task_id,
+            task_ids: item.task_ids || [],
+            refs: item.task_refs || [],
+            attempt_index: item.attempt_index,
+          })),
+        }),
+      })
+      pendingResumeTaskIdRef.current = String(response.task_id || '')
+      await loadTaskSnapshots(response.task_id)
+      await refreshTask(response.task_id)
+      openStream(response.task_id)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '批量重试失败')
     } finally {
       setRetryingResultId(null)
     }
@@ -1852,6 +1888,9 @@ export default function App() {
               取消选择
             </button>
             <div className="selected-count-chip">{selectedCount}</div>
+            <button className="ghost-btn" type="button" onClick={() => void retrySelectedAccounts()} disabled={isRunning || retryingResultId === -1 || selectedRetryableCount === 0}>
+              {retryingResultId === -1 ? '重试中...' : '一键重试'}
+            </button>
             <button className="ghost-btn" type="button" onClick={() => void uploadSelectedAccounts('cpa')} disabled={uploadingTarget !== null || selectedUploadableCount === 0}>
               {uploadingTarget === 'cpa' ? '上传中...' : '上传CPA'}
             </button>

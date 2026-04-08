@@ -343,6 +343,7 @@ class RegistrationManager:
         *,
         source: str = "manual",
         meta: dict[str, Any] | None = None,
+        initial_attempts: list[QueuedAttempt] | None = None,
     ) -> str:
         task_id = f"task_{int(time.time() * 1000)}"
         task_meta = {"mail_provider": req.mail_provider, "mode": "refresh_token"}
@@ -359,7 +360,8 @@ class RegistrationManager:
         request_payload["source"] = source
         request_payload["meta"] = task_meta
         create_task_run(task_id, total=req.count, request_payload=request_payload)
-        threading.Thread(target=self._run_task, args=(task_id, req, merged_config), daemon=True).start()
+        queued_attempts = [item for item in (initial_attempts or []) if isinstance(item, QueuedAttempt)]
+        threading.Thread(target=self._run_task, args=(task_id, req, merged_config, queued_attempts), daemon=True).start()
         return task_id
 
     def _next_log_seq(self, task_id: str) -> int:
@@ -1322,6 +1324,121 @@ class RegistrationManager:
         )
         return {"ok": True, "task_id": new_task_id}
 
+    def _build_retry_attempt_item(
+        self,
+        *,
+        task_id: str,
+        attempt_index: int,
+    ) -> QueuedAttempt | None:
+        task = get_task_run(task_id)
+        if task is None:
+            return None
+        request_payload = task.get("request_json") or {}
+        merged_config = deepcopy(request_payload.get("merged_config") or {})
+        mail_provider = str(
+            request_payload.get("mail_provider")
+            or merged_config.get("mail_provider")
+            or "luckmail"
+        ).strip()
+        accounts = self._build_db_accounts(task_id, request_payload=request_payload)
+        target = next((item for item in accounts if int(item.get("attempt_index") or 0) == int(attempt_index)), None)
+        if target is None:
+            return None
+        if str(target.get("status") or "") not in {"failed", "stopped"}:
+            return None
+        email = str(target.get("email") or "").strip()
+        if not self._supports_retry(mail_provider, email):
+            return None
+
+        current_defaults = self._get_current_runtime_defaults()
+        current_use_proxy = bool(current_defaults.get("use_proxy", True))
+        current_proxy = None
+        if current_use_proxy and not self._enabled_proxy_pool_exists():
+            current_proxy = str(current_defaults.get("proxy") or "").strip() or None
+
+        return QueuedAttempt(
+            attempt_index=0,
+            req_overrides={
+                "email": email or None,
+                "password": None,
+                "proxy": current_proxy,
+                "use_proxy": bool(current_use_proxy),
+                "executor_type": request_payload.get("executor_type") or merged_config.get("executor_type") or "protocol",
+                "mail_provider": mail_provider,
+                "provider_config": request_payload.get("provider_config") or {},
+                "phone_config": request_payload.get("phone_config") or {},
+            },
+            merged_config_overrides={
+                **merged_config,
+                "retry_resume_stage": str(target.get("failure_stage") or "").strip(),
+                "retry_resume_origin": str(target.get("failure_origin") or "").strip(),
+                "retry_from_task_id": task_id,
+                "retry_from_attempt_index": int(attempt_index),
+                "retry_email_binding": (
+                    dict(target.get("retry_email_binding") or {})
+                    if isinstance(target.get("retry_email_binding"), dict)
+                    else {}
+                ),
+            },
+            priority=10,
+        )
+
+    def retry_accounts_batch(self, items: list[Any], *, concurrency: int) -> dict[str, Any]:
+        if self._task_store.has_active(platform="chatgpt"):
+            return {"ok": False, "reason": "task_active"}
+
+        retry_items: list[QueuedAttempt] = []
+        seen: set[tuple[str, int]] = set()
+        for raw_item in items or []:
+            item = raw_item.model_dump() if hasattr(raw_item, "model_dump") else (dict(raw_item) if isinstance(raw_item, dict) else {})
+            task_id = str(item.get("task_id") or "").strip()
+            try:
+                attempt_index = int(item.get("attempt_index") or 0)
+            except Exception:
+                attempt_index = 0
+            for candidate_task_id, candidate_attempt_index in self._collect_account_candidate_refs(
+                task_id,
+                attempt_index,
+                task_ids=item.get("task_ids") if isinstance(item.get("task_ids"), list) else [],
+                refs=item.get("refs") if isinstance(item.get("refs"), list) else [],
+            ):
+                key = (candidate_task_id, int(candidate_attempt_index))
+                if key in seen:
+                    continue
+                seen.add(key)
+                queued = self._build_retry_attempt_item(
+                    task_id=candidate_task_id,
+                    attempt_index=int(candidate_attempt_index),
+                )
+                if queued is not None:
+                    retry_items.append(queued)
+
+        if not retry_items:
+            return {"ok": False, "reason": "no_retry_items"}
+
+        first = retry_items[0]
+        req = CreateRegisterTaskRequest(
+            count=len(retry_items),
+            concurrency=max(1, int(concurrency or 1)),
+            register_delay_seconds=0,
+            email=None,
+            password=None,
+            proxy=str((first.req_overrides or {}).get("proxy") or "").strip() or None,
+            use_proxy=bool((first.req_overrides or {}).get("use_proxy", True)),
+            executor_type=(first.req_overrides or {}).get("executor_type") or "protocol",
+            mail_provider=(first.req_overrides or {}).get("mail_provider") or "luckmail",
+            provider_config=(first.req_overrides or {}).get("provider_config") or {},
+            phone_config=(first.req_overrides or {}).get("phone_config") or {},
+        )
+        task_id = self.create_task(
+            req,
+            {},
+            source="retry_batch",
+            meta={"retry_batch": True},
+            initial_attempts=retry_items,
+        )
+        return {"ok": True, "task_id": task_id, "count": len(retry_items)}
+
     def append_to_task(self, task_id: str, *, count: int) -> dict[str, Any]:
         self._ensure_task_exists(task_id)
         if not self._task_store.exists(task_id):
@@ -1879,7 +1996,13 @@ class RegistrationManager:
             engine.password = req.password
         return engine
 
-    def _run_task(self, task_id: str, req: CreateRegisterTaskRequest, merged_config: dict[str, Any]) -> None:
+    def _run_task(
+        self,
+        task_id: str,
+        req: CreateRegisterTaskRequest,
+        merged_config: dict[str, Any],
+        initial_attempts: list[QueuedAttempt] | None = None,
+    ) -> None:
         control = self._task_store.control_for(task_id)
         state = TaskExecutionState(total=req.count)
         self._set_task_execution_state(task_id, state)
@@ -1956,8 +2079,12 @@ class RegistrationManager:
             self._task_store.cleanup()
             return
 
-        for index in range(req.count):
-            state.enqueue(QueuedAttempt(attempt_index=index + 1))
+        if initial_attempts:
+            for item in initial_attempts:
+                state.enqueue(item)
+        else:
+            for index in range(req.count):
+                state.enqueue(QueuedAttempt(attempt_index=index + 1))
         state.mark_initial_enqueued()
 
         def do_one(queued_attempt: QueuedAttempt):
