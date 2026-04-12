@@ -230,6 +230,61 @@ class RegistrationManager:
         return str(mail_provider or "").strip().lower() in {"luckmail", "outlook_local"}
 
     @staticmethod
+    def _extract_retry_origin(payload: dict[str, Any] | None) -> dict[str, Any]:
+        source = payload if isinstance(payload, dict) else {}
+        retry_from_task_id = str(source.get("retry_from_task_id") or "").strip()
+        try:
+            retry_from_attempt_index = int(source.get("retry_from_attempt_index") or 0)
+        except Exception:
+            retry_from_attempt_index = 0
+        try:
+            retry_from_result_id = int(source.get("retry_from_result_id") or 0)
+        except Exception:
+            retry_from_result_id = 0
+        result: dict[str, Any] = {}
+        if retry_from_task_id:
+            result["retry_from_task_id"] = retry_from_task_id
+        if retry_from_attempt_index > 0:
+            result["retry_from_attempt_index"] = retry_from_attempt_index
+        if retry_from_result_id > 0:
+            result["retry_from_result_id"] = retry_from_result_id
+        return result
+
+    @staticmethod
+    def _resolve_retry_concurrency(
+        request_payload: dict[str, Any] | None,
+        retry_concurrency: int | None,
+    ) -> int:
+        try:
+            requested = int(retry_concurrency or 0)
+        except Exception:
+            requested = 0
+        if requested > 0:
+            return max(1, min(requested, 100))
+        payload = request_payload if isinstance(request_payload, dict) else {}
+        try:
+            fallback = int(payload.get("concurrency") or 0)
+        except Exception:
+            fallback = 0
+        return max(1, min(fallback or 1, 100))
+
+    @staticmethod
+    def _prepare_initial_attempts(items: list[QueuedAttempt] | None) -> list[QueuedAttempt]:
+        prepared: list[QueuedAttempt] = []
+        for next_index, item in enumerate((entry for entry in (items or []) if isinstance(entry, QueuedAttempt)), start=1):
+            prepared.append(
+                QueuedAttempt(
+                    attempt_index=next_index,
+                    req_overrides=dict(item.req_overrides or {}),
+                    merged_config_overrides=dict(item.merged_config_overrides or {}),
+                    meta=dict(item.meta or {}),
+                    not_before=float(item.not_before or 0.0),
+                    priority=int(item.priority or 0),
+                )
+            )
+        return prepared
+
+    @staticmethod
     def _get_current_runtime_defaults() -> dict[str, Any]:
         stored = parse_config_row_values(get_config())
         merged = dict(DEFAULT_CONFIG)
@@ -383,6 +438,7 @@ class RegistrationManager:
         email: str | None = None,
         status: str | None = None,
         error: str | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -407,6 +463,11 @@ class RegistrationManager:
                 item["status"] = status
             if error is not None:
                 item["error"] = str(error)
+            if isinstance(extra_fields, dict):
+                for key, value in extra_fields.items():
+                    if value is None:
+                        continue
+                    item[str(key)] = value
             item["updated_at"] = now
             persisted_email = str(item.get("email") or "")
             persisted_label = str(item.get("label") or f"第 {attempt_index} 个账号")
@@ -594,12 +655,19 @@ class RegistrationManager:
         delete_task_result(task_id, int(attempt_index))
         state.rewind_for_retry(current_status)
         self._sync_task_progress(task_id, state, status="running")
+        retry_origin_fields = self._extract_retry_origin(
+            {
+                "retry_from_task_id": task_id,
+                "retry_from_attempt_index": int(attempt_index),
+            }
+        )
         self._upsert_task_account(
             task_id,
             int(attempt_index),
             email=email or "",
             status="pending",
             error="",
+            extra_fields=retry_origin_fields,
         )
         self._log(task_id, "已加入等待队列", attempt_index=int(attempt_index))
         queued = state.enqueue(
@@ -629,6 +697,7 @@ class RegistrationManager:
             int(attempt_index),
             email=email or "",
             status=current_status,
+            extra_fields=retry_origin_fields,
         )
         return False
 
@@ -660,14 +729,6 @@ class RegistrationManager:
             )
             if not state.enqueue(queued_item):
                 continue
-            email = str((queued_item.req_overrides or {}).get("email") or "").strip()
-            self._upsert_task_account(
-                task_id,
-                next_index,
-                email=email,
-                status="pending",
-                error="",
-            )
             appended_indexes.append(next_index)
             enqueued += 1
         if enqueued <= 0:
@@ -676,6 +737,19 @@ class RegistrationManager:
         update_task_request_count(task_id, state.total)
         self._sync_task_progress(task_id, state, status=task_status, summary_total=state.total)
         return {"ok": True, "task_id": task_id, "appended": enqueued, "attempt_indexes": appended_indexes}
+
+    def _enqueue_attempts_with_pending_accounts(
+        self,
+        task_id: str,
+        state: TaskExecutionState,
+        items: list[QueuedAttempt] | None,
+    ) -> int:
+        enqueued = 0
+        for item in (entry for entry in (items or []) if isinstance(entry, QueuedAttempt)):
+            if not state.enqueue(item):
+                continue
+            enqueued += 1
+        return enqueued
 
     @staticmethod
     def _guess_email_from_message(message: str) -> str:
@@ -737,7 +811,10 @@ class RegistrationManager:
             else:
                 try:
                     attempt_index = int(attempt_index)
-                    current_attempt_index = int(attempt_index)
+                    if attempt_index <= 0:
+                        attempt_index = current_attempt_index
+                    else:
+                        current_attempt_index = int(attempt_index)
                 except Exception:
                     attempt_index = current_attempt_index
             if attempt_index is None:
@@ -763,6 +840,9 @@ class RegistrationManager:
             failure_stage = str(extra.get("failure_stage") or metadata.get("failure_stage") or "").strip()
             failure_origin = str(extra.get("failure_origin") or metadata.get("failure_origin") or "").strip()
             failure_detail = str(extra.get("failure_detail") or metadata.get("failure_detail") or result.get("error") or "").strip()
+            retry_origin = self._extract_retry_origin(extra)
+            if not retry_origin:
+                retry_origin = self._extract_retry_origin(metadata)
             retry_email_binding = (
                 dict(metadata.get("email_binding") or {})
                 if isinstance(metadata.get("email_binding"), dict)
@@ -780,6 +860,8 @@ class RegistrationManager:
             ):
                 retry_supported = True
             attempt_index = int(result.get("attempt_index") or 0)
+            if attempt_index <= 0:
+                continue
             result_attempts.add(attempt_index)
             email = str(result.get("email") or retry_email_binding.get("email") or email_by_attempt.get(attempt_index) or "").strip()
             persisted_state = state_by_attempt.get(attempt_index) or {}
@@ -801,6 +883,7 @@ class RegistrationManager:
                     "failure_detail": failure_detail,
                     "retry_supported": bool(retry_supported) and self._supports_retry(mail_provider, email),
                     "retry_email_binding": retry_email_binding,
+                    **retry_origin,
                 }
             )
 
@@ -828,6 +911,7 @@ class RegistrationManager:
             if task_status in {"stopped", "failed", "done"} and item_status in {"pending", "registering", "running"}:
                 item_status = "stopped" if task_status == "stopped" else ("failed" if task_status == "failed" else "stopped")
             persisted_error = str(persisted_state.get("error") or "").strip()
+            retry_origin = self._extract_retry_origin(persisted_state)
             items.append(
                 {
                     "id": None,
@@ -845,6 +929,7 @@ class RegistrationManager:
                     "failure_origin": "",
                     "failure_detail": persisted_error or failure_detail,
                     "retry_supported": item_status in {"failed", "stopped"} and self._supports_retry(mail_provider, email),
+                    **retry_origin,
                 }
             )
 
@@ -1071,7 +1156,13 @@ class RegistrationManager:
             )
         return exported
 
-    def retry_result(self, result_id: int, *, target_task_id: str | None = None) -> dict[str, Any]:
+    def retry_result(
+        self,
+        result_id: int,
+        *,
+        target_task_id: str | None = None,
+        retry_concurrency: int | None = None,
+    ) -> dict[str, Any]:
         result = get_task_result(result_id)
         if result is None:
             return {"ok": False, "reason": "result_not_found"}
@@ -1167,7 +1258,7 @@ class RegistrationManager:
 
         req = CreateRegisterTaskRequest(
             count=1,
-            concurrency=1,
+            concurrency=self._resolve_retry_concurrency(request_payload, retry_concurrency),
             register_delay_seconds=0,
             email=email,
             password=str(result.get("password") or "") or None,
@@ -1198,7 +1289,14 @@ class RegistrationManager:
         )
         return {"ok": True, "task_id": task_id}
 
-    def retry_attempt(self, task_id: str, attempt_index: int, *, target_task_id: str | None = None) -> dict[str, Any]:
+    def retry_attempt(
+        self,
+        task_id: str,
+        attempt_index: int,
+        *,
+        target_task_id: str | None = None,
+        retry_concurrency: int | None = None,
+    ) -> dict[str, Any]:
         task = get_task_run(task_id)
         if task is None:
             return {"ok": False, "reason": "task_not_found"}
@@ -1292,7 +1390,7 @@ class RegistrationManager:
 
         req = CreateRegisterTaskRequest(
             count=1,
-            concurrency=1,
+            concurrency=self._resolve_retry_concurrency(request_payload, retry_concurrency),
             register_delay_seconds=0,
             email=email or None,
             password=None,
@@ -2039,6 +2137,7 @@ class RegistrationManager:
             message = f"代理检测失败: {exc}" if str(req.proxy or "").strip() else f"网络预检失败: {exc}"
             self._log(task_id, message, level="error")
             retry_supported = self._supports_retry(req.mail_provider, req.email or "")
+            retry_origin = self._extract_retry_origin(merged_config)
             insert_task_result(
                 task_id,
                 attempt_index=1,
@@ -2058,9 +2157,17 @@ class RegistrationManager:
                         "resume_supported": retry_supported,
                     },
                     "mail_provider": req.mail_provider,
+                    **retry_origin,
                 },
             )
-            self._upsert_task_account(task_id, 1, email=req.email or "", status="failed", error=message)
+            self._upsert_task_account(
+                task_id,
+                1,
+                email=req.email or "",
+                status="failed",
+                error=message,
+                extra_fields=retry_origin,
+            )
             state.apply_outcome(AttemptOutcome.FAILED)
             completed, success, failed, skipped = state.snapshot_counts()
             update_task_run(
@@ -2079,12 +2186,15 @@ class RegistrationManager:
             self._task_store.cleanup()
             return
 
-        if initial_attempts:
-            for item in initial_attempts:
-                state.enqueue(item)
+        prepared_initial_attempts = self._prepare_initial_attempts(initial_attempts)
+        if prepared_initial_attempts:
+            self._enqueue_attempts_with_pending_accounts(task_id, state, prepared_initial_attempts)
         else:
-            for index in range(req.count):
-                state.enqueue(QueuedAttempt(attempt_index=index + 1))
+            self._enqueue_attempts_with_pending_accounts(
+                task_id,
+                state,
+                [QueuedAttempt(attempt_index=index + 1) for index in range(req.count)],
+            )
         state.mark_initial_enqueued()
 
         def do_one(queued_attempt: QueuedAttempt):
@@ -2098,11 +2208,28 @@ class RegistrationManager:
             attempt_req = req.model_copy(deep=True, update=queued_attempt.req_overrides or {})
             attempt_merged_config = deepcopy(merged_config)
             attempt_merged_config.update(queued_attempt.merged_config_overrides or {})
+            attempt_retry_origin = self._extract_retry_origin(attempt_merged_config)
+
+            def upsert_attempt_account(
+                *,
+                email: str | None = None,
+                status: str | None = None,
+                error: str | None = None,
+            ) -> None:
+                self._upsert_task_account(
+                    task_id,
+                    attempt_index,
+                    email=email,
+                    status=status,
+                    error=error,
+                    extra_fields=attempt_retry_origin,
+                )
+
             try:
                 control.checkpoint()
                 attempt_id = control.start_attempt(attempt_index)
                 control.checkpoint(attempt_id=attempt_id)
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="registering", error="")
+                upsert_attempt_account(email=attempt_req.email or "", status="registering", error="")
                 self._log(task_id, f"开始注册第 {attempt_index}/{req.count} 个账号", attempt_index=attempt_index)
                 with start_gate_lock:
                     now = time.time()
@@ -2160,13 +2287,7 @@ class RegistrationManager:
                     )
                     if not queued:
                         return None
-                    self._upsert_task_account(
-                        task_id,
-                        attempt_index,
-                        email=attempt_req.email or "",
-                        status="pending",
-                        error="",
-                    )
+                    upsert_attempt_account(email=attempt_req.email or "", status="pending", error="")
                     attempt_log(
                         f"{message}，已重新排队 ({retry_meta['proxy_retry_count']}/{max_proxy_retry_rounds})",
                         level="warning",
@@ -2267,37 +2388,54 @@ class RegistrationManager:
                         "mode": "refresh_token",
                         "mail_provider": attempt_req.mail_provider,
                         "upload_results": upload_results,
+                        **attempt_retry_origin,
                     },
                 )
-                self._upsert_task_account(
-                    task_id,
-                    attempt_index,
-                    email=str(getattr(result, "email", "") or ""),
-                    status="success",
-                )
+                upsert_attempt_account(email=str(getattr(result, "email", "") or ""), status="success")
                 self._log(task_id, f"[OK] 注册成功: {getattr(result, 'email', '')}", attempt_index=attempt_index)
                 state.apply_outcome(AttemptOutcome.SUCCESS)
                 self._sync_task_progress(task_id, state)
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as exc:
-                insert_task_result(task_id, attempt_index=attempt_index, status="skipped", email=attempt_req.email or "", error=str(exc))
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="skipped", error=str(exc))
+                insert_task_result(
+                    task_id,
+                    attempt_index=attempt_index,
+                    status="skipped",
+                    email=attempt_req.email or "",
+                    error=str(exc),
+                    extra=attempt_retry_origin,
+                )
+                upsert_attempt_account(email=attempt_req.email or "", status="skipped", error=str(exc))
                 self._log(task_id, f"[SKIP] 已跳过当前账号: {exc}", attempt_index=attempt_index)
                 state.apply_outcome(AttemptOutcome.SKIPPED)
                 self._sync_task_progress(task_id, state)
                 return AttemptResult.skipped(str(exc))
             except StopTaskRequested as exc:
                 message = str(exc)
-                insert_task_result(task_id, attempt_index=attempt_index, status="stopped", email=attempt_req.email or "", error=message)
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="stopped", error=message)
+                insert_task_result(
+                    task_id,
+                    attempt_index=attempt_index,
+                    status="stopped",
+                    email=attempt_req.email or "",
+                    error=message,
+                    extra=attempt_retry_origin,
+                )
+                upsert_attempt_account(email=attempt_req.email or "", status="stopped", error=message)
                 self._log(task_id, f"[STOP] {message}", attempt_index=attempt_index)
                 state.apply_outcome(AttemptOutcome.STOPPED)
                 self._sync_task_progress(task_id, state)
                 return AttemptResult.stopped(message)
             except StopCurrentAttemptRequested as exc:
                 message = str(exc)
-                insert_task_result(task_id, attempt_index=attempt_index, status="stopped", email=attempt_req.email or "", error=message)
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="stopped", error=message)
+                insert_task_result(
+                    task_id,
+                    attempt_index=attempt_index,
+                    status="stopped",
+                    email=attempt_req.email or "",
+                    error=message,
+                    extra=attempt_retry_origin,
+                )
+                upsert_attempt_account(email=attempt_req.email or "", status="stopped", error=message)
                 self._log(task_id, f"[STOP] {message}", attempt_index=attempt_index)
                 state.apply_outcome(AttemptOutcome.STOPPED)
                 self._sync_task_progress(task_id, state)
@@ -2333,7 +2471,7 @@ class RegistrationManager:
                     not_before=time.time() + delay_seconds,
                     priority=-1,
                 )
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="pending", error="")
+                upsert_attempt_account(email=attempt_req.email or "", status="pending", error="")
                 self._log(
                     task_id,
                     f"[WAIT] {suspend_message}，已挂起 {delay_seconds}s 后继续",
@@ -2399,9 +2537,7 @@ class RegistrationManager:
                         meta=retry_meta,
                         priority=10,
                     )
-                    self._upsert_task_account(
-                        task_id,
-                        attempt_index,
+                    upsert_attempt_account(
                         email=str(
                             failure_meta.get("email")
                             or retry_email_binding.get("email")
@@ -2432,9 +2568,10 @@ class RegistrationManager:
                         "retry_supported": bool(failure_meta.get("resume_supported")),
                         "metadata": failure_meta,
                         "mail_provider": attempt_req.mail_provider,
+                        **attempt_retry_origin,
                     },
                 )
-                self._upsert_task_account(task_id, attempt_index, email=attempt_req.email or "", status="failed", error=message)
+                upsert_attempt_account(email=attempt_req.email or "", status="failed", error=message)
                 self._log(task_id, f"[FAIL] 注册失败: {message}", level="error", attempt_index=attempt_index)
                 state.apply_outcome(AttemptOutcome.FAILED)
                 errors.append(message)

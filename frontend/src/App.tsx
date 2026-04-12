@@ -8,6 +8,7 @@ type OutlookDeleteScope = 'all' | 'taken'
 type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
 type AccountFilter = 'all' | 'success' | 'failed'
+type AccountScope = 'all' | 'active'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -57,6 +58,9 @@ type AccountItem = {
   failure_stage_label?: string
   failure_origin?: string
   failure_detail?: string
+  retry_from_task_id?: string
+  retry_from_attempt_index?: number
+  retry_from_result_id?: number
   retry_supported?: boolean
 }
 
@@ -222,6 +226,7 @@ const settingsTabs: Array<{ key: SettingsTab; label: string }> = [
   { key: 'outlook', label: '微软邮箱池' },
 ]
 const accountPageSizeOptions = [20, 50, 100]
+const ACTIVE_TASK_STORAGE_KEY = 'chatgpt_register_active_task_id'
 
 function StatCard({ label, value, tone = 'default' }: { label: string; value: string | number; tone?: string }) {
   return (
@@ -401,6 +406,7 @@ export default function App() {
   const [accountPage, setAccountPage] = useState(1)
   const [accountPageSize, setAccountPageSize] = useState(20)
   const [accountFilter, setAccountFilter] = useState<AccountFilter>('all')
+  const [accountScope, setAccountScope] = useState<AccountScope>('all')
   const [failureStageFilter, setFailureStageFilter] = useState('')
   const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState>(null)
   const [error, setError] = useState('')
@@ -428,10 +434,12 @@ export default function App() {
 
     for (const task of taskSnapshots) {
       for (const account of task.accounts || []) {
+        const accountAttemptIndex = Number(account.attempt_index || 0)
+        if (accountAttemptIndex <= 0) continue
         if (typeof account.id === 'number') {
           resultOriginMap.set(account.id, {
             taskId: task.id,
-            attemptIndex: Number(account.attempt_index || 0),
+            attemptIndex: accountAttemptIndex,
           })
         }
       }
@@ -441,14 +449,19 @@ export default function App() {
       let baseTaskId = task.id
       let baseAttemptIndex = Number(account.attempt_index || 0)
       let currentTask: TaskSnapshot | undefined = task
+      let currentAccount: AccountItem | undefined = account
       const visited = new Set<string>()
 
       while (currentTask && !visited.has(currentTask.id)) {
         visited.add(currentTask.id)
         const meta = currentTask.meta || {}
-        const retryFromTaskId = String(meta.retry_from_task_id || '').trim()
-        const retryFromAttemptIndex = Number(meta.retry_from_attempt_index || 0)
-        const retryFromResultId = Number(meta.retry_from_result_id || 0)
+        const retryFromTaskId = String(currentAccount?.retry_from_task_id || meta.retry_from_task_id || '').trim()
+        const retryFromAttemptIndex = Number(
+          (currentAccount?.retry_from_attempt_index ?? meta.retry_from_attempt_index ?? 0) as number | string,
+        )
+        const retryFromResultId = Number(
+          (currentAccount?.retry_from_result_id ?? meta.retry_from_result_id ?? 0) as number | string,
+        )
 
         if (!retryFromTaskId) break
 
@@ -462,7 +475,19 @@ export default function App() {
             if (origin.attemptIndex > 0) baseAttemptIndex = origin.attemptIndex
           }
         }
-        currentTask = taskMap.get(retryFromTaskId)
+        const nextTask = taskMap.get(retryFromTaskId)
+        let nextAttemptIndex: number = retryFromAttemptIndex
+        if (nextAttemptIndex <= 0 && retryFromResultId > 0) {
+          const origin = resultOriginMap.get(retryFromResultId)
+          if (origin && origin.taskId === retryFromTaskId && origin.attemptIndex > 0) {
+            nextAttemptIndex = origin.attemptIndex
+          }
+        }
+        currentTask = nextTask
+        currentAccount =
+          nextTask && nextAttemptIndex > 0
+            ? (nextTask.accounts || []).find((item) => Number(item.attempt_index || 0) === nextAttemptIndex)
+            : undefined
       }
 
       return { baseTaskId, baseAttemptIndex }
@@ -470,6 +495,7 @@ export default function App() {
 
     for (const [taskIndex, task] of taskSnapshots.entries()) {
       for (const account of task.accounts || []) {
+        if (Number(account.attempt_index || 0) <= 0) continue
         const { baseTaskId, baseAttemptIndex } = resolveBase(task, account)
         const key = `${baseTaskId}:${baseAttemptIndex}`
         const normalized: AccountItem = {
@@ -597,7 +623,8 @@ export default function App() {
 
   const failureStageOptions = useMemo(() => {
     const map = new Map<string, string>()
-    for (const item of currentTaskAccounts) {
+    const source = accountScope === 'active' ? currentTaskAccounts : sortedAccounts
+    for (const item of source) {
       const status = String(item.status || '').toLowerCase()
       if (!['failed', 'stopped'].includes(status)) continue
       const value = String(item.failure_stage || '').trim()
@@ -606,10 +633,11 @@ export default function App() {
       map.set(value, label)
     }
     return Array.from(map.entries()).map(([value, label]) => ({ value, label }))
-  }, [currentTaskAccounts])
+  }, [accountScope, currentTaskAccounts, sortedAccounts])
 
   const filteredAccounts = useMemo(() => {
-    return sortedAccounts.filter((item) => {
+    const source = accountScope === 'active' ? currentTaskAccounts : sortedAccounts
+    return source.filter((item) => {
       const status = String(item.status || '').toLowerCase()
       if (accountFilter === 'success' && status !== 'success') return false
       if (accountFilter === 'failed' && !['failed', 'stopped'].includes(status)) return false
@@ -619,7 +647,7 @@ export default function App() {
       }
       return true
     })
-  }, [sortedAccounts, accountFilter, failureStageFilter])
+  }, [accountScope, currentTaskAccounts, sortedAccounts, accountFilter, failureStageFilter])
 
   const totalAccountPages = useMemo(
     () => Math.max(1, Math.ceil(filteredAccounts.length / accountPageSize)),
@@ -637,8 +665,12 @@ export default function App() {
   )
 
   const selectedCount = selectedAccounts.length
-  const selectedUploadableCount = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && item.status === 'success' && item.task_id).length
-  const selectedRetryableCount = sortedAccounts.filter((item) => selectedAccounts.includes(getAccountKey(item)) && ['failed', 'stopped'].includes(String(item.status || '').toLowerCase()) && item.task_id).length
+  const selectedSource = accountScope === 'active' ? currentTaskAccounts : sortedAccounts
+  const selectedUploadableCount = selectedSource.filter((item) => selectedAccounts.includes(getAccountKey(item)) && item.status === 'success' && item.task_id).length
+  const selectedRetryableCount = selectedSource.filter((item) => {
+    const status = String(item.status || '').toLowerCase()
+    return selectedAccounts.includes(getAccountKey(item)) && ['failed', 'stopped'].includes(status) && isCleanRetryItem(item)
+  }).length
   const currentPageSelectedCount = currentPageSelectableKeys.filter((key) => selectedAccounts.includes(key)).length
   const isCurrentPageAllSelected = currentPageSelectableKeys.length > 0 && currentPageSelectedCount === currentPageSelectableKeys.length
 
@@ -648,6 +680,19 @@ export default function App() {
       closeStream()
     }
   }, [])
+
+  useEffect(() => {
+    const activeTaskId = String(activeTask?.id || '').trim()
+    try {
+      if (activeTaskId) {
+        window.localStorage.setItem(ACTIVE_TASK_STORAGE_KEY, activeTaskId)
+      } else {
+        window.localStorage.removeItem(ACTIVE_TASK_STORAGE_KEY)
+      }
+    } catch {
+      // ignore
+    }
+  }, [activeTask?.id])
 
   useEffect(() => {
     for (const key of expandedAccounts) {
@@ -669,10 +714,23 @@ export default function App() {
   }, [accountFilter, failureStageFilter])
 
   useEffect(() => {
-    const validKeys = new Set(sortedAccounts.map((item) => getAccountKey(item)))
+    setFailureStageFilter('')
+    setAccountPage(1)
+  }, [accountScope])
+
+  useEffect(() => {
+    const source = accountScope === 'active' ? currentTaskAccounts : sortedAccounts
+    const validKeys = new Set(source.map((item) => getAccountKey(item)))
     setSelectedAccounts((prev) => prev.filter((key) => validKeys.has(key)))
     setExpandedAccounts((prev) => prev.filter((key) => validKeys.has(key)))
-  }, [sortedAccounts])
+  }, [accountScope, currentTaskAccounts, sortedAccounts])
+
+  useEffect(() => {
+    setSelectedAccounts([])
+    setExpandedAccounts([])
+    setAccountPage(1)
+    setFailureStageFilter('')
+  }, [activeTask?.id])
 
   useEffect(() => {
     const hasActiveTasks = taskSnapshots.some((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status))
@@ -701,9 +759,16 @@ export default function App() {
       await loadOutlookSummary()
       await loadLuckmailTokenSummary()
       await loadProxySummary()
-      const snapshots = await loadTaskSnapshots()
+      let persistedTaskId = ''
+      try {
+        persistedTaskId = String(window.localStorage.getItem(ACTIVE_TASK_STORAGE_KEY) || '').trim()
+      } catch {
+        persistedTaskId = ''
+      }
+      const preferredTaskId = String(pendingResumeTaskIdRef.current || persistedTaskId || '').trim()
+      const snapshots = await loadTaskSnapshots(preferredTaskId || undefined)
       const runningSnapshot = snapshots.find((item) => item.is_active && !['done', 'failed', 'stopped'].includes(item.status))
-      const nextActiveTask = runningSnapshot || snapshots[0] || null
+      const nextActiveTask = (preferredTaskId ? snapshots.find((item) => item.id === preferredTaskId) : null) || runningSnapshot || snapshots[0] || null
       pendingResumeTaskIdRef.current = runningSnapshot?.id ? String(runningSnapshot.id) : ''
       setActiveTask(nextActiveTask)
       if (nextActiveTask?.is_active && !['done', 'failed', 'stopped'].includes(nextActiveTask.status)) {
@@ -791,6 +856,7 @@ export default function App() {
         closeStream()
         await loadLuckmailTokenSummary()
       }
+      return snapshot
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err || '')
       if (message.includes('任务不存在') || message.includes('404')) {
@@ -798,8 +864,9 @@ export default function App() {
         const snapshots = await loadTaskSnapshots()
         const runningSnapshot = snapshots.find((entry) => entry.is_active && !['done', 'failed', 'stopped'].includes(entry.status))
         pendingResumeTaskIdRef.current = runningSnapshot?.id ? String(runningSnapshot.id) : ''
-        setActiveTask(runningSnapshot || snapshots[0] || null)
-        return
+        const fallback = runningSnapshot || snapshots[0] || null
+        setActiveTask(fallback)
+        return fallback
       }
       throw err
     }
@@ -854,12 +921,45 @@ export default function App() {
     }
   }
 
+  async function switchActiveTask(taskId: string) {
+    const nextTaskId = String(taskId || '').trim()
+    if (!nextTaskId) {
+      closeStream()
+      setActiveTask(null)
+      return
+    }
+    setError('')
+    closeStream()
+    try {
+      const snapshot = await refreshTask(nextTaskId)
+      if (snapshot?.is_active && !['done', 'failed', 'stopped'].includes(String(snapshot.status || ''))) {
+        openStream(nextTaskId)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '切换任务失败')
+    }
+  }
+
   function updateField<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((prev) => ({ ...prev, [key]: value }))
   }
 
   function getAccountKey(item: AccountItem) {
     return `${item.task_id || 'task'}:${item.attempt_index}`
+  }
+
+  function getRetryBaseTaskId(item: AccountItem) {
+    return String(item.task_id || item.retry_from_task_id || '').trim()
+  }
+
+  function hasInvalidRetryRefs(item: AccountItem) {
+    const refs = Array.isArray(item.task_refs) ? item.task_refs : []
+    return refs.some((ref) => Number(ref?.attempt_index || 0) <= 0)
+  }
+
+  function isCleanRetryItem(item: AccountItem) {
+    const attemptIndex = Number(item.attempt_index || 0)
+    return Boolean(getRetryBaseTaskId(item)) && attemptIndex > 0 && !hasInvalidRetryRefs(item)
   }
 
   function toggleAccount(key: string) {
@@ -1182,11 +1282,15 @@ export default function App() {
     setExpandedAccounts([getAccountKey(item)])
     try {
       const targetTaskId = String(runningTaskId || '').trim()
+      const query = new URLSearchParams()
+      if (targetTaskId) query.set('target_task_id', targetTaskId)
+      query.set('concurrency', String(Math.max(1, Number(form.concurrency) || 1)))
+      const suffix = query.toString() ? `?${query.toString()}` : ''
       const response = item.id
-        ? await apiFetch<{ task_id: string }>(`/api/register/results/${item.id}/retry${targetTaskId ? `?target_task_id=${encodeURIComponent(targetTaskId)}` : ''}`, {
+        ? await apiFetch<{ task_id: string }>(`/api/register/results/${item.id}/retry${suffix}`, {
             method: 'POST',
           })
-        : await apiFetch<{ task_id: string }>(`/api/register/tasks/${item.task_id}/attempts/${item.attempt_index}/retry${targetTaskId ? `?target_task_id=${encodeURIComponent(targetTaskId)}` : ''}`, {
+        : await apiFetch<{ task_id: string }>(`/api/register/tasks/${item.task_id}/attempts/${item.attempt_index}/retry${suffix}`, {
             method: 'POST',
           })
       pendingResumeTaskIdRef.current = String(response.task_id || '')
@@ -1202,7 +1306,8 @@ export default function App() {
 
   async function retrySelectedAccounts() {
     if (isRunning) return
-    const targets = sortedAccounts.filter(
+    const source = accountScope === 'active' ? currentTaskAccounts : sortedAccounts
+    const targets = source.filter(
       (item) =>
         selectedAccounts.includes(getAccountKey(item)) &&
         ['failed', 'stopped'].includes(String(item.status || '').toLowerCase()) &&
@@ -1212,16 +1317,31 @@ export default function App() {
     setRetryingResultId(-1)
     setError('')
     try {
+      const preparedItems = targets.map((item) => {
+        const refs = (item.task_refs || []).filter((ref) => Number(ref?.attempt_index || 0) > 0)
+        const attemptIndex = Number(item.attempt_index || item.retry_from_attempt_index || 0)
+        const taskId = String(item.task_id || item.retry_from_task_id || '').trim()
+        return {
+          task_id: taskId,
+          task_ids: item.task_ids || [],
+          refs,
+          attempt_index: attemptIndex,
+        }
+      })
+      const validItems = preparedItems.filter((item) => item.task_id && item.attempt_index > 0)
+      const invalidCount = preparedItems.length - validItems.length
+      if (invalidCount > 0 && validItems.length === 0) {
+        setError(`当前选中的账号里有 ${invalidCount} 个是旧任务遗留的无效重试项，请刷新后改选原始失败记录再试`)
+        return
+      }
+      if (invalidCount > 0) {
+        setError(`已自动跳过 ${invalidCount} 个旧任务遗留的无效重试项`)
+      }
       const response = await apiFetch<{ task_id: string }>(`/api/register/accounts/retry-batch`, {
         method: 'POST',
         body: JSON.stringify({
           concurrency: Number(form.concurrency),
-          items: targets.map((item) => ({
-            task_id: item.task_id,
-            task_ids: item.task_ids || [],
-            refs: item.task_refs || [],
-            attempt_index: item.attempt_index,
-          })),
+          items: validItems,
         }),
       })
       pendingResumeTaskIdRef.current = String(response.task_id || '')
@@ -1858,7 +1978,20 @@ export default function App() {
         <section className="panel account-panel">
           <div className="panel-title-row">
             <h2>账号列表</h2>
-            <span>{activeTask?.id || '-'}</span>
+            <select
+              className="page-size-select"
+              value={activeTask?.id || ''}
+              onChange={(e) => {
+                void switchActiveTask(e.target.value)
+              }}
+            >
+              {taskSnapshots.length === 0 ? <option value="">-</option> : null}
+              {taskSnapshots.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {`${item.id.slice(0, 8)} · ${getStatusLabel(item.status)}`}
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="stats-grid compact-stats">
@@ -1870,6 +2003,10 @@ export default function App() {
 
           <div className="control-row">
             <button className="ghost-btn danger" type="button" onClick={() => void sendControl('stop')} disabled={!isRunning}>停止任务</button>
+            <select className="page-size-select" value={accountScope} onChange={(e) => setAccountScope(e.target.value as AccountScope)}>
+              <option value="all">全部任务</option>
+              <option value="active">当前任务</option>
+            </select>
             <select className="page-size-select" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value as AccountFilter)}>
               <option value="all">全部</option>
               <option value="success">成功</option>

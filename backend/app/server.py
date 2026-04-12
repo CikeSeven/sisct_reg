@@ -120,8 +120,8 @@ def stop_register_attempt(task_id: str, attempt_index: int):
 
 
 @app.post("/api/register/results/{result_id}/retry")
-def retry_register_result(result_id: int, target_task_id: str | None = None):
-    result = manager.retry_result(result_id, target_task_id=target_task_id)
+def retry_register_result(result_id: int, target_task_id: str | None = None, concurrency: int | None = None):
+    result = manager.retry_result(result_id, target_task_id=target_task_id, retry_concurrency=concurrency)
     if not result.get("ok"):
         reason = str(result.get("reason") or "")
         if reason in {"result_not_found", "task_not_found"}:
@@ -135,8 +135,8 @@ def retry_register_result(result_id: int, target_task_id: str | None = None):
 
 
 @app.post("/api/register/tasks/{task_id}/attempts/{attempt_index}/retry")
-def retry_register_attempt(task_id: str, attempt_index: int, target_task_id: str | None = None):
-    result = manager.retry_attempt(task_id, attempt_index, target_task_id=target_task_id)
+def retry_register_attempt(task_id: str, attempt_index: int, target_task_id: str | None = None, concurrency: int | None = None):
+    result = manager.retry_attempt(task_id, attempt_index, target_task_id=target_task_id, retry_concurrency=concurrency)
     if not result.get("ok"):
         reason = str(result.get("reason") or "")
         if reason in {"task_not_found", "account_not_found"}:
