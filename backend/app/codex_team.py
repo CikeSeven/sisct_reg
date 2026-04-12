@@ -15,7 +15,7 @@ from .db import (
     parse_config_row_values,
 )
 from .defaults import DEFAULT_CONFIG
-from .schemas import CreateCodexTeamJobRequest, ImportCodexTeamParentsRequest
+from .schemas import CodexTeamSessionBatchRequest, CreateCodexTeamJobRequest, ImportCodexTeamParentsRequest
 
 router = APIRouter(prefix="/api/codex-team", tags=["codex-team"])
 
@@ -94,11 +94,37 @@ def export_codex_team_sessions_cpa(job_id: str | None = None, limit: int = 200):
     )
 
 
+@router.post("/sessions/export-cpa")
+def export_selected_codex_team_sessions_cpa(body: CodexTeamSessionBatchRequest, job_id: str | None = None, limit: int = 200):
+    result = codex_team_manager.export_cpa_bundle(
+        job_id=job_id,
+        limit=max(1, min(limit, 500)),
+        session_ids=body.session_ids,
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, str(result.get("message") or "导出失败"))
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(
+        iter([result.get("content") or b""]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{str(result.get("filename") or "codex_team_cpa_export.zip")}"'},
+    )
+
+
 @router.delete("/sessions/{session_id}")
 def delete_codex_team_session(session_id: int):
     result = codex_team_manager.delete_session(session_id)
     if not result.get("ok"):
         raise HTTPException(404, "子号结果不存在")
+    return result
+
+
+@router.post("/sessions/delete-batch")
+def delete_codex_team_sessions_batch(body: CodexTeamSessionBatchRequest):
+    result = codex_team_manager.delete_sessions(body.session_ids)
+    if not result.get("ok"):
+        raise HTTPException(400, "删除子号结果失败")
     return result
 
 

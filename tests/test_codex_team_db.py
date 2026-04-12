@@ -1,10 +1,10 @@
 import json
-import sqlite3
 import sys
 import unittest
 
 sys.path.insert(0, 'backend')
 
+from tests.db_isolation import IsolatedCodexTeamDbTestCase
 from app.db import (
     DB_PATH,
     append_codex_team_job_event,
@@ -18,17 +18,7 @@ from app.db import (
 )
 
 
-class CodexTeamDbTests(unittest.TestCase):
-    def setUp(self):
-        init_db()
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            conn.execute('DELETE FROM codex_team_web_sessions')
-            conn.execute('DELETE FROM codex_team_job_events')
-            conn.execute('DELETE FROM codex_team_jobs')
-            conn.commit()
-        finally:
-            conn.close()
+class CodexTeamDbTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
     def test_create_and_update_job_snapshot(self):
         create_codex_team_job('job-1', request_payload={'child_count': 3, 'concurrency': 2})

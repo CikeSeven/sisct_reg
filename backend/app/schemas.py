@@ -85,3 +85,7 @@ class CreateCodexTeamJobRequest(BaseModel):
 class ImportCodexTeamParentsRequest(BaseModel):
     data: str = Field(default="")
     enabled: bool = True
+
+
+class CodexTeamSessionBatchRequest(BaseModel):
+    session_ids: list[int] = Field(default_factory=list)

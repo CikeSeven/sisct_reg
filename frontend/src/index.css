@@ -1110,6 +1110,16 @@ button:disabled {
   align-items: flex-end;
 }
 
+.codex-session-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.codex-session-check {
+  padding-right: 4px;
+}
+
 @media (max-width: 1480px) {
   .workbench-grid {
     grid-template-columns: 1fr;

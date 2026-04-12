@@ -1,11 +1,11 @@
 import json
-import sqlite3
 import sys
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, 'backend')
 
+from tests.db_isolation import IsolatedCodexTeamDbTestCase
 from app.codex_team_manager import CodexTeamManager
 from app.db import (
     DB_PATH,
@@ -28,18 +28,9 @@ class _FakeChildProvider:
         return f'https://chatgpt.com/auth/login?inv_ws_name=TeamWorkspace&inv_email={email}&wId=team-1&accept_wId=team-1'
 
 
-class CodexTeamParentPoolTests(unittest.TestCase):
+class CodexTeamParentPoolTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
     def setUp(self):
-        init_db()
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            conn.execute('DELETE FROM codex_team_web_sessions')
-            conn.execute('DELETE FROM codex_team_job_events')
-            conn.execute('DELETE FROM codex_team_jobs')
-            conn.execute('DELETE FROM codex_team_parent_accounts')
-            conn.commit()
-        finally:
-            conn.close()
+        super().setUp()
         _FakeChildProvider.index = 0
 
     def test_import_parent_pool_uses_outlook_line_format(self):

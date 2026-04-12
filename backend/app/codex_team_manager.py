@@ -493,8 +493,37 @@ class CodexTeamManager:
     def list_sessions(self, *, job_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return list_codex_team_web_sessions(job_id=job_id, limit=limit)
 
-    def export_cpa_bundle(self, *, job_id: str | None = None, limit: int = 200) -> dict[str, Any]:
-        rows = list_codex_team_web_sessions(job_id=job_id, limit=limit)
+    def _list_sessions_by_ids(self, session_ids: list[int]) -> list[dict[str, Any]]:
+        from .db import connection, row_to_dict
+
+        normalized_ids = [int(item) for item in session_ids if int(item or 0) > 0]
+        normalized_ids = list(dict.fromkeys(normalized_ids))
+        if not normalized_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM codex_team_web_sessions WHERE id IN ({placeholders}) ORDER BY id DESC",
+                tuple(normalized_ids),
+            ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            data = row_to_dict(row) or {}
+            try:
+                data["cookie_jar"] = json.loads(str(data.get("cookie_jar_json") or "[]"))
+            except Exception:
+                data["cookie_jar"] = []
+            try:
+                data["info"] = json.loads(str(data.get("info_json") or "{}"))
+            except Exception:
+                data["info"] = {}
+            items.append(data)
+        return items
+
+    def export_cpa_bundle(self, *, job_id: str | None = None, limit: int = 200, session_ids: list[int] | None = None) -> dict[str, Any]:
+        rows = self._list_sessions_by_ids(session_ids or []) if session_ids else list_codex_team_web_sessions(job_id=job_id, limit=limit)
         selected = [row for row in rows if str(row.get("status") or "").strip().lower() == "success"]
         if not selected:
             return {"ok": False, "reason": "no_success_accounts", "message": "没有可导出的成功子号"}
@@ -537,6 +566,29 @@ class CodexTeamManager:
             job_id = str(row["job_id"] or "")
             conn.execute("DELETE FROM codex_team_web_sessions WHERE id = ?", (int(session_id),))
         return {"ok": True, "job_id": job_id}
+
+    def delete_sessions(self, session_ids: list[int]) -> dict[str, Any]:
+        from .db import connection
+
+        normalized_ids = [int(item) for item in session_ids if int(item or 0) > 0]
+        normalized_ids = list(dict.fromkeys(normalized_ids))
+        if not normalized_ids:
+            return {"ok": True, "deleted": 0, "job_ids": []}
+
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with connection(write=True) as conn:
+            rows = conn.execute(
+                f"SELECT id, job_id FROM codex_team_web_sessions WHERE id IN ({placeholders})",
+                tuple(normalized_ids),
+            ).fetchall()
+            if not rows:
+                return {"ok": False, "reason": "session_not_found"}
+            job_ids = sorted({str(row["job_id"] or "") for row in rows if str(row["job_id"] or "").strip()})
+            conn.execute(
+                f"DELETE FROM codex_team_web_sessions WHERE id IN ({placeholders})",
+                tuple(normalized_ids),
+            )
+        return {"ok": True, "deleted": len(rows), "job_ids": job_ids}
 
 
 codex_team_manager = CodexTeamManager()

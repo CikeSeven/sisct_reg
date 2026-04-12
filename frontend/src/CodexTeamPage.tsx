@@ -97,8 +97,18 @@ export default function CodexTeamPage() {
   const [parentSummary, setParentSummary] = useState<CodexTeamParentSummary | null>(null)
   const [exportingCpa, setExportingCpa] = useState(false)
   const [deletingSessionId, setDeletingSessionId] = useState<number | null>(null)
+  const [selectedSessionIds, setSelectedSessionIds] = useState<number[]>([])
+  const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false)
 
   const isRunning = useMemo(() => ['pending', 'running'].includes(snapshot?.status || ''), [snapshot])
+  const sessionItems = useMemo(() => (snapshot?.sessions || latestSessions || []), [snapshot?.sessions, latestSessions])
+  const selectedSessionCount = selectedSessionIds.length
+  const hasSelectedSessions = selectedSessionCount > 0
+
+  useEffect(() => {
+    const visibleIds = new Set(sessionItems.map((item) => Number(item.id || 0)).filter((id) => id > 0))
+    setSelectedSessionIds((prev) => prev.filter((id) => visibleIds.has(id)))
+  }, [sessionItems])
 
   async function refreshJob(jobId: string) {
     if (!jobId) return
@@ -220,14 +230,34 @@ export default function CodexTeamPage() {
     }
   }
 
+  function toggleSession(sessionId: number) {
+    setSelectedSessionIds((prev) => (
+      prev.includes(sessionId) ? prev.filter((id) => id !== sessionId) : [...prev, sessionId]
+    ))
+  }
+
+  function selectAllSessions() {
+    setSelectedSessionIds(sessionItems.map((item) => Number(item.id || 0)).filter((id) => id > 0))
+  }
+
+  function clearSelectedSessions() {
+    setSelectedSessionIds([])
+  }
+
   async function exportCpa() {
     setExportingCpa(true)
     setError('')
     try {
+      const selectedIds = selectedSessionIds.filter((id) => id > 0)
+      const hasCustomSelection = selectedIds.length > 0
       const path = activeJobId
         ? `/api/codex-team/sessions/export-cpa?job_id=${encodeURIComponent(activeJobId)}`
         : '/api/codex-team/sessions/export-cpa'
-      const response = await fetch(path)
+      const response = await fetch(path, hasCustomSelection ? {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_ids: selectedIds }),
+      } : undefined)
       if (!response.ok) {
         throw new Error(await response.text())
       }
@@ -266,6 +296,29 @@ export default function CodexTeamPage() {
       setError(err instanceof Error ? err.message : '删除子号结果失败')
     } finally {
       setDeletingSessionId(null)
+    }
+  }
+
+  async function deleteSelectedSessions() {
+    if (!selectedSessionIds.length) return
+    setDeletingSelectedSessions(true)
+    setError('')
+    try {
+      await apiFetch('/api/codex-team/sessions/delete-batch', {
+        method: 'POST',
+        body: JSON.stringify({ session_ids: selectedSessionIds }),
+      })
+      setSelectedSessionIds([])
+      if (activeJobId) {
+        await refreshJob(activeJobId)
+        await refreshLatestSessions(activeJobId)
+      } else {
+        await refreshLatestSessions()
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '批量删除子号结果失败')
+    } finally {
+      setDeletingSelectedSessions(false)
     }
   }
 
@@ -396,8 +449,18 @@ export default function CodexTeamPage() {
         </div>
 
         <div className="form-actions split-actions">
-          <button className="ghost-btn" type="button" onClick={() => void exportCpa()} disabled={exportingCpa || (activeJobId ? (snapshot?.sessions || []).length === 0 : latestSessions.length === 0)}>
+          <button className="ghost-btn" type="button" onClick={() => void selectAllSessions()} disabled={sessionItems.length === 0}>
+            全选
+          </button>
+          <button className="ghost-btn" type="button" onClick={() => void clearSelectedSessions()} disabled={!hasSelectedSessions}>
+            取消选择
+          </button>
+          <div className="selected-count-chip">{selectedSessionCount}</div>
+          <button className="ghost-btn" type="button" onClick={() => void exportCpa()} disabled={exportingCpa || sessionItems.length === 0}>
             {exportingCpa ? '导出中...' : '导出 CPA'}
+          </button>
+          <button className="ghost-btn danger" type="button" onClick={() => void deleteSelectedSessions()} disabled={deletingSelectedSessions || !hasSelectedSessions}>
+            {deletingSelectedSessions ? '删除中...' : '删除选中'}
           </button>
         </div>
 
@@ -418,9 +481,16 @@ export default function CodexTeamPage() {
           <div className="sub-block codex-session-block">
             <div className="sub-block-title">子号会话</div>
             <div className="provider-item-list">
-              {((snapshot?.sessions || latestSessions) || []).length === 0 ? <div className="timeline-empty">暂无结果</div> : null}
-              {(snapshot?.sessions || latestSessions || []).map((item) => (
-                <div className="provider-item" key={item.id}>
+              {sessionItems.length === 0 ? <div className="timeline-empty">暂无结果</div> : null}
+              {sessionItems.map((item) => (
+                <div className="provider-item codex-session-item" key={item.id}>
+                  <label className="account-check codex-session-check">
+                    <input
+                      type="checkbox"
+                      checked={selectedSessionIds.includes(Number(item.id || 0))}
+                      onChange={() => toggleSession(Number(item.id || 0))}
+                    />
+                  </label>
                   <div>
                     <strong>{item.display_name || item.email || '-'}</strong>
                     <p>{item.email || '-'}</p>

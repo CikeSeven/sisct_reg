@@ -1,13 +1,13 @@
-import sqlite3
 import sys
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, 'backend')
 
+from tests.db_isolation import IsolatedCodexTeamDbTestCase
 from app.codex_team_manager import CodexTeamManager
 from app.defaults import DEFAULT_CONFIG
-from app.db import DB_PATH, init_db, list_codex_team_web_sessions
+from app.db import list_codex_team_web_sessions
 
 
 class _FakeMailProvider:
@@ -18,17 +18,7 @@ class _FakeMailProvider:
         return 'https://chatgpt.com/auth/login?inv_ws_name=TeamWorkspace&inv_email=child%40example.com&wId=parent-acct&accept_wId=parent-acct'
 
 
-class CodexTeamManagerTests(unittest.TestCase):
-    def setUp(self):
-        init_db()
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            conn.execute('DELETE FROM codex_team_web_sessions')
-            conn.execute('DELETE FROM codex_team_job_events')
-            conn.execute('DELETE FROM codex_team_jobs')
-            conn.commit()
-        finally:
-            conn.close()
+class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
     def _make_job(self):
         manager = CodexTeamManager()
