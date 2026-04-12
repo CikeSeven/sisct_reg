@@ -377,6 +377,52 @@ def get_codex_team_job(job_id: str) -> dict[str, Any] | None:
     return data
 
 
+def finalize_orphaned_codex_team_jobs() -> int:
+    now = time.time()
+    with connection(write=True) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM codex_team_jobs
+            WHERE status IN ('pending', 'running')
+            """
+        ).fetchone()
+        total = int((row_to_dict(row) or {}).get("total") or 0)
+        if total <= 0:
+            return 0
+        conn.execute(
+            """
+            UPDATE codex_team_jobs
+            SET status = 'stopped', updated_at = ?
+            WHERE status IN ('pending', 'running')
+            """,
+            (now,),
+        )
+        return total
+
+
+def list_codex_team_jobs(*, limit: int = 20) -> list[dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM codex_team_jobs
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (int(limit or 20),),
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        data = row_to_dict(row) or {}
+        try:
+            data["request_json"] = json.loads(str(data.get("request_json") or "{}"))
+        except Exception:
+            data["request_json"] = {}
+        items.append(data)
+    return items
+
+
 def append_codex_team_job_event(
     job_id: str,
     message: str,

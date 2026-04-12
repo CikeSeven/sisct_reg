@@ -113,7 +113,6 @@ class TeamManageStyleClient:
             json_data={
                 "email_addresses": [email],
                 "role": "standard-user",
-                "seat_type": "default",
                 "resend_emails": True,
             },
             identifier=identifier,
@@ -123,7 +122,37 @@ class TeamManageStyleClient:
         data = result.get("data") or {}
         invites = data.get("account_invites") or []
         invite_id = str((invites[0] or {}).get("id") or "").strip() if invites else ""
-        return {"success": True, "invite_id": invite_id, "error": "", "data": data}
+        if invite_id:
+            return {"success": True, "invite_id": invite_id, "error": "", "data": data}
+        errored_emails = list(data.get("errored_emails") or [])
+        summary = {
+            "keys": sorted(list(data.keys()))[:8] if isinstance(data, dict) else [],
+            "errored_emails": errored_emails[:3],
+            "account_invites_count": len(invites),
+            "status_code": int(result.get("status_code") or 0),
+        }
+        return {
+            "success": False,
+            "invite_id": "",
+            "error": f"invite response missing id: {summary}",
+            "data": data,
+        }
+
+    def get_invites(self, *, access_token: str, account_id: str, identifier: str) -> dict[str, Any]:
+        result = self._make_request(
+            "GET",
+            f"{self.BASE_URL}/accounts/{account_id}/invites",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "chatgpt-account-id": account_id,
+            },
+            identifier=identifier,
+        )
+        if not result.get("success"):
+            return {"success": False, "items": [], "total": 0, "error": result.get("error")}
+        data = result.get("data") or {}
+        items = list(data.get("items") or [])
+        return {"success": True, "items": items, "total": len(items), "error": "", "data": data}
 
     def accept_invite(self, *, access_token: str, account_id: str, identifier: str) -> dict[str, Any]:
         result = self._make_request(

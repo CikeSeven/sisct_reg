@@ -58,7 +58,30 @@ type CodexTeamJobSnapshot = {
   sessions: CodexTeamSessionItem[]
 }
 
+type CodexTeamJobListItem = {
+  id: string
+  status: string
+  total: number
+  success: number
+  failed: number
+  progress: string
+  created_at: number
+}
+
 const ACTIVE_CODEX_TEAM_JOB_STORAGE_KEY = 'codex_team_active_job_id'
+
+
+type CodexTeamParentImportSnapshot = {
+  id: string
+  status: string
+  total: number
+  success: number
+  failed: number
+  completed: number
+  progress: string
+  created_at: number
+  events: CodexTeamEvent[]
+}
 
 type FormState = {
   max_parent_accounts: number
@@ -92,6 +115,7 @@ export default function CodexTeamPage() {
   const [error, setError] = useState('')
   const [activeJobId, setActiveJobId] = useState('')
   const [snapshot, setSnapshot] = useState<CodexTeamJobSnapshot | null>(null)
+  const [jobHistory, setJobHistory] = useState<CodexTeamJobListItem[]>([])
   const [latestSessions, setLatestSessions] = useState<CodexTeamSessionItem[]>([])
   const [parentImportText, setParentImportText] = useState('')
   const [parentSummary, setParentSummary] = useState<CodexTeamParentSummary | null>(null)
@@ -99,6 +123,10 @@ export default function CodexTeamPage() {
   const [deletingSessionId, setDeletingSessionId] = useState<number | null>(null)
   const [selectedSessionIds, setSelectedSessionIds] = useState<number[]>([])
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false)
+  const [showParentImportModal, setShowParentImportModal] = useState(false)
+  const [parentImportJobId, setParentImportJobId] = useState('')
+  const [parentImportSnapshot, setParentImportSnapshot] = useState<CodexTeamParentImportSnapshot | null>(null)
+  const [stoppingParentImport, setStoppingParentImport] = useState(false)
 
   const isRunning = useMemo(() => ['pending', 'running'].includes(snapshot?.status || ''), [snapshot])
   const sessionItems = useMemo(() => (snapshot?.sessions || latestSessions || []), [snapshot?.sessions, latestSessions])
@@ -122,6 +150,38 @@ export default function CodexTeamPage() {
     setLatestSessions(detail.items || [])
   }
 
+  async function refreshJobs() {
+    const detail = await apiFetch<{ items: CodexTeamJobListItem[] }>('/api/codex-team/jobs?limit=20')
+    const items = detail.items || []
+    setJobHistory(items)
+    if (!activeJobId && items.length > 0) {
+      const latestJobId = String(items[0]?.id || '')
+      if (latestJobId) {
+        setActiveJobId(latestJobId)
+        window.localStorage.setItem(ACTIVE_CODEX_TEAM_JOB_STORAGE_KEY, latestJobId)
+      }
+    }
+  }
+
+
+  function isMicrosoftParentImport(text: string) {
+    const lines = String(text || '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+    if (lines.length === 0) return false
+    return lines.every((line) => {
+      const parts = line.split('----').map((item) => item.trim())
+      return parts.length === 4 && parts[0].includes('@') && !!parts[1] && !!parts[2] && !!parts[3] && !parts[1].startsWith('eyJ')
+    })
+  }
+
+  async function refreshParentImportJob(jobId: string) {
+    if (!jobId) return
+    const detail = await apiFetch<CodexTeamParentImportSnapshot>(`/api/codex-team/parents/import-jobs/${jobId}`)
+    setParentImportSnapshot(detail)
+    if (['done', 'failed', 'stopped'].includes(detail.status || '')) {
+      await refreshParents()
+    }
+  }
+
   async function refreshParents() {
     const detail = await apiFetch<CodexTeamParentSummary>('/api/codex-team/parents')
     setParentSummary(detail)
@@ -138,6 +198,7 @@ export default function CodexTeamPage() {
     } else {
       void refreshLatestSessions()
     }
+    void refreshJobs()
     void refreshParents()
   }, [])
 
@@ -152,6 +213,16 @@ export default function CodexTeamPage() {
     }, 2000)
     return () => window.clearInterval(timer)
   }, [activeJobId, isRunning])
+
+  useEffect(() => {
+    if (!parentImportJobId) return
+    void refreshParentImportJob(parentImportJobId)
+    if (!['pending', 'running'].includes(parentImportSnapshot?.status || 'pending')) return
+    const timer = window.setInterval(() => {
+      void refreshParentImportJob(parentImportJobId)
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [parentImportJobId, parentImportSnapshot?.status])
 
   async function startJob(event: FormEvent) {
     event.preventDefault()
@@ -171,6 +242,7 @@ export default function CodexTeamPage() {
       })
       setActiveJobId(response.job_id)
       window.localStorage.setItem(ACTIVE_CODEX_TEAM_JOB_STORAGE_KEY, response.job_id)
+      await refreshJobs()
       await refreshJob(response.job_id)
       await refreshLatestSessions(response.job_id)
     } catch (err) {
@@ -184,19 +256,45 @@ export default function CodexTeamPage() {
     setImportingParents(true)
     setError('')
     try {
-      await apiFetch('/api/codex-team/parents/import', {
-        method: 'POST',
-        body: JSON.stringify({
-          data: parentImportText,
-          enabled: true,
-        }),
-      })
+      if (isMicrosoftParentImport(parentImportText)) {
+        setShowParentImportModal(true)
+        const response = await apiFetch<{ job_id: string }>('/api/codex-team/parents/import-login', {
+          method: 'POST',
+          body: JSON.stringify({
+            data: parentImportText,
+            executor_type: form.executor_type,
+          }),
+        })
+        setParentImportJobId(response.job_id)
+        await refreshParentImportJob(response.job_id)
+      } else {
+        await apiFetch('/api/codex-team/parents/import', {
+          method: 'POST',
+          body: JSON.stringify({
+            data: parentImportText,
+            enabled: true,
+          }),
+        })
+        await refreshParents()
+      }
       setParentImportText('')
-      await refreshParents()
     } catch (err) {
       setError(err instanceof Error ? err.message : '导入母号池失败')
     } finally {
       setImportingParents(false)
+    }
+  }
+
+  async function stopParentImport() {
+    if (!parentImportJobId) return
+    setStoppingParentImport(true)
+    try {
+      await apiFetch(`/api/codex-team/parents/import-jobs/${parentImportJobId}/stop`, { method: 'POST' })
+      await refreshParentImportJob(parentImportJobId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '取消母号导入失败')
+    } finally {
+      setStoppingParentImport(false)
     }
   }
 
@@ -221,6 +319,7 @@ export default function CodexTeamPage() {
     setError('')
     try {
       await apiFetch(`/api/codex-team/jobs/${activeJobId}/stop`, { method: 'POST' })
+      await refreshJobs()
       await refreshJob(activeJobId)
       await refreshLatestSessions(activeJobId)
     } catch (err) {
@@ -287,6 +386,7 @@ export default function CodexTeamPage() {
         method: 'DELETE',
       })
       if (activeJobId) {
+        await refreshJobs()
         await refreshJob(activeJobId)
         await refreshLatestSessions(activeJobId)
       } else {
@@ -310,6 +410,7 @@ export default function CodexTeamPage() {
       })
       setSelectedSessionIds([])
       if (activeJobId) {
+        await refreshJobs()
         await refreshJob(activeJobId)
         await refreshLatestSessions(activeJobId)
       } else {
@@ -433,7 +534,30 @@ export default function CodexTeamPage() {
       <section className="panel account-panel codex-team-panel">
         <div className="panel-title-row">
           <h2>任务结果</h2>
-          <span className="hint">{activeJobId || '暂无任务'}</span>
+          <select
+            className="page-size-select"
+            value={activeJobId}
+            onChange={(e) => {
+              const nextJobId = String(e.target.value || '')
+              setActiveJobId(nextJobId)
+              setSnapshot(null)
+              if (nextJobId) {
+                window.localStorage.setItem(ACTIVE_CODEX_TEAM_JOB_STORAGE_KEY, nextJobId)
+                void refreshJob(nextJobId)
+                void refreshLatestSessions(nextJobId)
+              } else {
+                window.localStorage.removeItem(ACTIVE_CODEX_TEAM_JOB_STORAGE_KEY)
+                void refreshLatestSessions()
+              }
+            }}
+          >
+            {jobHistory.length === 0 ? <option value="">暂无任务</option> : null}
+            {jobHistory.map((item) => (
+              <option key={item.id} value={item.id}>
+                {`${item.id.slice(0, 18)} · ${item.status} · ${item.progress}`}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div className="codex-stats-grid">
@@ -524,6 +648,60 @@ export default function CodexTeamPage() {
           </div>
         </div>
       </section>
+
+      {showParentImportModal ? (
+        <div className="modal-shell" onClick={() => {
+          if (!['pending', 'running'].includes(parentImportSnapshot?.status || '')) {
+            setShowParentImportModal(false)
+          }
+        }}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="panel-title-row">
+              <div>
+                <h2>母号登录导入</h2>
+                <span className="hint">检测到微软邮箱导入格式，正在按注册账号同链路登录并转换为 session json</span>
+              </div>
+              <div className="hero-actions">
+                <span className="hint">{parentImportJobId || '-'}</span>
+                {['pending', 'running'].includes(parentImportSnapshot?.status || '') ? (
+                  <button className="ghost-btn danger" type="button" onClick={() => void stopParentImport()} disabled={stoppingParentImport}>
+                    {stoppingParentImport ? '取消中...' : '取消导入'}
+                  </button>
+                ) : (
+                  <button className="ghost-btn" type="button" onClick={() => setShowParentImportModal(false)}>
+                    关闭
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="codex-stats-grid">
+              <Stat label="状态" value={parentImportSnapshot?.status || '-'} tone={['pending', 'running'].includes(parentImportSnapshot?.status || '') ? 'info' : 'default'} />
+              <Stat label="总数" value={parentImportSnapshot?.total ?? 0} />
+              <Stat label="成功" value={parentImportSnapshot?.success ?? 0} tone="success" />
+              <Stat label="失败" value={parentImportSnapshot?.failed ?? 0} tone="danger" />
+            </div>
+
+            <div className="helper-note codex-progress-note">
+              <strong>进度</strong>
+              <p>{parentImportSnapshot?.progress || '0/0'}</p>
+            </div>
+
+            <div className="sub-block codex-log-block">
+              <div className="sub-block-title">导入日志</div>
+              <div className="codex-log-list">
+                {(parentImportSnapshot?.events || []).length === 0 ? <div className="timeline-empty">暂无日志</div> : null}
+                {(parentImportSnapshot?.events || []).map((item) => (
+                  <div className={`codex-log-line tone-${item.level === 'error' ? 'danger' : 'default'}`} key={`parent-import-${item.id}`}>
+                    <span>[{item.seq}]</span>
+                    <span>{item.account_email ? `${item.account_email} · ` : ''}{item.message}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

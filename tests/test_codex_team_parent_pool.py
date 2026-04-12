@@ -107,7 +107,7 @@ class CodexTeamParentPoolTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
         counts = {'team-1': 3, 'team-2': 5}
 
-        def fake_parent_context(parent, *, proxy_url=None, merged_config=None, executor_type=None):
+        def fake_parent_context(parent, *, proxy_url=None, merged_config=None, executor_type=None, force_refresh=False):
             return {
                 'success': True,
                 'email': parent['email'],
@@ -188,6 +188,60 @@ class CodexTeamParentPoolTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertEqual('parent@example.com', client.send_invite.call_args.kwargs['identifier'])
         self.assertEqual('parent@example.com', client.accept_invite.call_args.kwargs['identifier'])
         client_cls.assert_called_with(proxy_url='http://127.0.0.1:7890')
+
+    def test_parent_pool_job_stops_consuming_children_after_invite_failure(self):
+        batch_import_codex_team_parent_accounts(
+            'parent1@example.com----eyJaaa.bbb.ccc----123e4567-e89b-12d3-a456-426614174000',
+            enabled=True,
+        )
+        manager = CodexTeamManager()
+        job_id = manager.create_job(
+            {'parent_source': 'pool', 'target_children_per_parent': 5, 'max_parent_accounts': 1, 'executor_type': 'protocol'},
+            merged_config={'use_proxy': False},
+            start_immediately=False,
+        )
+        job = manager._jobs[job_id]
+
+        with patch('app.codex_team_manager.resolve_parent_invite_context', return_value={'success': True, 'email': 'parent1@example.com', 'access_token': 'at-parent', 'account_id': 'team-1'}), \
+            patch.object(manager, '_process_account', return_value=False) as process_mock, \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls:
+            client = client_cls.return_value
+            client.get_members = Mock(return_value={'success': True, 'members': [], 'total': 0})
+            manager._run_parent_pool_job(job)
+
+        self.assertEqual(1, process_mock.call_count)
+
+    def test_parent_pool_job_continues_after_mailbox_service_abuse_failure(self):
+        batch_import_codex_team_parent_accounts(
+            'parent1@example.com----eyJaaa.bbb.ccc----123e4567-e89b-12d3-a456-426614174000',
+            enabled=True,
+        )
+        manager = CodexTeamManager()
+        job_id = manager.create_job(
+            {'parent_source': 'pool', 'target_children_per_parent': 1, 'max_parent_accounts': 1, 'executor_type': 'protocol'},
+            merged_config={'use_proxy': False},
+            start_immediately=False,
+        )
+        job = manager._jobs[job_id]
+
+        results = [False, True]
+
+        def fake_process(*args, **kwargs):
+            current = results.pop(0)
+            job._last_account_halt_parent = False if current is False else True
+            return current
+
+        with patch('app.codex_team_manager.resolve_parent_invite_context', return_value={'success': True, 'email': 'parent1@example.com', 'access_token': 'at-parent', 'account_id': 'team-1'}), \
+            patch.object(manager, '_process_account', side_effect=fake_process) as process_mock, \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls:
+            client = client_cls.return_value
+            client.get_members = Mock(side_effect=[
+                {'success': True, 'members': [], 'total': 0},
+                {'success': True, 'members': [{'role': 'standard-user'}], 'total': 1},
+            ])
+            manager._run_parent_pool_job(job)
+
+        self.assertEqual(2, process_mock.call_count)
 
 
 if __name__ == '__main__':

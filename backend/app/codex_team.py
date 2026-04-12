@@ -15,7 +15,7 @@ from .db import (
     parse_config_row_values,
 )
 from .defaults import DEFAULT_CONFIG
-from .schemas import CodexTeamSessionBatchRequest, CreateCodexTeamJobRequest, ImportCodexTeamParentsRequest
+from .schemas import CodexTeamSessionBatchRequest, CreateCodexTeamJobRequest, ImportCodexTeamParentsRequest, StartCodexTeamParentLoginImportRequest
 
 router = APIRouter(prefix="/api/codex-team", tags=["codex-team"])
 
@@ -35,6 +35,11 @@ def get_codex_team_job(job_id: str):
     if not snapshot:
         raise HTTPException(404, "任务不存在")
     return snapshot
+
+
+@router.get("/jobs")
+def list_codex_team_jobs(limit: int = 20):
+    return {"items": codex_team_manager.list_jobs(limit=max(1, min(limit, 100)))}
 
 
 @router.post("/jobs/{job_id}/stop")
@@ -136,6 +141,34 @@ def get_codex_team_parents():
 @router.post("/parents/import")
 def import_codex_team_parents(body: ImportCodexTeamParentsRequest):
     return batch_import_codex_team_parent_accounts(body.data, enabled=body.enabled)
+
+
+@router.post("/parents/import-login")
+def start_codex_team_parent_login_import(body: StartCodexTeamParentLoginImportRequest):
+    merged_config = dict(DEFAULT_CONFIG)
+    merged_config.update(parse_config_row_values(get_config()))
+    job_id = codex_team_manager.create_parent_import_job(
+        data=body.data,
+        merged_config=merged_config,
+        executor_type=body.executor_type,
+    )
+    return {"job_id": job_id}
+
+
+@router.get("/parents/import-jobs/{job_id}")
+def get_codex_team_parent_login_import(job_id: str):
+    snapshot = codex_team_manager.get_parent_import_job_snapshot(job_id)
+    if not snapshot:
+        raise HTTPException(404, "导入任务不存在")
+    return snapshot
+
+
+@router.post("/parents/import-jobs/{job_id}/stop")
+def stop_codex_team_parent_login_import(job_id: str):
+    result = codex_team_manager.stop_parent_import_job(job_id)
+    if not result.get("ok"):
+        raise HTTPException(404, "导入任务不存在")
+    return result
 
 
 @router.delete("/parents/{parent_id}")

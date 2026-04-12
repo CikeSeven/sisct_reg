@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from core.task_runtime import StopTaskRequested
+
 from .db import (
     acquire_proxy_pool_entry,
     append_codex_team_job_event,
@@ -18,6 +20,7 @@ from .db import (
     create_codex_team_job,
     get_codex_team_job,
     insert_codex_team_web_session,
+    list_codex_team_jobs,
     list_enabled_codex_team_parent_accounts,
     list_codex_team_job_events,
     list_codex_team_web_sessions,
@@ -26,6 +29,7 @@ from .db import (
 )
 from .manager import RegistrationManager
 from .mail_providers import build_mail_provider
+from .codex_team_parent_login import login_parent_via_outlook, parse_outlook_parent_import_data
 from platforms.chatgpt.refresh_token_registration_engine import RefreshTokenRegistrationEngine
 from platforms.chatgpt.team_manage_style_client import TeamManageStyleClient
 from .external_uploads import generate_cpa_token_json
@@ -52,12 +56,179 @@ class CodexTeamJob:
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
+@dataclass
+class CodexTeamParentImportJob:
+    id: str
+    raw_data: str
+    merged_config: dict[str, Any]
+    executor_type: str = "protocol"
+    status: str = "pending"
+    total: int = 0
+    success: int = 0
+    failed: int = 0
+    completed: int = 0
+    progress: str = "0/0"
+    created_at: float = field(default_factory=time.time)
+    stop_requested: bool = False
+    events: list[dict[str, Any]] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
 class CodexTeamManager:
     def __init__(self) -> None:
         self._jobs: dict[str, CodexTeamJob] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         self._team_clients: dict[str, TeamManageStyleClient] = {}
+        self._parent_import_jobs: dict[str, CodexTeamParentImportJob] = {}
+        self._parent_import_threads: dict[str, threading.Thread] = {}
+
+    def create_parent_import_job(
+        self,
+        *,
+        data: str,
+        merged_config: dict[str, Any],
+        executor_type: str = "protocol",
+    ) -> str:
+        job_id = f"codex_parent_import_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        job = CodexTeamParentImportJob(
+            id=job_id,
+            raw_data=str(data or ""),
+            merged_config=dict(merged_config or {}),
+            executor_type=str(executor_type or "protocol"),
+        )
+        with self._lock:
+            self._parent_import_jobs[job_id] = job
+        thread = threading.Thread(target=self._run_parent_import_job, args=(job,), daemon=True)
+        self._parent_import_threads[job_id] = thread
+        thread.start()
+        return job_id
+
+    def _append_parent_import_event(
+        self,
+        job: CodexTeamParentImportJob,
+        message: str,
+        *,
+        level: str = "info",
+        account_email: str = "",
+    ) -> None:
+        with job.lock:
+            seq = len(job.events) + 1
+            job.events.append(
+                {
+                    "id": seq,
+                    "seq": seq,
+                    "level": str(level or "info"),
+                    "account_email": str(account_email or ""),
+                    "message": str(message or ""),
+                    "created_at": time.time(),
+                }
+            )
+
+    def _check_parent_import_stop(self, job: CodexTeamParentImportJob) -> None:
+        if job.stop_requested:
+            raise RuntimeError("母号导入已取消")
+
+    def _run_parent_import_job(self, job: CodexTeamParentImportJob) -> None:
+        with job.lock:
+            job.status = "running"
+        try:
+            entries = parse_outlook_parent_import_data(job.raw_data)
+        except Exception as exc:
+            with job.lock:
+                job.status = "failed"
+                job.progress = "0/0"
+            self._append_parent_import_event(job, str(exc or "母号导入格式错误"), level="error")
+            return
+
+        with job.lock:
+            job.total = len(entries)
+            job.progress = f"0/{len(entries)}"
+        self._append_parent_import_event(job, f"开始导入 {len(entries)} 个母号并执行登录转换")
+
+        runtime_config = dict(job.merged_config)
+        if runtime_config.get("use_proxy") and not str(runtime_config.get("proxy") or "").strip():
+            proxy_entry = acquire_proxy_pool_entry()
+            if proxy_entry and str(proxy_entry.get("proxy_url") or "").strip():
+                runtime_config["proxy"] = str(proxy_entry.get("proxy_url") or "").strip()
+
+        for item in entries:
+            self._check_parent_import_stop(job)
+            email = str(item.get("email") or "").strip().lower()
+            self._append_parent_import_event(job, "开始母号登录转换", account_email=email)
+            try:
+                result = login_parent_via_outlook(
+                    item,
+                    merged_config=runtime_config,
+                    executor_type=job.executor_type,
+                    log_fn=lambda message, current_email=email: self._append_parent_import_event(
+                        job,
+                        str(message or ""),
+                        account_email=current_email,
+                    ),
+                    interrupt_check=lambda current_job=job: self._check_parent_import_stop(current_job),
+                )
+                if result.get("success"):
+                    with job.lock:
+                        job.success += 1
+                    self._append_parent_import_event(
+                        job,
+                        f"母号转换成功，已导入 session: account_id={str(result.get('account_id') or '-')}",
+                        account_email=email,
+                    )
+                else:
+                    with job.lock:
+                        job.failed += 1
+                    self._append_parent_import_event(
+                        job,
+                        str(result.get("error") or "母号转换失败"),
+                        level="error",
+                        account_email=email,
+                    )
+            except Exception as exc:
+                with job.lock:
+                    job.failed += 1
+                self._append_parent_import_event(job, str(exc or "母号转换异常"), level="error", account_email=email)
+            finally:
+                with job.lock:
+                    job.completed += 1
+                    job.progress = f"{job.completed}/{job.total}"
+
+        with job.lock:
+            if job.stop_requested:
+                job.status = "stopped"
+            elif job.failed > 0 and job.success == 0:
+                job.status = "failed"
+            else:
+                job.status = "done"
+
+    def get_parent_import_job_snapshot(self, job_id: str) -> dict[str, Any] | None:
+        job = self._parent_import_jobs.get(str(job_id))
+        if not job:
+            return None
+        with job.lock:
+            return {
+                "id": job.id,
+                "status": job.status,
+                "total": job.total,
+                "success": job.success,
+                "failed": job.failed,
+                "completed": job.completed,
+                "progress": job.progress,
+                "created_at": job.created_at,
+                "events": list(job.events),
+            }
+
+    def stop_parent_import_job(self, job_id: str) -> dict[str, Any]:
+        job = self._parent_import_jobs.get(str(job_id))
+        if not job:
+            return {"ok": False, "reason": "job_not_found"}
+        job.stop_requested = True
+        with job.lock:
+            if job.status in {"pending", "running"}:
+                job.status = "stopped"
+        self._append_parent_import_event(job, "已请求取消母号导入", level="error")
+        return {"ok": True}
 
     def create_job(
         self,
@@ -114,9 +285,22 @@ class CodexTeamManager:
         self._set_job_state(job, status=final_status)
 
     @staticmethod
+    def _check_job_stop(job: CodexTeamJob) -> None:
+        if job.stop_requested:
+            raise StopTaskRequested("任务已手动停止")
+
+    @staticmethod
     def _is_fatal_child_failure_message(message: str) -> bool:
         text = str(message or "").strip()
         if not text:
+            return False
+        nonfatal_markers = (
+            "微软邮箱已失效",
+            "service abuse mode",
+            "invalid_grant",
+            "aadsts70000",
+        )
+        if any(marker.lower() in text.lower() for marker in nonfatal_markers):
             return False
         fatal_markers = (
             "本地微软邮箱池为空",
@@ -126,6 +310,36 @@ class CodexTeamManager:
             "空邮箱",
         )
         return any(marker in text for marker in fatal_markers)
+
+    @staticmethod
+    def _should_halt_parent_on_failure(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return True
+        nonfatal_markers = (
+            "微软邮箱已失效",
+            "service abuse mode",
+            "invalid_grant",
+            "aadsts70000",
+            "graph api token 获取失败",
+        )
+        if any(marker.lower() in text for marker in nonfatal_markers):
+            return False
+        return True
+
+    @staticmethod
+    def _should_retry_registration_failure(error_text: str) -> bool:
+        text = str(error_text or "").strip().lower()
+        if not text:
+            return False
+        retry_markers = (
+            "http 429",
+            " 429:",
+            "too many requests",
+            "just a moment",
+            "rate limit",
+        )
+        return any(marker in text for marker in retry_markers)
 
     def _stop_job_on_fatal_child_failure(self, job: CodexTeamJob, reason: str, *, account_email: str = "") -> None:
         if job.stop_requested and job.status == "failed":
@@ -215,7 +429,22 @@ class CodexTeamManager:
 
             while child_count < target_children and not job.stop_requested:
                 attempt_index += 1
+                refreshed_parent_context = resolve_parent_invite_context(
+                    parent,
+                    merged_config=job.merged_config,
+                    executor_type=str(job.request_payload.get("executor_type") or "protocol"),
+                    force_refresh=True,
+                )
+                if refreshed_parent_context.get("success"):
+                    parent_context = dict(refreshed_parent_context)
                 success = self._process_account(job, attempt_index, parent_context=dict(parent_context))
+                if not success:
+                    halt_parent = bool(getattr(job, "_last_account_halt_parent", True))
+                    if halt_parent:
+                        append_codex_team_job_event(job.id, f"母号停止继续邀请: {parent_email} 子号流程失败", level="error")
+                        break
+                    append_codex_team_job_event(job.id, f"子号失败但继续当前母号: {parent_email}", level="error")
+                    continue
                 count_result = client.get_members(
                     access_token=str(parent_context.get("access_token") or ""),
                     account_id=parent_account_id,
@@ -230,12 +459,12 @@ class CodexTeamManager:
                         last_used=time.time(),
                     )
                     append_codex_team_job_event(job.id, f"母号刷新子号数: {parent_email} {child_count}/{target_children}")
-                elif not success:
-                    break
 
     def _process_account(self, job: CodexTeamJob, attempt_index: int, *, parent_context: dict[str, Any] | None = None) -> bool:
         child_email = ""
         try:
+            setattr(job, "_last_account_halt_parent", True)
+            self._check_job_stop(job)
             proxy_url = str(job.merged_config.get("proxy") or "").strip() if job.merged_config.get("use_proxy") else ""
             provider = build_mail_provider(
                 "outlook_local",
@@ -243,7 +472,9 @@ class CodexTeamManager:
                 proxy=(job.merged_config.get("proxy") if job.merged_config.get("use_proxy") else None),
                 log_fn=lambda message: append_codex_team_job_event(job.id, str(message or ""), account_email=child_email),
             )
+            self._check_job_stop(job)
             mail_info = provider.create_email(job.merged_config)
+            self._check_job_stop(job)
             child_email = str(mail_info.get("email") or "").strip()
             if not child_email:
                 raise RuntimeError("本地微软邮箱池返回空邮箱，停止任务")
@@ -254,33 +485,73 @@ class CodexTeamManager:
             active_parent_context = dict(parent_context or self._ensure_parent_invite_context(job))
             parent_identifier = str(active_parent_context.get("email") or active_parent_context.get("account_id") or "default")
             client = self._get_team_client(parent_identifier, proxy_url or None)
-            invite_result = client.send_invite(
+            invites_before = client.get_invites(
                 access_token=str(active_parent_context.get("access_token") or ""),
                 account_id=str(active_parent_context.get("account_id") or ""),
-                email=child_email,
                 identifier=parent_identifier,
             )
-            if not invite_result.get("success"):
-                error_message = str(invite_result.get("error") or "发送邀请失败")
-                insert_codex_team_web_session(
-                    job_id=job.id,
-                    email=child_email,
-                    status="failed",
-                    selected_workspace_id="",
-                    selected_workspace_kind="",
-                    account_id="",
-                    next_auth_session_token="",
-                    cookie_jar=[],
-                    error=error_message,
-                )
+            pending_before = self._find_pending_invite(invites_before, child_email) if invites_before.get("success") else None
+            if pending_before:
                 append_codex_team_job_event(
                     job.id,
-                    f"母号邀请失败: {error_message}",
-                    level="error",
+                    f"复用已有待接受邀请: invite_id={str(pending_before.get('id') or '-')}",
                     account_email=child_email,
                 )
-                self._increment(job, failed=1)
-                return False
+                invite_result = {
+                    "success": True,
+                    "invite_id": str(pending_before.get("id") or "").strip(),
+                    "error": "",
+                    "data": {"reused_existing_invite": True, "invite": pending_before},
+                }
+            else:
+                invite_result = client.send_invite(
+                    access_token=str(active_parent_context.get("access_token") or ""),
+                    account_id=str(active_parent_context.get("account_id") or ""),
+                    email=child_email,
+                    identifier=parent_identifier,
+                )
+            self._check_job_stop(job)
+            if not invite_result.get("success"):
+                invites_after = client.get_invites(
+                    access_token=str(active_parent_context.get("access_token") or ""),
+                    account_id=str(active_parent_context.get("account_id") or ""),
+                    identifier=parent_identifier,
+                )
+                pending_after = self._find_pending_invite(invites_after, child_email) if invites_after.get("success") else None
+                if pending_after:
+                    invite_result = {
+                        "success": True,
+                        "invite_id": str(pending_after.get("id") or "").strip(),
+                        "error": "",
+                        "data": {"reused_existing_invite": True, "invite": pending_after},
+                    }
+                    append_codex_team_job_event(
+                        job.id,
+                        f"邀请接口失败，但检测到已存在待接受邀请，继续复用: invite_id={str(invite_result.get('invite_id') or '-')}",
+                        account_email=child_email,
+                    )
+                else:
+                    error_message = str(invite_result.get("error") or "发送邀请失败")
+                    insert_codex_team_web_session(
+                        job_id=job.id,
+                        email=child_email,
+                        status="failed",
+                        selected_workspace_id="",
+                        selected_workspace_kind="",
+                        account_id="",
+                        next_auth_session_token="",
+                        cookie_jar=[],
+                        error=error_message,
+                    )
+                    append_codex_team_job_event(
+                        job.id,
+                        f"母号邀请失败: {error_message}",
+                        level="error",
+                        account_email=child_email,
+                    )
+                    setattr(job, "_last_account_halt_parent", True)
+                    self._increment(job, failed=1)
+                    return False
             append_codex_team_job_event(
                 job.id,
                 f"母号邀请已发送: invite_id={str(invite_result.get('invite_id') or '-')}",
@@ -290,7 +561,9 @@ class CodexTeamManager:
                 email=child_email,
                 timeout=int(job.merged_config.get("chatgpt_invite_link_wait_seconds") or 300),
                 invite_sent_at=time.time(),
+                interrupt_check=lambda current_job=job: self._check_job_stop(current_job),
             )
+            self._check_job_stop(job)
             append_codex_team_job_event(
                 job.id,
                 f"已获取邀请链接: {invite_link[:180]}",
@@ -304,10 +577,31 @@ class CodexTeamManager:
                 task_uuid=f"{job.id}:{attempt_index}",
                 browser_mode=str(job.request_payload.get("executor_type") or "protocol"),
                 extra_config=dict(job.merged_config),
+                interrupt_check=lambda current_job=job: self._check_job_stop(current_job),
             )
             engine.email = child_email
             engine.email_info = mail_info
-            result_obj = engine.run()
+            max_register_retries = max(1, int(job.merged_config.get("codex_team_register_retry_attempts") or 3))
+            result_obj = None
+            for register_try in range(1, max_register_retries + 1):
+                result_obj = engine.run()
+                current_error = str(getattr(result_obj, "error_message", "") or "")
+                if bool(getattr(result_obj, "success", False)):
+                    break
+                if register_try >= max_register_retries:
+                    break
+                if not self._should_retry_registration_failure(current_error):
+                    break
+                retry_delay = min(30, 5 * register_try)
+                append_codex_team_job_event(
+                    job.id,
+                    f"子号注册触发重试 {register_try}/{max_register_retries - 1}: {current_error[:180]}，{retry_delay}s 后重试",
+                    level="error",
+                    account_email=child_email,
+                )
+                self._check_job_stop(job)
+                time.sleep(retry_delay)
+                self._check_job_stop(job)
             result = {
                 "success": bool(getattr(result_obj, "success", False)),
                 "email": str(getattr(result_obj, "email", "") or child_email),
@@ -326,6 +620,7 @@ class CodexTeamManager:
                 "error": str(getattr(result_obj, "error_message", "") or ""),
             }
             if result.get("success") and result.get("access_token") and result.get("invite_workspace_id"):
+                self._check_job_stop(job)
                 accept_result = client.accept_invite(
                     access_token=str(result.get("access_token") or ""),
                     account_id=str(result.get("invite_workspace_id") or ""),
@@ -342,6 +637,7 @@ class CodexTeamManager:
                     str(failure_info.get("stop_task_reason") or result.get("error") or "子号流程致命失败"),
                     account_email=child_email,
                 )
+            setattr(job, "_last_account_halt_parent", self._should_halt_parent_on_failure(str(result.get("error") or "")))
             insert_codex_team_web_session(
                 job_id=job.id,
                 email=child_email or str(result.get("email") or ""),
@@ -376,9 +672,30 @@ class CodexTeamManager:
                 )
                 self._increment(job, failed=1)
                 return False
+        except StopTaskRequested as exc:
+            insert_codex_team_web_session(
+                job_id=job.id,
+                email=child_email,
+                status="failed",
+                selected_workspace_id="",
+                selected_workspace_kind="",
+                account_id="",
+                next_auth_session_token="",
+                cookie_jar=[],
+                error=str(exc or ""),
+            )
+            append_codex_team_job_event(
+                job.id,
+                f"子号处理已停止: {str(exc or '')}",
+                level="error",
+                account_email=child_email,
+            )
+            setattr(job, "_last_account_halt_parent", True)
+            return False
         except Exception as exc:
             if self._is_fatal_child_failure_message(str(exc or "")):
                 self._stop_job_on_fatal_child_failure(job, str(exc or ""), account_email=child_email)
+            setattr(job, "_last_account_halt_parent", self._should_halt_parent_on_failure(str(exc or "")))
             insert_codex_team_web_session(
                 job_id=job.id,
                 email=child_email,
@@ -444,6 +761,15 @@ class CodexTeamManager:
             count += 1
         return count
 
+    @staticmethod
+    def _find_pending_invite(invites_result: dict[str, Any], email: str) -> dict[str, Any] | None:
+        target = str(email or "").strip().lower()
+        for item in list(invites_result.get("items") or []):
+            invite_email = str(item.get("email_address") or item.get("email") or "").strip().lower()
+            if invite_email == target:
+                return dict(item)
+        return None
+
     def _increment(self, job: CodexTeamJob, *, success: int = 0, failed: int = 0) -> None:
         with job.lock:
             job.success += int(success or 0)
@@ -476,11 +802,16 @@ class CodexTeamManager:
 
     def stop_job(self, job_id: str) -> dict[str, Any]:
         job = self._jobs.get(str(job_id))
-        if not job:
+        if job:
+            job.stop_requested = True
+            self._set_job_state(job, status="stopped")
+            return {"ok": True}
+
+        snapshot = get_codex_team_job(str(job_id))
+        if not snapshot:
             return {"ok": False, "reason": "job_not_found"}
-        job.stop_requested = True
-        self._set_job_state(job, status="stopped")
-        return {"ok": True}
+        update_codex_team_job(str(job_id), status="stopped")
+        return {"ok": True, "detached": True}
 
     def get_job_snapshot(self, job_id: str) -> dict[str, Any] | None:
         snapshot = get_codex_team_job(str(job_id))
@@ -489,6 +820,9 @@ class CodexTeamManager:
         snapshot["events"] = list_codex_team_job_events(str(job_id))
         snapshot["sessions"] = list_codex_team_web_sessions(job_id=str(job_id))
         return snapshot
+
+    def list_jobs(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        return list_codex_team_jobs(limit=limit)
 
     def list_sessions(self, *, job_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return list_codex_team_web_sessions(job_id=job_id, limit=limit)
@@ -599,12 +933,38 @@ def resolve_parent_invite_context(
     *,
     merged_config: dict[str, Any] | None = None,
     executor_type: str = "protocol",
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     parent = dict(parent_credentials or {})
     merged = dict(merged_config or {})
     proxy_url = str(merged.get("proxy") or "").strip() if merged.get("use_proxy") else ""
-    resolved = resolve_parent_invite_context_from_token(parent, proxy_url=proxy_url or None)
+    resolved = resolve_parent_invite_context_from_token(
+        parent,
+        proxy_url=proxy_url or None,
+        force_refresh=force_refresh,
+    )
     if resolved.get("success"):
         resolved.setdefault("source", "team_manage_style_tokens")
         return resolved
+    if (
+        str(parent.get("email") or "").strip()
+        and str(parent.get("password") or "").strip()
+        and str(parent.get("client_id") or "").strip()
+        and str(parent.get("refresh_token") or "").strip()
+    ):
+        login_result = login_parent_via_outlook(
+            parent,
+            merged_config=merged,
+            executor_type=executor_type,
+        )
+        if login_result.get("success"):
+            return {
+                "success": True,
+                "source": "outlook_mailbox_login",
+                "email": str(login_result.get("email") or parent.get("email") or "").strip(),
+                "access_token": str(login_result.get("access_token") or ""),
+                "session_token": str(login_result.get("session_token") or ""),
+                "account_id": str(login_result.get("account_id") or ""),
+            }
+        return {"success": False, "error": str(login_result.get("error") or "母号邮箱登录失败")}
     return {"success": False, "error": str(resolved.get("error") or "母号参数不可用")}

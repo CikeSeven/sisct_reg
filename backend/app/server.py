@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .db import finalize_orphaned_tasks, get_config, get_task_events, init_db, parse_config_row_values, set_config
+from .db import finalize_orphaned_codex_team_jobs, finalize_orphaned_tasks, get_config, get_task_events, init_db, parse_config_row_values, set_config
 from .codex_team import router as codex_team_router
 from .defaults import DEFAULT_CONFIG
 from .luckmail_pool import router as luckmail_pool_router
@@ -38,6 +38,7 @@ app.include_router(codex_team_router)
 def _startup():
     init_db()
     finalize_orphaned_tasks()
+    finalize_orphaned_codex_team_jobs()
 
 
 @app.get("/api/health")

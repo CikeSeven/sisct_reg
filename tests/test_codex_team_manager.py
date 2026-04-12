@@ -71,6 +71,7 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
             patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
             client = client_cls.return_value
+            client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
             client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
             engine = engine_cls.return_value
             engine.run.return_value = Mock(
@@ -102,6 +103,7 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
             patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
             client = client_cls.return_value
+            client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
             client.send_invite = Mock(return_value={'success': False, 'invite_id': '', 'error': 'invite denied'})
             manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
 
@@ -111,6 +113,87 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertEqual(1, snapshot['failed'])
         self.assertIn('invite denied', sessions[0]['error'])
         engine_cls.assert_not_called()
+
+    def test_process_account_reuses_existing_pending_invite_after_send_failure(self):
+        manager, job_id, job = self._make_job()
+
+        with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            client = client_cls.return_value
+            client.get_invites = Mock(side_effect=[
+                {'success': True, 'items': [], 'total': 0, 'error': ''},
+                {'success': True, 'items': [{'id': 'inv-existing', 'email_address': 'child@example.com'}], 'total': 1, 'error': ''},
+            ])
+            client.send_invite = Mock(return_value={'success': False, 'invite_id': '', 'error': 'invite denied'})
+            client.accept_invite = Mock(return_value={'success': True, 'error': ''})
+            engine = engine_cls.return_value
+            engine.run.return_value = Mock(
+                success=True,
+                email='child@example.com',
+                password='mail-pass',
+                account_id='acct-1',
+                workspace_id='org-1',
+                access_token='child-at',
+                refresh_token='child-rt',
+                id_token='child-id',
+                session_token='child-st',
+                error_message='',
+                metadata={'plan_type': 'team', 'account_role': 'standard-user'},
+            )
+            manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
+
+        snapshot = manager.get_job_snapshot(job_id)
+        self.assertEqual(1, snapshot['success'])
+        self.assertEqual(0, snapshot['failed'])
+        engine_cls.assert_called_once()
+
+    def test_process_account_retries_registration_on_http_429(self):
+        manager, job_id, job = self._make_job()
+
+        with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls, \
+            patch('app.codex_team_manager.time.sleep', return_value=None):
+            client = client_cls.return_value
+            client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
+            client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
+            client.accept_invite = Mock(return_value={'success': True, 'error': ''})
+            engine = engine_cls.return_value
+            engine.run.side_effect = [
+                Mock(
+                    success=False,
+                    email='child@example.com',
+                    password='mail-pass',
+                    account_id='',
+                    workspace_id='',
+                    access_token='',
+                    refresh_token='',
+                    id_token='',
+                    session_token='',
+                    error_message='注册状态机失败: 注册失败: HTTP 429: Just a moment...',
+                    metadata={},
+                ),
+                Mock(
+                    success=True,
+                    email='child@example.com',
+                    password='mail-pass',
+                    account_id='acct-1',
+                    workspace_id='org-1',
+                    access_token='child-at',
+                    refresh_token='child-rt',
+                    id_token='child-id',
+                    session_token='child-st',
+                    error_message='',
+                    metadata={'plan_type': 'team', 'account_role': 'standard-user'},
+                ),
+            ]
+            manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
+
+        snapshot = manager.get_job_snapshot(job_id)
+        self.assertEqual(1, snapshot['success'])
+        self.assertEqual(0, snapshot['failed'])
+        self.assertEqual(2, engine.run.call_count)
 
 
 

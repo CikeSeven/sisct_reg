@@ -176,7 +176,12 @@ def refresh_parent_access_token_with_session_token(
     }
 
 
-def resolve_parent_invite_context(parent_credentials: dict[str, Any] | None, *, proxy_url: str | None = None) -> dict[str, Any]:
+def resolve_parent_invite_context(
+    parent_credentials: dict[str, Any] | None,
+    *,
+    proxy_url: str | None = None,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     creds = dict(parent_credentials or {})
     access_token = str(creds.get("access_token") or "").strip()
     session_token = str(creds.get("session_token") or "").strip()
@@ -184,13 +189,7 @@ def resolve_parent_invite_context(parent_credentials: dict[str, Any] | None, *, 
     refresh_token = str(creds.get("refresh_token") or "").strip()
     provided_account_id = str(creds.get("team_account_id") or creds.get("account_id") or "").strip()
 
-    if access_token.count(".") >= 2:
-        account_id = provided_account_id or extract_account_id_from_access_token(access_token)
-        if not account_id:
-            return {"success": False, "error": "无法从母号 access token 中解析 account_id"}
-        return {"success": True, "access_token": access_token, "account_id": account_id, "session_token": session_token}
-
-    if session_token:
+    if session_token and (force_refresh or not access_token):
         refreshed = refresh_parent_access_token_with_session_token(
             session_token=session_token,
             account_id=provided_account_id or None,
@@ -211,7 +210,7 @@ def resolve_parent_invite_context(parent_credentials: dict[str, Any] | None, *, 
             "session": refreshed.get("session"),
         }
 
-    if client_id and refresh_token:
+    if client_id and refresh_token and (force_refresh or not access_token):
         refreshed = refresh_parent_access_token(client_id=client_id, refresh_token=refresh_token, proxy_url=proxy_url)
         if not refreshed.get("success"):
             return refreshed
@@ -224,6 +223,19 @@ def resolve_parent_invite_context(parent_credentials: dict[str, Any] | None, *, 
             "access_token": access_token,
             "account_id": account_id,
             "refresh_token": str(refreshed.get("refresh_token") or refresh_token),
+            "client_id": client_id,
+        }
+
+    if access_token.count(".") >= 2:
+        account_id = provided_account_id or extract_account_id_from_access_token(access_token)
+        if not account_id:
+            return {"success": False, "error": "无法从母号 access token 中解析 account_id"}
+        return {
+            "success": True,
+            "access_token": access_token,
+            "account_id": account_id,
+            "session_token": session_token,
+            "refresh_token": refresh_token,
             "client_id": client_id,
         }
 

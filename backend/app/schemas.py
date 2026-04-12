@@ -89,3 +89,8 @@ class ImportCodexTeamParentsRequest(BaseModel):
 
 class CodexTeamSessionBatchRequest(BaseModel):
     session_ids: list[int] = Field(default_factory=list)
+
+
+class StartCodexTeamParentLoginImportRequest(BaseModel):
+    data: str = Field(default="")
+    executor_type: ExecutorType = "protocol"
