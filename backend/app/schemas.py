@@ -62,3 +62,26 @@ class AppendTaskRequest(BaseModel):
 class BatchRetryRequest(BaseModel):
     concurrency: int = Field(default=1, ge=1, le=100)
     items: list[DeleteAccountRequest] = Field(default_factory=list)
+
+
+class CodexTeamParentCredentials(BaseModel):
+    email: str = Field(default="")
+    password: str = Field(default="")
+    provider: str = Field(default="outlook_local")
+    client_id: str = Field(default="")
+    refresh_token: str = Field(default="")
+
+
+class CreateCodexTeamJobRequest(BaseModel):
+    parent_credentials: CodexTeamParentCredentials = Field(default_factory=CodexTeamParentCredentials)
+    parent_source: str = Field(default="manual")
+    target_children_per_parent: int = Field(default=5, ge=1, le=50)
+    max_parent_accounts: int = Field(default=1, ge=1, le=1000)
+    child_count: int = Field(default=1, ge=1, le=1000)
+    concurrency: int = Field(default=1, ge=1, le=100)
+    executor_type: ExecutorType = "protocol"
+
+
+class ImportCodexTeamParentsRequest(BaseModel):
+    data: str = Field(default="")
+    enabled: bool = True

@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch } from './lib/api'
+import CodexTeamPage from './CodexTeamPage'
 
 type MailProvider = 'luckmail' | 'tempmail_lol' | 'outlook_local'
 type Executor = 'protocol' | 'headless' | 'headed'
@@ -9,6 +10,7 @@ type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
 type AccountFilter = 'all' | 'success' | 'failed'
 type AccountScope = 'all' | 'active'
+type WorkbenchPage = 'register' | 'codex_team'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -368,6 +370,7 @@ function getActiveFlowLabel(item: AccountItem) {
 }
 
 export default function App() {
+  const [page, setPage] = useState<WorkbenchPage>('register')
   const [form, setForm] = useState<FormState>(defaultForm)
   const [activeTask, setActiveTask] = useState<TaskSnapshot | null>(null)
   const [taskSnapshots, setTaskSnapshots] = useState<TaskSnapshot[]>([])
@@ -1909,8 +1912,25 @@ export default function App() {
   return (
     <div className="page-shell">
       <div className="page-backdrop" />
-      {error ? <div className="error-banner">{error}</div> : null}
+      <div className="page-switch-bar">
+        <button
+          className={`page-switch-btn ${page === 'register' ? 'active' : ''}`}
+          type="button"
+          onClick={() => setPage('register')}
+        >
+          注册工作台
+        </button>
+        <button
+          className={`page-switch-btn ${page === 'codex_team' ? 'active' : ''}`}
+          type="button"
+          onClick={() => setPage('codex_team')}
+        >
+          Codex Team
+        </button>
+      </div>
+      {page === 'register' && error ? <div className="error-banner">{error}</div> : null}
 
+      {page === 'codex_team' ? <CodexTeamPage /> : (
       <main className="workbench-grid two-pane">
         <section className="panel form-panel">
           <div className="panel-title-row">
@@ -2164,8 +2184,9 @@ export default function App() {
           </div>
         </section>
       </main>
+      )}
 
-      {showSettings ? (
+      {page === 'register' && showSettings ? (
         <div className="modal-shell" onClick={() => setShowSettings(false)}>
           <div className="modal-card settings-modal" onClick={(e) => e.stopPropagation()}>
             <div className="panel-title-row settings-header">
@@ -2205,7 +2226,7 @@ export default function App() {
         </div>
       ) : null}
 
-      {deleteDialog ? (
+      {page === 'register' && deleteDialog ? (
         <div className="modal-shell" onClick={() => closeDeleteDialog()}>
           <div className="modal-card confirm-modal" onClick={(e) => e.stopPropagation()}>
             <div className="confirm-title">删除 {deleteDialog.items.length} 个账号？</div>
@@ -2221,7 +2242,7 @@ export default function App() {
         </div>
       ) : null}
 
-      {loading ? <div className="loading-overlay">加载中...</div> : null}
+      {page === 'register' && loading ? <div className="loading-overlay">加载中...</div> : null}
     </div>
   )
 }

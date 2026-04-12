@@ -1,0 +1,126 @@
+import sqlite3
+import sys
+import unittest
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, 'backend')
+
+from app.codex_team_manager import CodexTeamManager
+from app.db import DB_PATH, init_db, list_codex_team_web_sessions
+
+
+class _FakeMailProvider:
+    def create_email(self, config=None):
+        return {'email': 'child@example.com', 'account': {'email': 'child@example.com', 'password': 'mail-password'}}
+
+    def get_invitation_link(self, email=None, timeout=120, invite_sent_at=None, **kwargs):
+        return 'https://chatgpt.com/auth/login?inv_ws_name=TeamWorkspace&inv_email=child%40example.com&wId=parent-acct&accept_wId=parent-acct'
+
+
+class CodexTeamManagerTests(unittest.TestCase):
+    def setUp(self):
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            conn.execute('DELETE FROM codex_team_web_sessions')
+            conn.execute('DELETE FROM codex_team_job_events')
+            conn.execute('DELETE FROM codex_team_jobs')
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _make_job(self):
+        manager = CodexTeamManager()
+        manager.create_job(
+            {'parent_credentials': {'email': 'parent@example.com'}, 'child_count': 1, 'concurrency': 1, 'executor_type': 'protocol'},
+            merged_config={'use_proxy': False},
+            start_immediately=False,
+        )
+        job_id = next(iter(manager._jobs.keys()))
+        return manager, job_id, manager._jobs[job_id]
+
+    def test_process_account_success_persists_session_and_updates_snapshot(self):
+        manager, job_id, job = self._make_job()
+
+        with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            client = client_cls.return_value
+            client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
+            client.accept_invite = Mock(return_value={'success': True, 'error': ''})
+            engine = engine_cls.return_value
+            engine.run.return_value = Mock(
+                success=True,
+                email='child@example.com',
+                password='mail-pass',
+                account_id='acct-1',
+                workspace_id='org-1',
+                access_token='child-at',
+                refresh_token='child-rt',
+                id_token='child-id',
+                session_token='child-st',
+                error_message='',
+                metadata={'plan_type': 'team', 'account_role': 'standard-user'},
+            )
+            manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
+
+        engine_cls.assert_called_once()
+        snapshot = manager.get_job_snapshot(job_id)
+        sessions = list_codex_team_web_sessions(job_id=job_id)
+        self.assertEqual('done', snapshot['status'])
+        self.assertEqual(1, snapshot['success'])
+        self.assertEqual(1, len(sessions))
+        self.assertEqual('org-1', sessions[0]['selected_workspace_id'])
+        self.assertEqual('child-at', sessions[0]['access_token'])
+
+    def test_process_account_failure_without_team_workspace_marks_failed(self):
+        manager, job_id, job = self._make_job()
+
+        with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            client = client_cls.return_value
+            client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
+            engine = engine_cls.return_value
+            engine.run.return_value = Mock(
+                success=False,
+                email='child@example.com',
+                password='mail-pass',
+                account_id='',
+                workspace_id='',
+                access_token='',
+                refresh_token='',
+                id_token='',
+                session_token='',
+                error_message='没有可用的 team workspace',
+                metadata={},
+            )
+            manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
+
+        snapshot = manager.get_job_snapshot(job_id)
+        sessions = list_codex_team_web_sessions(job_id=job_id)
+        self.assertEqual('done', snapshot['status'])
+        self.assertEqual(0, snapshot['success'])
+        self.assertEqual(1, snapshot['failed'])
+        self.assertIn('team workspace', sessions[0]['error'])
+
+    def test_process_account_invite_failure_marks_failed_without_login(self):
+        manager, job_id, job = self._make_job()
+
+        with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            client = client_cls.return_value
+            client.send_invite = Mock(return_value={'success': False, 'invite_id': '', 'error': 'invite denied'})
+            manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
+
+        snapshot = manager.get_job_snapshot(job_id)
+        sessions = list_codex_team_web_sessions(job_id=job_id)
+        self.assertEqual(0, snapshot['success'])
+        self.assertEqual(1, snapshot['failed'])
+        self.assertIn('invite denied', sessions[0]['error'])
+        engine_cls.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

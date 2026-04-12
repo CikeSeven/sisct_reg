@@ -26,4 +26,5 @@ DEFAULT_CONFIG = {
     "smstome_sync_max_pages_per_country": 5,
     "chatgpt_register_otp_wait_seconds": 600,
     "chatgpt_register_otp_resend_wait_seconds": 300,
+    "chatgpt_invite_link_wait_seconds": 300,
 }

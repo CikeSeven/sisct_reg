@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import requests
 
 from core.proxy_utils import build_requests_proxy_config, tracked_request
+from platforms.chatgpt.invite_link import extract_invite_urls, resolve_invite_link
 
 from .db import (
     get_luckmail_token_account_by_email,
@@ -103,6 +104,9 @@ class ProviderBase:
         if len(text) <= 80:
             return text or "(无主题)"
         return f"{text[:77]}..."
+
+    def get_invitation_link(self, email=None, timeout: int = 120, invite_sent_at=None, **kwargs):
+        raise TimeoutError(f"{self.__class__.__name__} 不支持获取邀请链接")
 
 
 class TempMailLolProvider(ProviderBase):
@@ -1088,6 +1092,36 @@ class OutlookLocalProvider(ProviderBase):
                 body_chunks.append(str(payload))
         return self._decode_raw_content((subject + " " + " ".join(body_chunks)).strip())
 
+    def _extract_message_raw_text(self, message) -> str:
+        subject = self._decode_header_value(message.get("Subject", ""))
+        body_chunks: list[str] = []
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_maintype() == "multipart":
+                    continue
+                if part.get_content_type() not in {"text/plain", "text/html"}:
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    body_chunks.append(payload.decode(charset, errors="ignore"))
+                except Exception:
+                    body_chunks.append(payload.decode("utf-8", errors="ignore"))
+        else:
+            payload = message.get_payload(decode=True)
+            if payload is None:
+                payload = message.get_payload()
+            if isinstance(payload, bytes):
+                try:
+                    body_chunks.append(payload.decode("utf-8", errors="ignore"))
+                except Exception:
+                    body_chunks.append(payload.decode("latin1", errors="ignore"))
+            elif payload:
+                body_chunks.append(str(payload))
+        return f"{subject}\n" + "\n".join(body_chunks)
+
     def _select_mailbox(self, conn: imaplib.IMAP4_SSL, mailbox: str) -> bool:
         try:
             status, _ = conn.select(mailbox, readonly=True)
@@ -1189,6 +1223,13 @@ class OutlookLocalProvider(ProviderBase):
         body_text = str(body_info.get("content") or "")
         preview = str(item.get("bodyPreview") or "")
         return self._decode_raw_content(f"{subject} {preview} {body_text}".strip())
+
+    def _extract_graph_message_raw_text(self, item: dict) -> str:
+        subject = str(item.get("subject") or "")
+        body_info = item.get("body") or {}
+        body_text = str(body_info.get("content") or "")
+        preview = str(item.get("bodyPreview") or "")
+        return f"{subject}\n{preview}\n{body_text}"
 
     def _scan_graph_for_code(self, *, otp_sent_at=None, exclude_codes: set[str], limit: int = 20) -> str:
         messages = self._fetch_graph_messages(otp_sent_at=otp_sent_at, limit=limit)
@@ -1330,6 +1371,81 @@ class OutlookLocalProvider(ProviderBase):
                         conn.logout()
                 except Exception:
                     pass
+
+    def _scan_graph_for_invitation_link(self, *, invite_sent_at=None, limit: int = 20) -> str:
+        messages = self._fetch_graph_messages(otp_sent_at=invite_sent_at, limit=limit)
+        messages.sort(key=lambda item: self._parse_graph_timestamp(str(item.get("receivedDateTime") or "")) or 0, reverse=True)
+        for item in messages:
+            subject = str(item.get("subject") or "")
+            raw_text = self._extract_graph_message_raw_text(item)
+            urls = extract_invite_urls(raw_text)
+            if not urls:
+                continue
+            for url in urls:
+                try:
+                    session = requests.Session()
+                    session.proxies = self.proxies
+                    resolved = resolve_invite_link(url, session=session, timeout=20)
+                except Exception:
+                    resolved = url
+                lowered = str(resolved or "").lower()
+                if "chatgpt.com/auth/login" in lowered and ("accept_wid=" in lowered or "inv_ws_name=" in lowered):
+                    self._log(f"[OutlookLocal] 命中邀请链接: provider=graph_api subject={self._subject_preview(subject)} url={resolved[:200]}")
+                    self._lock_provider("graph_api", strict=True)
+                    return resolved
+        return ""
+
+    def _scan_imap_for_invitation_link(self, provider_name: str, *, invite_sent_at=None) -> str:
+        conn = None
+        try:
+            conn = self._open_imap(provider_name)
+            for mailbox in self._mailboxes:
+                if not self._select_mailbox(conn, mailbox):
+                    continue
+                status, data = conn.uid("search", None, "ALL")
+                if status != "OK":
+                    continue
+                ids = data[0].split() if data and data[0] else []
+                if len(ids) > 50:
+                    ids = ids[-50:]
+                for uid in reversed(ids):
+                    status, msg_data = conn.uid("fetch", uid, "(RFC822)")
+                    if status != "OK":
+                        continue
+                    raw = None
+                    for item in msg_data or []:
+                        if isinstance(item, tuple) and item[1]:
+                            raw = item[1]
+                            break
+                    if not raw:
+                        continue
+                    msg = message_from_bytes(raw, policy=email_default_policy)
+                    subject = self._decode_header_value(msg.get("Subject", ""))
+                    if not self._is_recent_message(msg, invite_sent_at):
+                        continue
+                    raw_text = self._extract_message_raw_text(msg)
+                    urls = extract_invite_urls(raw_text)
+                    if not urls:
+                        continue
+                    for url in urls:
+                        try:
+                            session = requests.Session()
+                            session.proxies = self.proxies
+                            resolved = resolve_invite_link(url, session=session, timeout=20)
+                        except Exception:
+                            resolved = url
+                        lowered = str(resolved or "").lower()
+                        if "chatgpt.com/auth/login" in lowered and ("accept_wid=" in lowered or "inv_ws_name=" in lowered):
+                            self._log(f"[OutlookLocal] 命中邀请链接: provider={provider_name} mailbox={mailbox} subject={self._subject_preview(subject)} url={resolved[:200]}")
+                            self._lock_provider(provider_name, strict=True)
+                            return resolved
+            return ""
+        finally:
+            try:
+                if conn:
+                    conn.logout()
+            except Exception:
+                pass
         return seen
 
     def _log_recent_code_snapshot(
@@ -1464,6 +1580,34 @@ class OutlookLocalProvider(ProviderBase):
 
         self._log_recent_code_snapshot(exclude_codes=exclude_codes, otp_sent_at=otp_sent_at)
         raise TimeoutError(f"Outlook 本地邮箱等待验证码超时 ({timeout}s)")
+
+    def get_invitation_link(self, email=None, timeout: int = 180, invite_sent_at=None, **kwargs):
+        if not self._account:
+            raise RuntimeError("本地微软邮箱尚未创建")
+
+        interrupt_check = kwargs.get("interrupt_check")
+        deadline = time.monotonic() + max(int(timeout or 0), 1)
+        provider_order = self._read_provider_order()
+        fixed_preferred_provider = str(self._preferred_provider or "").strip()
+
+        while time.monotonic() < deadline:
+            self._interrupt(interrupt_check)
+            current_order = (fixed_preferred_provider,) if fixed_preferred_provider else provider_order
+            for provider_name in current_order:
+                self._interrupt(interrupt_check)
+                try:
+                    if provider_name == "graph_api":
+                        invite_link = self._scan_graph_for_invitation_link(invite_sent_at=invite_sent_at)
+                    else:
+                        invite_link = self._scan_imap_for_invitation_link(provider_name, invite_sent_at=invite_sent_at)
+                    if invite_link:
+                        return invite_link
+                except Exception as exc:
+                    self._log(f"[OutlookLocal] 扫描邀请链接失败: provider={provider_name} error={exc}")
+                    continue
+            self._sleep_interruptibly(1, interrupt_check)
+
+        raise TimeoutError(f"Outlook 本地邮箱等待邀请链接超时 ({timeout}s)")
 
 
 def build_mail_provider(
