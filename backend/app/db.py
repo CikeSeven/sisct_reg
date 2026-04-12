@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -151,6 +152,77 @@ def init_db() -> None:
                 updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_proxy_pool_enabled_id ON proxy_pool(enabled, id);
+
+            CREATE TABLE IF NOT EXISTS codex_team_jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                total INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                progress TEXT NOT NULL DEFAULT '0/0',
+                request_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS codex_team_job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                level TEXT NOT NULL DEFAULT 'info',
+                account_email TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES codex_team_jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_team_job_events_job_id_id
+                ON codex_team_job_events(job_id, id);
+
+            CREATE TABLE IF NOT EXISTS codex_team_web_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                email TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                selected_workspace_id TEXT NOT NULL DEFAULT '',
+                selected_workspace_kind TEXT NOT NULL DEFAULT '',
+                account_id TEXT NOT NULL DEFAULT '',
+                next_auth_session_token TEXT NOT NULL DEFAULT '',
+                access_token TEXT NOT NULL DEFAULT '',
+                refresh_token TEXT NOT NULL DEFAULT '',
+                id_token TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                info_json TEXT NOT NULL DEFAULT '{}',
+                cookie_jar_json TEXT NOT NULL DEFAULT '[]',
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES codex_team_jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_team_web_sessions_job_id_id
+                ON codex_team_web_sessions(job_id, id);
+
+            CREATE TABLE IF NOT EXISTS codex_team_parent_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL DEFAULT '',
+                access_token TEXT NOT NULL DEFAULT '',
+                session_token TEXT NOT NULL DEFAULT '',
+                client_id TEXT NOT NULL DEFAULT '',
+                refresh_token TEXT NOT NULL DEFAULT '',
+                team_account_id TEXT NOT NULL DEFAULT '',
+                team_name TEXT NOT NULL DEFAULT '',
+                child_member_count INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_sync_at REAL,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_used REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_team_parent_accounts_enabled_id
+                ON codex_team_parent_accounts(enabled, id);
             """
         )
 
@@ -160,6 +232,22 @@ def init_db() -> None:
 
         if not _has_column("task_events", "attempt_index"):
             conn.execute("ALTER TABLE task_events ADD COLUMN attempt_index INTEGER")
+        for column, ddl in (
+            ("access_token", "ALTER TABLE codex_team_web_sessions ADD COLUMN access_token TEXT NOT NULL DEFAULT ''"),
+            ("refresh_token", "ALTER TABLE codex_team_web_sessions ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''"),
+            ("id_token", "ALTER TABLE codex_team_web_sessions ADD COLUMN id_token TEXT NOT NULL DEFAULT ''"),
+            ("user_id", "ALTER TABLE codex_team_web_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"),
+            ("display_name", "ALTER TABLE codex_team_web_sessions ADD COLUMN display_name TEXT NOT NULL DEFAULT ''"),
+            ("info_json", "ALTER TABLE codex_team_web_sessions ADD COLUMN info_json TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            if not _has_column("codex_team_web_sessions", column):
+                conn.execute(ddl)
+        for column, ddl in (
+            ("access_token", "ALTER TABLE codex_team_parent_accounts ADD COLUMN access_token TEXT NOT NULL DEFAULT ''"),
+            ("session_token", "ALTER TABLE codex_team_parent_accounts ADD COLUMN session_token TEXT NOT NULL DEFAULT ''"),
+        ):
+            if not _has_column("codex_team_parent_accounts", column):
+                conn.execute(ddl)
 
 
 def _proxy_row_to_item(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -245,6 +333,421 @@ def parse_config_row_values(values: dict[str, str]) -> dict[str, Any]:
         except Exception:
             parsed[key] = text
     return parsed
+
+
+def create_codex_team_job(job_id: str, *, request_payload: dict[str, Any]) -> None:
+    now = time.time()
+    with connection(write=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO codex_team_jobs(id, status, total, success, failed, progress, request_json, error, created_at, updated_at)
+            VALUES(?, 'pending', 0, 0, 0, '0/0', ?, '', ?, ?)
+            """,
+            (str(job_id), json.dumps(request_payload or {}, ensure_ascii=False), now, now),
+        )
+
+
+def update_codex_team_job(job_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    updates = dict(fields)
+    updates["updated_at"] = time.time()
+    columns = ", ".join(f"{key} = ?" for key in updates)
+    values: list[Any] = []
+    for key, value in updates.items():
+        if key == "request_json" and not isinstance(value, str):
+            values.append(json.dumps(value or {}, ensure_ascii=False))
+        else:
+            values.append(value)
+    values.append(str(job_id))
+    with connection(write=True) as conn:
+        conn.execute(f"UPDATE codex_team_jobs SET {columns} WHERE id = ?", values)
+
+
+def get_codex_team_job(job_id: str) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM codex_team_jobs WHERE id = ?", (str(job_id),)).fetchone()
+    data = row_to_dict(row)
+    if not data:
+        return None
+    try:
+        data["request_json"] = json.loads(str(data.get("request_json") or "{}"))
+    except Exception:
+        data["request_json"] = {}
+    return data
+
+
+def append_codex_team_job_event(
+    job_id: str,
+    message: str,
+    *,
+    level: str = "info",
+    account_email: str = "",
+) -> int:
+    now = time.time()
+    with connection(write=True) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS seq FROM codex_team_job_events WHERE job_id = ?",
+            (str(job_id),),
+        ).fetchone()
+        seq = int((row_to_dict(row) or {}).get("seq") or 0) + 1
+        cur = conn.execute(
+            """
+            INSERT INTO codex_team_job_events(job_id, seq, level, account_email, message, created_at)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (str(job_id), seq, str(level or "info"), str(account_email or ""), str(message or ""), now),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_codex_team_job_events(job_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM codex_team_job_events
+            WHERE job_id = ? AND seq > ?
+            ORDER BY seq ASC
+            LIMIT ?
+            """,
+            (str(job_id), int(after_seq or 0), int(limit or 200)),
+        ).fetchall()
+    return [row_to_dict(row) or {} for row in rows]
+
+
+def insert_codex_team_web_session(
+    *,
+    job_id: str,
+    email: str,
+    status: str,
+    selected_workspace_id: str,
+    selected_workspace_kind: str,
+    account_id: str,
+    next_auth_session_token: str,
+    access_token: str = "",
+    refresh_token: str = "",
+    id_token: str = "",
+    user_id: str = "",
+    display_name: str = "",
+    info: dict[str, Any] | None = None,
+    cookie_jar: list[dict[str, Any]] | None = None,
+    error: str = "",
+) -> int:
+    now = time.time()
+    with connection(write=True) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO codex_team_web_sessions(
+                job_id, email, status, selected_workspace_id, selected_workspace_kind,
+                account_id, next_auth_session_token, access_token, refresh_token, id_token,
+                user_id, display_name, info_json, cookie_jar_json, error, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(job_id),
+                str(email or ""),
+                str(status or ""),
+                str(selected_workspace_id or ""),
+                str(selected_workspace_kind or ""),
+                str(account_id or ""),
+                str(next_auth_session_token or ""),
+                str(access_token or ""),
+                str(refresh_token or ""),
+                str(id_token or ""),
+                str(user_id or ""),
+                str(display_name or ""),
+                json.dumps(info or {}, ensure_ascii=False),
+                json.dumps(cookie_jar or [], ensure_ascii=False),
+                str(error or ""),
+                now,
+                now,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_codex_team_web_sessions(*, job_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    query = "SELECT * FROM codex_team_web_sessions"
+    if str(job_id or "").strip():
+        query += " WHERE job_id = ?"
+        params.append(str(job_id))
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit or 100))
+
+    with connection() as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        data = row_to_dict(row) or {}
+        try:
+            data["cookie_jar"] = json.loads(str(data.get("cookie_jar_json") or "[]"))
+        except Exception:
+            data["cookie_jar"] = []
+        try:
+            data["info"] = json.loads(str(data.get("info_json") or "{}"))
+        except Exception:
+            data["info"] = {}
+        items.append(data)
+    return items
+
+
+def get_codex_team_parent_pool_summary(*, limit: int = 100) -> dict[str, Any]:
+    with connection() as conn:
+        summary_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
+                SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END) AS disabled,
+                SUM(CASE WHEN client_id != '' AND refresh_token != '' THEN 1 ELSE 0 END) AS with_oauth
+            FROM codex_team_parent_accounts
+            """
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM codex_team_parent_accounts
+            ORDER BY enabled DESC, id ASC
+            LIMIT ?
+            """,
+            (int(limit or 100),),
+        ).fetchall()
+    summary = row_to_dict(summary_row) or {}
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        data = row_to_dict(row) or {}
+        items.append(
+            {
+                "id": int(data.get("id") or 0),
+                "email": str(data.get("email") or ""),
+                "password": str(data.get("password") or ""),
+                "access_token": str(data.get("access_token") or ""),
+                "session_token": str(data.get("session_token") or ""),
+                "client_id": str(data.get("client_id") or ""),
+                "refresh_token": str(data.get("refresh_token") or ""),
+                "team_account_id": str(data.get("team_account_id") or ""),
+                "team_name": str(data.get("team_name") or ""),
+                "child_member_count": int(data.get("child_member_count") or 0),
+                "enabled": bool(data.get("enabled")),
+                "has_oauth": bool(data.get("client_id") and data.get("refresh_token")),
+                "has_access_token": bool(data.get("access_token")),
+                "has_session_token": bool(data.get("session_token")),
+                "last_sync_at": float(data.get("last_sync_at") or 0),
+                "last_error": str(data.get("last_error") or ""),
+                "created_at": float(data.get("created_at") or 0),
+                "updated_at": float(data.get("updated_at") or 0),
+                "last_used": float(data.get("last_used") or 0),
+            }
+        )
+    return {
+        "total": int(summary.get("total") or 0),
+        "enabled": int(summary.get("enabled") or 0),
+        "disabled": int(summary.get("disabled") or 0),
+        "with_oauth": int(summary.get("with_oauth") or 0),
+        "items": items,
+    }
+
+
+def batch_import_codex_team_parent_accounts(data: str, *, enabled: bool = True) -> dict[str, Any]:
+    parsed_total = 0
+    success = 0
+    updated = 0
+    failed = 0
+    errors: list[str] = []
+    accounts: list[dict[str, Any]] = []
+    now = time.time()
+
+    with connection(write=True) as conn:
+        raw_text = str(data or "").strip()
+        jwt_pattern = r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        account_id_pattern = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+        refresh_token_pattern = r'rt[_-][A-Za-z0-9._-]+'
+        client_id_pattern = r'app_[A-Za-z0-9]+'
+        records: list[str] = []
+        try:
+            parsed_json = json.loads(raw_text) if raw_text else None
+        except Exception:
+            parsed_json = None
+
+        if isinstance(parsed_json, dict) and (
+            isinstance(parsed_json.get("user"), dict)
+            or isinstance(parsed_json.get("account"), dict)
+            or parsed_json.get("accessToken")
+            or parsed_json.get("sessionToken")
+        ):
+            normalized = "----".join(
+                [
+                    str(((parsed_json.get("user") or {}).get("email") or "")).strip(),
+                    str(parsed_json.get("accessToken") or "").strip(),
+                    str(((parsed_json.get("account") or {}).get("id") or "")).strip(),
+                    str(parsed_json.get("sessionToken") or "").strip(),
+                    str(parsed_json.get("refreshToken") or "").strip(),
+                    str(parsed_json.get("clientId") or "").strip(),
+                ]
+            ).strip("-")
+            records = [normalized]
+        else:
+            records = raw_text.splitlines()
+
+        for index, raw_line in enumerate(records, start=1):
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            parsed_total += 1
+            parts = [part.strip() for part in re.split(r'----|\||\t|\s{2,}', line) if part.strip()]
+
+            email = ""
+            password = ""
+            access_token = ""
+            session_token = ""
+            client_id = ""
+            refresh_token = ""
+            team_account_id = ""
+
+            if len(parts) == 4 and '@' in parts[0] and parts[1] and not re.fullmatch(jwt_pattern, parts[1]):
+                email, password, client_id, refresh_token = parts
+            else:
+                for part in parts:
+                    if not email and re.fullmatch(email_pattern, part):
+                        email = part
+                    elif not access_token and re.fullmatch(jwt_pattern, part):
+                        access_token = part
+                    elif not session_token and re.match(jwt_pattern, part):
+                        if access_token:
+                            session_token = part
+                        else:
+                            access_token = part
+                    elif not team_account_id and re.fullmatch(account_id_pattern, part, re.IGNORECASE):
+                        team_account_id = part
+                    elif not refresh_token and re.match(refresh_token_pattern, part):
+                        refresh_token = part
+                    elif not client_id and re.match(client_id_pattern, part):
+                        client_id = part
+
+                if not email:
+                    emails = re.findall(email_pattern, line)
+                    email = emails[0] if emails else ""
+                if not access_token:
+                    tokens = re.findall(jwt_pattern, line)
+                    if tokens:
+                        access_token = tokens[0]
+                        if len(tokens) > 1:
+                            session_token = tokens[1]
+                if not team_account_id:
+                    account_ids = re.findall(account_id_pattern, line, re.IGNORECASE)
+                    team_account_id = account_ids[0] if account_ids else ""
+                if not refresh_token:
+                    rts = re.findall(refresh_token_pattern, line)
+                    refresh_token = rts[0] if rts else ""
+                if not client_id:
+                    cids = re.findall(client_id_pattern, line)
+                    client_id = cids[0] if cids else ""
+
+            if not email:
+                failed += 1
+                errors.append(f"行 {index}: 邮箱为空")
+                continue
+            if not access_token and not session_token and not (client_id and refresh_token):
+                failed += 1
+                errors.append(f"行 {index}: 至少提供 access_token、session_token，或 client_id+refresh_token")
+                continue
+
+            existing = conn.execute(
+                "SELECT id FROM codex_team_parent_accounts WHERE lower(email) = lower(?) LIMIT 1",
+                (email,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE codex_team_parent_accounts
+                    SET password = ?, access_token = ?, session_token = ?, client_id = ?, refresh_token = ?, team_account_id = ?, enabled = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (password, access_token, session_token, client_id, refresh_token, team_account_id, 1 if enabled else 0, now, existing["id"]),
+                )
+                row_id = int(existing["id"] or 0)
+                updated += 1
+                status = "updated"
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO codex_team_parent_accounts(
+                        email, password, access_token, session_token, client_id, refresh_token, team_account_id, enabled, created_at, updated_at, last_used
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (email, password, access_token, session_token, client_id, refresh_token, team_account_id, 1 if enabled else 0, now, now),
+                )
+                row_id = int(cur.lastrowid or 0)
+                success += 1
+                status = "imported"
+
+            accounts.append(
+                {
+                    "id": row_id,
+                    "email": email,
+                    "enabled": bool(enabled),
+                    "has_oauth": bool(client_id and refresh_token),
+                    "has_access_token": bool(access_token),
+                    "has_session_token": bool(session_token),
+                    "team_account_id": team_account_id,
+                    "status": status,
+                }
+            )
+
+    return {
+        "total": parsed_total,
+        "success": success,
+        "updated": updated,
+        "failed": failed,
+        "accounts": accounts,
+        "errors": errors,
+        "summary": get_codex_team_parent_pool_summary(),
+    }
+
+
+def list_enabled_codex_team_parent_accounts() -> list[dict[str, Any]]:
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM codex_team_parent_accounts
+            WHERE enabled = 1
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    return [row_to_dict(row) or {} for row in rows]
+
+
+def update_codex_team_parent_account(parent_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    updates = dict(fields)
+    updates["updated_at"] = time.time()
+    columns = ", ".join(f"{key} = ?" for key in updates)
+    values = list(updates.values())
+    values.append(int(parent_id))
+    with connection(write=True) as conn:
+        conn.execute(
+            f"UPDATE codex_team_parent_accounts SET {columns} WHERE id = ?",
+            values,
+        )
+
+
+def delete_codex_team_parent_account(parent_id: int) -> bool:
+    with connection(write=True) as conn:
+        row = conn.execute(
+            "SELECT id FROM codex_team_parent_accounts WHERE id = ? LIMIT 1",
+            (int(parent_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        conn.execute("DELETE FROM codex_team_parent_accounts WHERE id = ?", (int(parent_id),))
+        return True
 
 
 def create_task_run(task_id: str, *, total: int, request_payload: dict[str, Any]) -> None:

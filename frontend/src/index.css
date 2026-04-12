@@ -1023,8 +1023,100 @@ button:disabled {
   gap: 14px;
 }
 
+.page-switch-bar {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.page-switch-btn {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: #eef2ff;
+  border-radius: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.page-switch-btn.active {
+  background: rgba(125, 92, 255, 0.18);
+  border-color: rgba(125, 92, 255, 0.5);
+}
+
+.codex-team-layout {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  gap: 18px;
+}
+
+.codex-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.codex-stat {
+  border-radius: 14px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  display: grid;
+  gap: 6px;
+}
+
+.codex-stat span {
+  color: rgba(238, 242, 255, 0.7);
+  font-size: 12px;
+}
+
+.codex-stat strong {
+  font-size: 20px;
+}
+
+.codex-team-sections {
+  display: grid;
+  gap: 14px;
+}
+
+.codex-log-list {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.codex-log-line {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 13px;
+}
+
+.codex-log-line.tone-danger {
+  border-color: rgba(255, 104, 104, 0.28);
+  background: rgba(255, 104, 104, 0.08);
+}
+
+.codex-session-meta {
+  align-items: flex-end;
+}
+
 @media (max-width: 1480px) {
   .workbench-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .codex-team-layout,
+  .codex-stats-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1051,6 +1143,11 @@ button:disabled {
   .confirm-actions {
     grid-template-columns: 1fr;
     display: grid;
+  }
+
+  .page-switch-bar {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
   }
 
   .hero-bar {
