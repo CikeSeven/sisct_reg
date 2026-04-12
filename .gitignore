@@ -10,3 +10,7 @@ backend/data/
 *.log
 *.local
 *.tsbuildinfo
+
+.worktrees/
+
+.worktrees/
