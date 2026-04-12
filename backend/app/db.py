@@ -447,17 +447,37 @@ def append_codex_team_job_event(
         return int(cur.lastrowid or 0)
 
 
-def list_codex_team_job_events(job_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+def list_codex_team_job_events(
+    job_id: str,
+    *,
+    after_seq: int = 0,
+    limit: int = 200,
+    newest_first_window: bool = False,
+) -> list[dict[str, Any]]:
     with connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM codex_team_job_events
-            WHERE job_id = ? AND seq > ?
-            ORDER BY seq ASC
-            LIMIT ?
-            """,
-            (str(job_id), int(after_seq or 0), int(limit or 200)),
-        ).fetchall()
+        if newest_first_window and int(after_seq or 0) <= 0:
+            rows = conn.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM codex_team_job_events
+                    WHERE job_id = ?
+                    ORDER BY seq DESC
+                    LIMIT ?
+                )
+                ORDER BY seq ASC
+                """,
+                (str(job_id), int(limit or 200)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM codex_team_job_events
+                WHERE job_id = ? AND seq > ?
+                ORDER BY seq ASC
+                LIMIT ?
+                """,
+                (str(job_id), int(after_seq or 0), int(limit or 200)),
+            ).fetchall()
     return [row_to_dict(row) or {} for row in rows]
 
 

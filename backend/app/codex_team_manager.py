@@ -817,7 +817,7 @@ class CodexTeamManager:
         snapshot = get_codex_team_job(str(job_id))
         if not snapshot:
             return None
-        snapshot["events"] = list_codex_team_job_events(str(job_id))
+        snapshot["events"] = list_codex_team_job_events(str(job_id), limit=500, newest_first_window=True)
         snapshot["sessions"] = list_codex_team_web_sessions(job_id=str(job_id))
         return snapshot
 

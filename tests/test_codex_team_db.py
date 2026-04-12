@@ -43,6 +43,15 @@ class CodexTeamDbTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertEqual([1, 2], [item['seq'] for item in events])
         self.assertEqual('a@example.com', events[1]['account_email'])
 
+    def test_list_events_newest_window_returns_latest_chunk_in_order(self):
+        create_codex_team_job('job-2', request_payload={})
+        for index in range(1, 206):
+            append_codex_team_job_event('job-2', f'event-{index}')
+
+        events = list_codex_team_job_events('job-2', limit=5, newest_first_window=True)
+
+        self.assertEqual([201, 202, 203, 204, 205], [item['seq'] for item in events])
+
     def test_insert_and_list_web_sessions(self):
         create_codex_team_job('job-3', request_payload={})
         insert_codex_team_web_session(
