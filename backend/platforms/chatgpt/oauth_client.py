@@ -146,17 +146,26 @@ class OAuthClient:
             random_delay(low, high)
 
     def _otp_suspend_settings(self, prefix: str) -> tuple[int, int, int]:
-        suspend_after = max(
-            90,
-            int(self.config.get(f"{prefix}_otp_suspend_after_seconds", 180) or 180),
+        if prefix == "chatgpt_oauth":
+            fallback_total_timeout = self.config.get(
+                "chatgpt_oauth_otp_wait_seconds",
+                self.config.get("chatgpt_otp_wait_seconds", 60),
+            )
+        else:
+            fallback_total_timeout = 1800
+        total_timeout = max(
+            30,
+            int(self.config.get(f"{prefix}_otp_total_timeout_seconds", fallback_total_timeout) or fallback_total_timeout),
         )
+        configured_suspend_after = int(
+            self.config.get(f"{prefix}_otp_suspend_after_seconds", 180) or 180
+        )
+        suspend_after = max(30, configured_suspend_after)
+        if total_timeout <= suspend_after:
+            suspend_after = total_timeout + 1
         suspend_poll = max(
             30,
             int(self.config.get(f"{prefix}_otp_suspend_poll_seconds", 120) or 120),
-        )
-        total_timeout = max(
-            suspend_after,
-            int(self.config.get(f"{prefix}_otp_total_timeout_seconds", 1800) or 1800),
         )
         return suspend_after, suspend_poll, total_timeout
 
@@ -3481,12 +3490,12 @@ class OAuthClient:
             otp_wait_seconds = int(
                 self.config.get(
                     "chatgpt_oauth_otp_wait_seconds",
-                    self.config.get("chatgpt_otp_wait_seconds", 600),
+                    self.config.get("chatgpt_otp_wait_seconds", 60),
                 )
-                or 600
+                or 60
             )
         except Exception:
-            otp_wait_seconds = 600
+            otp_wait_seconds = 60
         otp_wait_seconds = max(30, min(otp_wait_seconds, 3600))
         otp_poll_window = min(30, max(10, otp_wait_seconds))
         try:
@@ -3513,7 +3522,7 @@ class OAuthClient:
         )
         if otp_deadline <= now:
             self._clear_otp_suspend_state("chatgpt_oauth")
-            self._set_error("等待邮箱验证码超时 (30分钟)")
+            self._set_error(f"等待邮箱验证码超时 ({int(total_timeout)}秒)")
             return None
         self.config["chatgpt_oauth_otp_started_at"] = float(otp_started_at)
         self.config["chatgpt_oauth_otp_total_deadline_at"] = float(otp_deadline)

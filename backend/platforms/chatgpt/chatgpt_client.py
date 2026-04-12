@@ -138,17 +138,26 @@ class ChatGPTClient:
         self.last_stage = ""
 
     def _otp_suspend_settings(self, prefix: str) -> tuple[int, int, int]:
-        suspend_after = max(
-            90,
-            int(self.config.get(f"{prefix}_otp_suspend_after_seconds", 180) or 180),
+        if prefix == "chatgpt_register":
+            fallback_total_timeout = self.config.get(
+                "chatgpt_register_otp_wait_seconds",
+                self.config.get("chatgpt_otp_wait_seconds", 60),
+            )
+        else:
+            fallback_total_timeout = 1800
+        total_timeout = max(
+            30,
+            int(self.config.get(f"{prefix}_otp_total_timeout_seconds", fallback_total_timeout) or fallback_total_timeout),
         )
+        configured_suspend_after = int(
+            self.config.get(f"{prefix}_otp_suspend_after_seconds", 180) or 180
+        )
+        suspend_after = max(30, configured_suspend_after)
+        if total_timeout <= suspend_after:
+            suspend_after = total_timeout + 1
         suspend_poll = max(
             30,
             int(self.config.get(f"{prefix}_otp_suspend_poll_seconds", 120) or 120),
-        )
-        total_timeout = max(
-            suspend_after,
-            int(self.config.get(f"{prefix}_otp_total_timeout_seconds", 1800) or 1800),
         )
         return suspend_after, suspend_poll, total_timeout
 
@@ -1119,7 +1128,7 @@ class ChatGPTClient:
         birthdate,
         skymail_client,
         stop_before_about_you_submission=False,
-        otp_wait_timeout=600,
+        otp_wait_timeout=60,
         otp_resend_wait_timeout=300,
     ):
         """
@@ -1145,9 +1154,9 @@ class ChatGPTClient:
         )
 
         try:
-            otp_wait_timeout = max(30, int(otp_wait_timeout or 600))
+            otp_wait_timeout = max(30, int(otp_wait_timeout or 60))
         except Exception:
-            otp_wait_timeout = 600
+            otp_wait_timeout = 60
         try:
             otp_resend_wait_timeout = max(30, int(otp_resend_wait_timeout or 300))
         except Exception:
@@ -1272,7 +1281,7 @@ class ChatGPTClient:
                 self.config["chatgpt_register_otp_total_deadline_at"] = float(otp_deadline)
                 if otp_deadline <= now:
                     self._clear_otp_suspend_state("chatgpt_register")
-                    return False, "等待邮箱验证码超时 (30分钟)"
+                    return False, f"等待邮箱验证码超时 ({int(total_timeout)}秒)"
                 otp_sent_at = float(self.config.get("chatgpt_register_otp_sent_at") or otp_sent_at or (now - 15))
                 next_resend_at = float(
                     self.config.get("chatgpt_register_otp_next_resend_at")
@@ -1369,7 +1378,7 @@ class ChatGPTClient:
 
                 if not otp_verified:
                     self._clear_otp_suspend_state("chatgpt_register")
-                    return False, "等待邮箱验证码超时 (30分钟)"
+                    return False, f"等待邮箱验证码超时 ({int(total_timeout)}秒)"
                 continue
 
             if (

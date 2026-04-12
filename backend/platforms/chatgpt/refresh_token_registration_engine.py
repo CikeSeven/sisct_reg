@@ -445,7 +445,7 @@ class RefreshTokenRegistrationEngine:
         register_otp_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_wait_seconds",
             fallback_keys=("chatgpt_otp_wait_seconds",),
-            default=600,
+            default=60,
             minimum=30,
             maximum=3600,
         )
@@ -510,7 +510,7 @@ class RefreshTokenRegistrationEngine:
                 "验证码等待策略: "
                 f"register_wait={register_otp_wait_seconds}s, "
                 f"register_resend_wait={register_otp_resend_wait_seconds}s, "
-                "oauth_wait=读取 OAuthClient 配置（默认600s）"
+                "oauth_wait=读取 OAuthClient 配置（默认60s）"
             )
 
             email_adapter = EmailServiceAdapter(

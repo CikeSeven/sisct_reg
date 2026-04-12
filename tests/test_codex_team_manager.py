@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, 'backend')
 
 from app.codex_team_manager import CodexTeamManager
+from app.defaults import DEFAULT_CONFIG
 from app.db import DB_PATH, init_db, list_codex_team_web_sessions
 
 
@@ -120,6 +121,45 @@ class CodexTeamManagerTests(unittest.TestCase):
         self.assertEqual(1, snapshot['failed'])
         self.assertIn('invite denied', sessions[0]['error'])
         engine_cls.assert_not_called()
+
+
+
+
+    def test_default_register_otp_wait_seconds_is_60(self):
+        self.assertEqual(60, int(DEFAULT_CONFIG['chatgpt_register_otp_wait_seconds']))
+
+    def test_parent_pool_job_stops_when_outlook_pool_is_empty(self):
+        manager = CodexTeamManager()
+        job_id = manager.create_job(
+            {
+                'parent_source': 'pool',
+                'target_children_per_parent': 5,
+                'max_parent_accounts': 1,
+                'executor_type': 'protocol',
+            },
+            merged_config={'use_proxy': False},
+            start_immediately=False,
+        )
+        job = manager._jobs[job_id]
+
+        class _EmptyMailProvider:
+            def create_email(self, config=None):
+                raise RuntimeError('本地微软邮箱池为空，请先导入 Outlook 账号')
+
+        with patch('app.codex_team_manager.list_enabled_codex_team_parent_accounts', return_value=[{'id': 1, 'email': 'parent@example.com'}]), \
+            patch('app.codex_team_manager.resolve_parent_invite_context', return_value={'success': True, 'access_token': 'at', 'account_id': 'acct', 'email': 'parent@example.com'}), \
+            patch('app.codex_team_manager.build_mail_provider', return_value=_EmptyMailProvider()), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls:
+            client = client_cls.return_value
+            client.get_members.return_value = {'success': True, 'members': []}
+            manager._run_parent_pool_job(job)
+
+        snapshot = manager.get_job_snapshot(job_id)
+        self.assertTrue(job.stop_requested)
+        self.assertEqual('failed', snapshot['status'])
+        self.assertEqual(1, snapshot['failed'])
+        self.assertEqual(1, len(snapshot['sessions']))
+        self.assertIn('邮箱池为空', snapshot['sessions'][0]['error'])
 
 
 if __name__ == '__main__':

@@ -92,7 +92,7 @@ class CodexTeamManager:
         self._set_job_state(job, status="running")
         if str(job.request_payload.get("parent_source") or "").strip().lower() == "pool":
             self._run_parent_pool_job(job)
-            final_status = "stopped" if job.stop_requested else "done"
+            final_status = "failed" if job.status == "failed" else ("stopped" if job.stop_requested else "done")
             self._set_job_state(job, status=final_status)
             return
         max_workers = max(1, int(job.request_payload.get("concurrency") or 1))
@@ -110,8 +110,34 @@ class CodexTeamManager:
                 except Exception as exc:
                     append_codex_team_job_event(job.id, f"任务 worker 异常: {str(exc or '')}", level="error")
 
-        final_status = "stopped" if job.stop_requested else "done"
+        final_status = "failed" if job.status == "failed" else ("stopped" if job.stop_requested else "done")
         self._set_job_state(job, status=final_status)
+
+    @staticmethod
+    def _is_fatal_child_failure_message(message: str) -> bool:
+        text = str(message or "").strip()
+        if not text:
+            return False
+        fatal_markers = (
+            "本地微软邮箱池为空",
+            "本地微软邮箱池中不存在账号",
+            "本地令牌池为空",
+            "令牌池为空",
+            "空邮箱",
+        )
+        return any(marker in text for marker in fatal_markers)
+
+    def _stop_job_on_fatal_child_failure(self, job: CodexTeamJob, reason: str, *, account_email: str = "") -> None:
+        if job.stop_requested and job.status == "failed":
+            return
+        job.stop_requested = True
+        append_codex_team_job_event(
+            job.id,
+            f"检测到致命错误，停止任务: {str(reason or '').strip()}",
+            level="error",
+            account_email=account_email,
+        )
+        self._set_job_state(job, status="failed")
 
     def _run_parent_pool_job(self, job: CodexTeamJob) -> None:
         proxy_url = str(job.merged_config.get("proxy") or "").strip() if job.merged_config.get("use_proxy") else ""
@@ -219,6 +245,8 @@ class CodexTeamManager:
             )
             mail_info = provider.create_email(job.merged_config)
             child_email = str(mail_info.get("email") or "").strip()
+            if not child_email:
+                raise RuntimeError("本地微软邮箱池返回空邮箱，停止任务")
             account = dict(mail_info.get("account") or {})
             child_password = str(account.get("password") or "").strip()
             append_codex_team_job_event(job.id, f"开始处理子号 #{attempt_index}", account_email=child_email)
@@ -307,6 +335,13 @@ class CodexTeamManager:
                     result["success"] = False
                     result["error"] = str(accept_result.get("error") or "接受邀请失败")
             success = bool(result.get("success"))
+            failure_info = dict(result.get("info") or {})
+            if (not success) and bool(failure_info.get("stop_task_on_failure")):
+                self._stop_job_on_fatal_child_failure(
+                    job,
+                    str(failure_info.get("stop_task_reason") or result.get("error") or "子号流程致命失败"),
+                    account_email=child_email,
+                )
             insert_codex_team_web_session(
                 job_id=job.id,
                 email=child_email or str(result.get("email") or ""),
@@ -342,6 +377,8 @@ class CodexTeamManager:
                 self._increment(job, failed=1)
                 return False
         except Exception as exc:
+            if self._is_fatal_child_failure_message(str(exc or "")):
+                self._stop_job_on_fatal_child_failure(job, str(exc or ""), account_email=child_email)
             insert_codex_team_web_session(
                 job_id=job.id,
                 email=child_email,
