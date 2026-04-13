@@ -6,7 +6,7 @@ from typing import Any
 
 from curl_cffi.requests import Session
 
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, instrument_session_proxy_requests
 
 
 class TeamManageStyleClient:
@@ -21,12 +21,14 @@ class TeamManageStyleClient:
     def _get_session(self, identifier: str) -> Session:
         key = str(identifier or "default")
         if key not in self._sessions:
-            self._sessions[key] = Session(
+            session = Session(
                 impersonate="chrome110",
                 proxies=build_requests_proxy_config(self.proxy_url),
                 timeout=30,
                 verify=False,
             )
+            instrument_session_proxy_requests(session, proxy_url=self.proxy_url)
+            self._sessions[key] = session
         return self._sessions[key]
 
     def _make_request(

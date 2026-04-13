@@ -107,7 +107,7 @@ class CodexTeamParentPoolTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
         counts = {'team-1': 3, 'team-2': 5}
 
-        def fake_parent_context(parent, *, proxy_url=None, merged_config=None, executor_type=None, force_refresh=False):
+        def fake_parent_context(parent, *, proxy_url=None, merged_config=None, executor_type=None, force_refresh=False, proxy_url_override=None):
             return {
                 'success': True,
                 'email': parent['email'],

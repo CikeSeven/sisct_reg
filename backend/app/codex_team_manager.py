@@ -53,6 +53,8 @@ class CodexTeamJob:
     created_at: float = field(default_factory=time.time)
     stop_requested: bool = False
     parent_invite_context: dict[str, Any] | None = None
+    proxy_url: str = ""
+    proxy_id: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -353,12 +355,30 @@ class CodexTeamManager:
         )
         self._set_job_state(job, status="failed")
 
+    def _resolve_job_proxy(self, job: CodexTeamJob) -> tuple[str | None, int | None]:
+        if not bool(job.merged_config.get("use_proxy")):
+            return None, None
+        with job.lock:
+            if str(job.proxy_url or "").strip():
+                return str(job.proxy_url or "").strip(), int(job.proxy_id or 0) or None
+
+        proxy_url = ""
+        proxy_id = 0
+        entry = acquire_proxy_pool_entry()
+        if entry and str(entry.get("proxy_url") or "").strip():
+            proxy_url = str(entry.get("proxy_url") or "").strip()
+            proxy_id = int(entry.get("id") or 0)
+        if not proxy_url:
+            proxy_url = str(job.merged_config.get("proxy") or "").strip()
+
+        with job.lock:
+            job.proxy_url = proxy_url
+            job.proxy_id = proxy_id
+        return proxy_url or None, proxy_id or None
+
     def _run_parent_pool_job(self, job: CodexTeamJob) -> None:
-        proxy_url = str(job.merged_config.get("proxy") or "").strip() if job.merged_config.get("use_proxy") else ""
-        if job.merged_config.get("use_proxy") and not proxy_url:
-            proxy_entry = acquire_proxy_pool_entry()
-            if proxy_entry and str(proxy_entry.get("proxy_url") or "").strip():
-                proxy_url = str(proxy_entry.get("proxy_url") or "").strip()
+        proxy_url, _proxy_id = self._resolve_job_proxy(job)
+        proxy_url = str(proxy_url or "").strip()
         if proxy_url:
             try:
                 proxy_ip, proxy_country = RegistrationManager._query_egress_info(proxy_url)
@@ -391,6 +411,7 @@ class CodexTeamManager:
                 parent,
                 merged_config=job.merged_config,
                 executor_type=str(job.request_payload.get("executor_type") or "protocol"),
+                proxy_url_override=proxy_url or None,
             )
             if not parent_context.get("success") and not (
                 str(parent_context.get("access_token") or "").strip()
@@ -457,11 +478,12 @@ class CodexTeamManager:
         try:
             setattr(job, "_last_account_halt_parent", True)
             self._check_job_stop(job)
-            proxy_url = str(job.merged_config.get("proxy") or "").strip() if job.merged_config.get("use_proxy") else ""
+            proxy_url, _proxy_id = self._resolve_job_proxy(job)
+            proxy_url = str(proxy_url or "").strip()
             provider = build_mail_provider(
                 "outlook_local",
                 config=job.merged_config,
-                proxy=(job.merged_config.get("proxy") if job.merged_config.get("use_proxy") else None),
+                proxy=proxy_url or None,
                 log_fn=lambda message: append_codex_team_job_event(job.id, str(message or ""), account_email=child_email),
             )
             self._check_job_stop(job)
@@ -569,7 +591,7 @@ class CodexTeamManager:
 
             engine = RefreshTokenRegistrationEngine(
                 email_service=provider,
-                proxy_url=(job.merged_config.get("proxy") if job.merged_config.get("use_proxy") else None) or None,
+                proxy_url=proxy_url or None,
                 callback_logger=lambda message: append_codex_team_job_event(job.id, str(message or ""), account_email=child_email),
                 task_uuid=f"{job.id}:{attempt_index}",
                 browser_mode=str(job.request_payload.get("executor_type") or "protocol"),
@@ -932,10 +954,13 @@ def resolve_parent_invite_context(
     merged_config: dict[str, Any] | None = None,
     executor_type: str = "protocol",
     force_refresh: bool = False,
+    proxy_url_override: str | None = None,
 ) -> dict[str, Any]:
     parent = dict(parent_credentials or {})
     merged = dict(merged_config or {})
-    proxy_url = str(merged.get("proxy") or "").strip() if merged.get("use_proxy") else ""
+    proxy_url = str(proxy_url_override or "").strip()
+    if not proxy_url:
+        proxy_url = str(merged.get("proxy") or "").strip() if merged.get("use_proxy") else ""
     resolved = resolve_parent_invite_context_from_token(
         parent,
         proxy_url=proxy_url or None,
