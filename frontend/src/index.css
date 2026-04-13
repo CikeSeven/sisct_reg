@@ -719,13 +719,18 @@ button:disabled {
 
 .provider-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   padding: 10px 12px;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.provider-item > div:first-child {
+  min-width: 0;
+  flex: 1;
 }
 
 .provider-item-compact {
@@ -1049,8 +1054,25 @@ button:disabled {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: 380px minmax(0, 1fr);
+  grid-template-columns: minmax(460px, 520px) minmax(0, 1fr);
   gap: 18px;
+}
+
+.codex-team-layout .form-panel,
+.codex-team-layout .account-panel {
+  min-width: 0;
+}
+
+.codex-team-layout .panel-title-row {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.codex-team-layout .panel-title-row .hint {
+  display: block;
+  max-width: 100%;
+  line-height: 1.5;
+  word-break: break-word;
 }
 
 .codex-stats-grid {
