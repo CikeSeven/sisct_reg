@@ -429,14 +429,6 @@ class CodexTeamManager:
 
             while child_count < target_children and not job.stop_requested:
                 attempt_index += 1
-                refreshed_parent_context = resolve_parent_invite_context(
-                    parent,
-                    merged_config=job.merged_config,
-                    executor_type=str(job.request_payload.get("executor_type") or "protocol"),
-                    force_refresh=True,
-                )
-                if refreshed_parent_context.get("success"):
-                    parent_context = dict(refreshed_parent_context)
                 success = self._process_account(job, attempt_index, parent_context=dict(parent_context))
                 if not success:
                     halt_parent = bool(getattr(job, "_last_account_halt_parent", True))
@@ -473,6 +465,7 @@ class CodexTeamManager:
                 log_fn=lambda message: append_codex_team_job_event(job.id, str(message or ""), account_email=child_email),
             )
             self._check_job_stop(job)
+            append_codex_team_job_event(job.id, f"开始从邮箱池取子号 #{attempt_index}")
             mail_info = provider.create_email(job.merged_config)
             self._check_job_stop(job)
             child_email = str(mail_info.get("email") or "").strip()
@@ -480,11 +473,13 @@ class CodexTeamManager:
                 raise RuntimeError("本地微软邮箱池返回空邮箱，停止任务")
             account = dict(mail_info.get("account") or {})
             child_password = str(account.get("password") or "").strip()
+            append_codex_team_job_event(job.id, f"子号邮箱取出成功: {child_email}", account_email=child_email)
             append_codex_team_job_event(job.id, f"开始处理子号 #{attempt_index}", account_email=child_email)
 
             active_parent_context = dict(parent_context or self._ensure_parent_invite_context(job))
             parent_identifier = str(active_parent_context.get("email") or active_parent_context.get("account_id") or "default")
             client = self._get_team_client(parent_identifier, proxy_url or None)
+            append_codex_team_job_event(job.id, "检查是否存在待接受邀请", account_email=child_email)
             invites_before = client.get_invites(
                 access_token=str(active_parent_context.get("access_token") or ""),
                 account_id=str(active_parent_context.get("account_id") or ""),
@@ -512,6 +507,7 @@ class CodexTeamManager:
                 )
             self._check_job_stop(job)
             if not invite_result.get("success"):
+                append_codex_team_job_event(job.id, "邀请失败后复查待接受邀请列表", account_email=child_email)
                 invites_after = client.get_invites(
                     access_token=str(active_parent_context.get("access_token") or ""),
                     account_id=str(active_parent_context.get("account_id") or ""),
@@ -557,6 +553,7 @@ class CodexTeamManager:
                 f"母号邀请已发送: invite_id={str(invite_result.get('invite_id') or '-')}",
                 account_email=child_email,
             )
+            append_codex_team_job_event(job.id, "开始等待邀请链接邮件", account_email=child_email)
             invite_link = provider.get_invitation_link(
                 email=child_email,
                 timeout=int(job.merged_config.get("chatgpt_invite_link_wait_seconds") or 300),
@@ -584,6 +581,7 @@ class CodexTeamManager:
             max_register_retries = max(1, int(job.merged_config.get("codex_team_register_retry_attempts") or 3))
             result_obj = None
             for register_try in range(1, max_register_retries + 1):
+                append_codex_team_job_event(job.id, f"开始子号注册流程: attempt={register_try}/{max_register_retries}", account_email=child_email)
                 result_obj = engine.run()
                 current_error = str(getattr(result_obj, "error_message", "") or "")
                 if bool(getattr(result_obj, "success", False)):

@@ -1542,8 +1542,14 @@ class OutlookLocalProvider(ProviderBase):
         fixed_preferred_provider = str(self._preferred_provider or "").strip()
 
         try:
+            started_at = time.monotonic()
+            last_progress_log = 0
             while time.monotonic() < deadline:
                 self._interrupt(interrupt_check)
+                elapsed_now = int(time.monotonic() - started_at)
+                if elapsed_now >= last_progress_log + 10:
+                    last_progress_log = elapsed_now
+                    self._log(f"[OutlookLocal] 等待验证码进度: elapsed={elapsed_now}s timeout={int(timeout or 0)}s")
                 poll_had_success = False
                 fatal_errors: list[str] = []
                 current_order = (fixed_preferred_provider,) if fixed_preferred_provider else provider_order
@@ -1589,9 +1595,15 @@ class OutlookLocalProvider(ProviderBase):
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         provider_order = self._read_provider_order()
         fixed_preferred_provider = str(self._preferred_provider or "").strip()
+        started_at = time.monotonic()
+        last_progress_log = 0
 
         while time.monotonic() < deadline:
             self._interrupt(interrupt_check)
+            elapsed_now = int(time.monotonic() - started_at)
+            if elapsed_now >= last_progress_log + 10:
+                last_progress_log = elapsed_now
+                self._log(f"[OutlookLocal] 等待邀请链接进度: elapsed={elapsed_now}s timeout={int(timeout or 0)}s")
             current_order = (fixed_preferred_provider,) if fixed_preferred_provider else provider_order
             for provider_name in current_order:
                 self._interrupt(interrupt_check)
