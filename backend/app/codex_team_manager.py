@@ -16,6 +16,7 @@ from core.task_runtime import StopTaskRequested
 from .db import (
     acquire_proxy_pool_entry,
     append_codex_team_job_event,
+    batch_import_codex_team_parent_accounts,
     get_codex_team_parent_pool_summary,
     create_codex_team_job,
     get_codex_team_job,
@@ -171,13 +172,26 @@ class CodexTeamManager:
                     interrupt_check=lambda current_job=job: self._check_parent_import_stop(current_job),
                 )
                 if result.get("success"):
+                    sync_result = self.sync_parent_account_child_count(
+                        int(result.get("parent_id") or 0),
+                        merged_config=runtime_config,
+                        executor_type=job.executor_type,
+                    )
                     with job.lock:
                         job.success += 1
-                    self._append_parent_import_event(
-                        job,
-                        f"母号转换成功，已导入 session: account_id={str(result.get('account_id') or '-')}",
-                        account_email=email,
-                    )
+                    if sync_result.get("success"):
+                        self._append_parent_import_event(
+                            job,
+                            f"母号转换成功，已导入 session: account_id={str(result.get('account_id') or '-')} · 当前子号数={int(sync_result.get('child_member_count') or 0)}",
+                            account_email=email,
+                        )
+                    else:
+                        self._append_parent_import_event(
+                            job,
+                            f"母号转换成功，但自动获取子号数失败: {str(sync_result.get('error') or 'unknown')}",
+                            level="error",
+                            account_email=email,
+                        )
                 else:
                     with job.lock:
                         job.failed += 1
@@ -231,6 +245,109 @@ class CodexTeamManager:
                 job.status = "stopped"
         self._append_parent_import_event(job, "已请求取消母号导入", level="error")
         return {"ok": True}
+
+    def import_parent_accounts(
+        self,
+        data: str,
+        *,
+        enabled: bool = True,
+        merged_config: dict[str, Any] | None = None,
+        executor_type: str = "protocol",
+    ) -> dict[str, Any]:
+        result = batch_import_codex_team_parent_accounts(data, enabled=enabled)
+        accounts = list(result.get("accounts") or [])
+        merged = dict(merged_config or {})
+        sync_errors: list[str] = []
+        for account in accounts:
+            parent_id = int(account.get("id") or 0)
+            if parent_id <= 0:
+                continue
+            sync_result = self.sync_parent_account_child_count(
+                parent_id,
+                merged_config=merged,
+                executor_type=executor_type,
+            )
+            if sync_result.get("success"):
+                account["child_member_count"] = int(sync_result.get("child_member_count") or 0)
+                account["team_account_id"] = str(sync_result.get("team_account_id") or account.get("team_account_id") or "")
+            else:
+                error = str(sync_result.get("error") or "自动获取母号子号数失败")
+                sync_errors.append(f"{str(account.get('email') or parent_id)}: {error}")
+                account["sync_error"] = error
+        errors = list(result.get("errors") or [])
+        errors.extend(sync_errors)
+        result["accounts"] = accounts
+        result["errors"] = errors
+        result["summary"] = get_codex_team_parent_pool_summary()
+        return result
+
+    def sync_parent_account_child_count(
+        self,
+        parent_id: int,
+        *,
+        merged_config: dict[str, Any] | None = None,
+        executor_type: str = "protocol",
+    ) -> dict[str, Any]:
+        parents = list_enabled_codex_team_parent_accounts()
+        parent = next((item for item in parents if int(item.get("id") or 0) == int(parent_id)), None)
+        if not parent:
+            return {"success": False, "error": "母号不存在"}
+
+        merged = dict(merged_config or {})
+        proxy_url = str(merged.get("proxy") or "").strip() if merged.get("use_proxy") else ""
+        try:
+            parent_context = resolve_parent_invite_context(
+                parent,
+                merged_config=merged,
+                executor_type=executor_type,
+                proxy_url_override=proxy_url or None,
+            )
+            if not parent_context.get("success") and not (
+                str(parent_context.get("access_token") or "").strip()
+                and str(parent_context.get("account_id") or "").strip()
+            ):
+                error = str(parent_context.get("error") or "母号上下文初始化失败")
+                update_codex_team_parent_account(int(parent_id), last_error=error, last_sync_at=time.time())
+                return {"success": False, "error": error}
+
+            parent_account_id = str(parent_context.get("account_id") or parent.get("team_account_id") or "").strip()
+            if not parent_account_id:
+                error = "母号缺少 team account_id"
+                update_codex_team_parent_account(int(parent_id), last_error=error, last_sync_at=time.time())
+                return {"success": False, "error": error}
+
+            parent_identifier = str(parent_context.get("email") or parent.get("email") or parent_account_id or "default")
+            client = self._get_team_client(parent_identifier, proxy_url or None)
+            count_result = client.get_members(
+                access_token=str(parent_context.get("access_token") or ""),
+                account_id=parent_account_id,
+                identifier=parent_identifier,
+            )
+            if not count_result.get("success"):
+                error = str(count_result.get("error") or "读取 Team 子号人数失败")
+                update_codex_team_parent_account(int(parent_id), last_error=error, last_sync_at=time.time())
+                return {"success": False, "error": error}
+
+            child_count = self._count_child_members(count_result)
+            update_codex_team_parent_account(
+                int(parent_id),
+                team_account_id=parent_account_id,
+                team_name=str(parent_context.get("team_name") or parent.get("team_name") or ""),
+                child_member_count=child_count,
+                last_sync_at=time.time(),
+                last_error="",
+                last_used=time.time(),
+            )
+            return {
+                "success": True,
+                "child_member_count": child_count,
+                "team_account_id": parent_account_id,
+                "email": str(parent.get("email") or ""),
+            }
+        except Exception as exc:
+            error = str(exc or "读取 Team 子号人数失败")
+            update_codex_team_parent_account(int(parent_id), last_error=error, last_sync_at=time.time())
+            return {"success": False, "error": error}
 
     def create_job(
         self,

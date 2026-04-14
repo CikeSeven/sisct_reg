@@ -77,6 +77,41 @@ class CodexTeamParentPoolTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertTrue(item['has_oauth'])
         self.assertEqual('123e4567-e89b-12d3-a456-426614174000', item['team_account_id'])
 
+    def test_import_parent_accounts_auto_syncs_child_count(self):
+        manager = CodexTeamManager()
+
+        with patch('app.codex_team_manager.resolve_parent_invite_context', return_value={
+            'success': True,
+            'email': 'parent@example.com',
+            'access_token': 'at-parent',
+            'account_id': '123e4567-e89b-12d3-a456-426614174000',
+            'team_name': 'Team Workspace',
+        }), patch('app.codex_team_manager.TeamManageStyleClient') as client_cls:
+            client = client_cls.return_value
+            client.get_members = Mock(return_value={
+                'success': True,
+                'members': [
+                    {'role': 'account-owner'},
+                    {'role': 'standard-user'},
+                    {'role': 'standard-user'},
+                ],
+                'total': 3,
+            })
+
+            result = manager.import_parent_accounts(
+                'parent@example.com----eyJaaa.bbb.ccc----123e4567-e89b-12d3-a456-426614174000',
+                enabled=True,
+                merged_config={'use_proxy': False},
+                executor_type='protocol',
+            )
+
+        self.assertEqual([], result['errors'])
+        summary = get_codex_team_parent_pool_summary()
+        self.assertEqual(1, summary['total'])
+        self.assertEqual(2, summary['items'][0]['child_member_count'])
+        self.assertEqual('Team Workspace', summary['items'][0]['team_name'])
+        self.assertEqual(2, result['summary']['items'][0]['child_member_count'])
+
     def test_delete_parent_account_removes_record(self):
         result = batch_import_codex_team_parent_accounts(
             'parent@example.com----mail-pass----client-id----refresh-token',

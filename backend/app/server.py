@@ -13,6 +13,7 @@ from .codex_team import router as codex_team_router
 from .defaults import DEFAULT_CONFIG
 from .luckmail_pool import router as luckmail_pool_router
 from .manager import manager
+from .oauth_cpa import router as oauth_cpa_router
 from .outlook_pool import router as outlook_router
 from .proxy_pool import router as proxy_router
 from .schemas import (
@@ -32,6 +33,7 @@ app.include_router(outlook_router)
 app.include_router(luckmail_pool_router)
 app.include_router(proxy_router)
 app.include_router(codex_team_router)
+app.include_router(oauth_cpa_router)
 
 
 @app.on_event("startup")

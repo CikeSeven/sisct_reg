@@ -5,9 +5,9 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, 'backend')
 
 from tests.db_isolation import IsolatedCodexTeamDbTestCase
-from app.codex_team_manager import CodexTeamManager
+from app.codex_team_manager import CodexTeamManager, CodexTeamParentImportJob
 from app.defaults import DEFAULT_CONFIG
-from app.db import list_codex_team_web_sessions
+from app.db import batch_import_codex_team_parent_accounts, get_codex_team_parent_pool_summary, list_codex_team_web_sessions
 
 
 class _FakeMailProvider:
@@ -197,6 +197,53 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
 
 
+
+    def test_parent_import_job_syncs_child_count_after_login(self):
+        manager = CodexTeamManager()
+        job = CodexTeamParentImportJob(
+            id='parent-import-1',
+            raw_data='parent@example.com----mail-pass----123e4567-e89b-12d3-a456-426614174000----M.C523',
+            merged_config={'use_proxy': False},
+            executor_type='protocol',
+        )
+
+        def fake_login_parent(*args, **kwargs):
+            import_result = batch_import_codex_team_parent_accounts(
+                'parent@example.com----eyJaaa.bbb.ccc----123e4567-e89b-12d3-a456-426614174000',
+                enabled=True,
+            )
+            parent_id = int(import_result['summary']['items'][0]['id'])
+            return {
+                'success': True,
+                'parent_id': parent_id,
+                'account_id': '123e4567-e89b-12d3-a456-426614174000',
+            }
+
+        with patch('app.codex_team_manager.login_parent_via_outlook', side_effect=fake_login_parent), \
+            patch('app.codex_team_manager.resolve_parent_invite_context', return_value={
+                'success': True,
+                'email': 'parent@example.com',
+                'access_token': 'at-parent',
+                'account_id': '123e4567-e89b-12d3-a456-426614174000',
+                'team_name': 'Team Workspace',
+            }), \
+            patch('app.codex_team_manager.TeamManageStyleClient') as client_cls:
+            client = client_cls.return_value
+            client.get_members = Mock(return_value={
+                'success': True,
+                'members': [
+                    {'role': 'account-owner'},
+                    {'role': 'standard-user'},
+                ],
+                'total': 2,
+            })
+            manager._run_parent_import_job(job)
+
+        summary = get_codex_team_parent_pool_summary()
+        self.assertEqual('done', job.status)
+        self.assertEqual(1, job.success)
+        self.assertEqual(1, summary['items'][0]['child_member_count'])
+        self.assertTrue(any('当前子号数=1' in str(item.get('message') or '') for item in job.events))
 
     def test_default_register_otp_wait_seconds_is_60(self):
         self.assertEqual(60, int(DEFAULT_CONFIG['chatgpt_register_otp_wait_seconds']))

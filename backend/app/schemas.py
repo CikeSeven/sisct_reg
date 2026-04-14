@@ -94,3 +94,9 @@ class CodexTeamSessionBatchRequest(BaseModel):
 class StartCodexTeamParentLoginImportRequest(BaseModel):
     data: str = Field(default="")
     executor_type: ExecutorType = "protocol"
+
+
+class OAuthCpaCallbackRequest(BaseModel):
+    callback_url: str = Field(default="")
+    state: str = Field(default="")
+    code_verifier: str = Field(default="")

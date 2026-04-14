@@ -1261,3 +1261,72 @@ button:disabled {
 .settings-checkbox-row {
   margin-top: 2px;
 }
+
+.oauth-cpa-layout {
+  position: relative;
+  z-index: 1;
+}
+
+ .oauth-cpa-grid {
+  align-items: start;
+}
+
+ .oauth-inline-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+ .oauth-meta-note p {
+  word-break: break-all;
+}
+
+ .oauth-cpa-result-panel {
+  min-width: 0;
+}
+
+ .oauth-result-title {
+  margin-bottom: 10px;
+}
+
+ .oauth-result-title .ghost-btn {
+  flex: 0 0 auto;
+}
+
+ .oauth-result-textarea {
+  min-height: 360px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+ .oauth-summary-list .provider-item p {
+  word-break: break-all;
+}
+
+ .oauth-export-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+ .oauth-history-list {
+  max-height: 360px;
+  overflow: auto;
+}
+
+ .oauth-history-item {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+ .oauth-history-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, auto));
+  gap: 8px;
+  align-items: start;
+}
+
+ .oauth-mini-btn {
+  flex: 0 0 auto;
+  min-width: 72px;
+}

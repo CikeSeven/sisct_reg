@@ -7,7 +7,6 @@ from fastapi.responses import StreamingResponse
 
 from .codex_team_manager import codex_team_manager
 from .db import (
-    batch_import_codex_team_parent_accounts,
     delete_codex_team_parent_account,
     get_codex_team_parent_pool_summary,
     get_config,
@@ -140,8 +139,14 @@ def get_codex_team_parents():
 
 @router.post("/parents/import")
 def import_codex_team_parents(body: ImportCodexTeamParentsRequest):
-    return batch_import_codex_team_parent_accounts(body.data, enabled=body.enabled)
-
+    merged_config = dict(DEFAULT_CONFIG)
+    merged_config.update(parse_config_row_values(get_config()))
+    return codex_team_manager.import_parent_accounts(
+        body.data,
+        enabled=body.enabled,
+        merged_config=merged_config,
+        executor_type="protocol",
+    )
 
 @router.post("/parents/import-login")
 def start_codex_team_parent_login_import(body: StartCodexTeamParentLoginImportRequest):

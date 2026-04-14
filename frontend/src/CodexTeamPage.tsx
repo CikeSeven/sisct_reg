@@ -83,6 +83,10 @@ type CodexTeamParentImportSnapshot = {
   events: CodexTeamEvent[]
 }
 
+type SessionDeleteDialogState = {
+  items: CodexTeamSessionItem[]
+} | null
+
 type FormState = {
   max_parent_accounts: number
   target_children_per_parent: number
@@ -123,6 +127,7 @@ export default function CodexTeamPage() {
   const [deletingSessionId, setDeletingSessionId] = useState<number | null>(null)
   const [selectedSessionIds, setSelectedSessionIds] = useState<number[]>([])
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false)
+  const [deleteSessionDialog, setDeleteSessionDialog] = useState<SessionDeleteDialogState>(null)
   const [showParentImportModal, setShowParentImportModal] = useState(false)
   const [parentImportJobId, setParentImportJobId] = useState('')
   const [parentImportSnapshot, setParentImportSnapshot] = useState<CodexTeamParentImportSnapshot | null>(null)
@@ -132,6 +137,17 @@ export default function CodexTeamPage() {
   const sessionItems = useMemo(() => (snapshot?.sessions || latestSessions || []), [snapshot?.sessions, latestSessions])
   const selectedSessionCount = selectedSessionIds.length
   const hasSelectedSessions = selectedSessionCount > 0
+  const lastParentCountSyncKey = useMemo(() => {
+    const events = snapshot?.events || []
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const item = events[index]
+      const message = String(item?.message || '')
+      if (message.includes('母号当前子号数:') || message.includes('母号刷新子号数:')) {
+        return `${item.id}:${message}`
+      }
+    }
+    return ''
+  }, [snapshot?.events])
 
   useEffect(() => {
     const visibleIds = new Set(sessionItems.map((item) => Number(item.id || 0)).filter((id) => id > 0))
@@ -165,7 +181,10 @@ export default function CodexTeamPage() {
 
 
   function isMicrosoftParentImport(text: string) {
-    const lines = String(text || '').split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+    const lines = String(text || '')
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter((item) => item && !item.startsWith('#'))
     if (lines.length === 0) return false
     return lines.every((line) => {
       const parts = line.split('----').map((item) => item.trim())
@@ -213,6 +232,11 @@ export default function CodexTeamPage() {
     }, 2000)
     return () => window.clearInterval(timer)
   }, [activeJobId, isRunning])
+
+  useEffect(() => {
+    if (!lastParentCountSyncKey) return
+    void refreshParents()
+  }, [lastParentCountSyncKey])
 
   useEffect(() => {
     if (!parentImportJobId) return
@@ -378,13 +402,48 @@ export default function CodexTeamPage() {
     }
   }
 
-  async function deleteSession(sessionId: number) {
-    setDeletingSessionId(sessionId)
+  function shouldConfirmDeleteSessions(items: CodexTeamSessionItem[]) {
+    return items.some((item) => String(item.status || '').toLowerCase() === 'success')
+  }
+
+  function requestDeleteSessions(items: CodexTeamSessionItem[]) {
+    const targets = items.filter((item) => Number(item.id || 0) > 0)
+    if (!targets.length) return
+    if (shouldConfirmDeleteSessions(targets)) {
+      setDeleteSessionDialog({ items: targets })
+      return
+    }
+    void performDeleteSessions(targets)
+  }
+
+  function closeDeleteSessionDialog() {
+    if (deletingSessionId !== null || deletingSelectedSessions) return
+    setDeleteSessionDialog(null)
+  }
+
+  async function performDeleteSessions(items: CodexTeamSessionItem[]) {
+    const sessionIds = items.map((item) => Number(item.id || 0)).filter((id) => id > 0)
+    if (!sessionIds.length) return
+
+    const singleId = sessionIds.length === 1 ? sessionIds[0] : null
+    if (singleId !== null) {
+      setDeletingSessionId(singleId)
+    } else {
+      setDeletingSelectedSessions(true)
+    }
     setError('')
     try {
-      await apiFetch(`/api/codex-team/sessions/${sessionId}`, {
-        method: 'DELETE',
-      })
+      if (singleId !== null) {
+        await apiFetch(`/api/codex-team/sessions/${singleId}`, {
+          method: 'DELETE',
+        })
+      } else {
+        await apiFetch('/api/codex-team/sessions/delete-batch', {
+          method: 'POST',
+          body: JSON.stringify({ session_ids: sessionIds }),
+        })
+      }
+      setSelectedSessionIds((prev) => prev.filter((id) => !sessionIds.includes(id)))
       if (activeJobId) {
         await refreshJobs()
         await refreshJob(activeJobId)
@@ -393,34 +452,25 @@ export default function CodexTeamPage() {
         await refreshLatestSessions()
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '删除子号结果失败')
+      setError(err instanceof Error ? err.message : singleId !== null ? '删除子号结果失败' : '批量删除子号结果失败')
     } finally {
-      setDeletingSessionId(null)
+      if (singleId !== null) {
+        setDeletingSessionId(null)
+      } else {
+        setDeletingSelectedSessions(false)
+      }
+      setDeleteSessionDialog(null)
     }
   }
 
-  async function deleteSelectedSessions() {
+  function deleteSession(item: CodexTeamSessionItem) {
+    requestDeleteSessions([item])
+  }
+
+  function deleteSelectedSessions() {
     if (!selectedSessionIds.length) return
-    setDeletingSelectedSessions(true)
-    setError('')
-    try {
-      await apiFetch('/api/codex-team/sessions/delete-batch', {
-        method: 'POST',
-        body: JSON.stringify({ session_ids: selectedSessionIds }),
-      })
-      setSelectedSessionIds([])
-      if (activeJobId) {
-        await refreshJobs()
-        await refreshJob(activeJobId)
-        await refreshLatestSessions(activeJobId)
-      } else {
-        await refreshLatestSessions()
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '批量删除子号结果失败')
-    } finally {
-      setDeletingSelectedSessions(false)
-    }
+    const targets = sessionItems.filter((item) => selectedSessionIds.includes(Number(item.id || 0)))
+    requestDeleteSessions(targets)
   }
 
   return (
@@ -636,7 +686,7 @@ export default function CodexTeamPage() {
                     <button
                       className="tiny-action-btn danger"
                       type="button"
-                      onClick={() => void deleteSession(item.id)}
+                      onClick={() => void deleteSession(item)}
                       disabled={deletingSessionId === item.id}
                     >
                       {deletingSessionId === item.id ? '删除中' : '删除'}
@@ -648,6 +698,32 @@ export default function CodexTeamPage() {
           </div>
         </div>
       </section>
+
+      {deleteSessionDialog ? (
+        <div className="modal-shell" onClick={() => closeDeleteSessionDialog()}>
+          <div className="modal-card confirm-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-title">
+              {(deleteSessionDialog.items.length === 1
+                ? '该 success 子号删除后不可恢复，确认继续删除吗？'
+                : `选中的 ${deleteSessionDialog.items.length} 个子号中有 ${deleteSessionDialog.items.filter((item) => String(item.status || '').toLowerCase() === 'success').length} 个 success 账号，确认继续删除吗？`)
+              }
+            </div>
+            <div className="confirm-actions">
+              <button className="ghost-btn" type="button" onClick={() => closeDeleteSessionDialog()} disabled={deletingSessionId !== null || deletingSelectedSessions}>
+                取消
+              </button>
+              <button
+                className="ghost-btn danger"
+                type="button"
+                onClick={() => void performDeleteSessions(deleteSessionDialog.items)}
+                disabled={deletingSessionId !== null || deletingSelectedSessions}
+              >
+                {deletingSessionId !== null || deletingSelectedSessions ? '删除中...' : '确认删除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {showParentImportModal ? (
         <div className="modal-shell" onClick={() => {

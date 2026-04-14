@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch } from './lib/api'
 import CodexTeamPage from './CodexTeamPage'
+import OAuthCpaPage from './OAuthCpaPage'
 
 type MailProvider = 'luckmail' | 'tempmail_lol' | 'outlook_local'
 type Executor = 'protocol' | 'headless' | 'headed'
@@ -10,7 +11,7 @@ type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
 type AccountFilter = 'all' | 'success' | 'failed'
 type AccountScope = 'all' | 'active'
-type WorkbenchPage = 'register' | 'codex_team'
+type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -1927,10 +1928,17 @@ export default function App() {
         >
           Codex Team
         </button>
+        <button
+          className={`page-switch-btn ${page === 'oauth_cpa' ? 'active' : ''}`}
+          type="button"
+          onClick={() => setPage('oauth_cpa')}
+        >
+          OAuth 转 CPA
+        </button>
       </div>
       {page === 'register' && error ? <div className="error-banner">{error}</div> : null}
 
-      {page === 'codex_team' ? <CodexTeamPage /> : (
+      {page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : (
       <main className="workbench-grid two-pane">
         <section className="panel form-panel">
           <div className="panel-title-row">
