@@ -756,11 +756,13 @@ class OutlookLocalProvider(ProviderBase):
             raise RuntimeError(f"微软邮箱记录缺少密码或 OAuth 令牌: {account.get('email')}")
 
         self._account = account
+        self._seen_ids = set()
+        self._last_provider_errors = {}
         self._strict_provider_lock = False
         self._preferred_provider = ""
-        self._preflight_oauth_mailbox()
         auth_desc = "OAuth" if account.get("client_id") and account.get("refresh_token") else "密码登录"
         self._log(f"[OutlookLocal] 已取出账号: {account.get('email')}（{auth_desc}）")
+        self._log("[OutlookLocal] 已延迟邮箱预检，首次真实收码/取链接时再建立微软邮箱会话")
         return {
             "email": str(account.get("email") or "").strip(),
             "token": f"local-outlook-{account.get('id')}",

@@ -1,5 +1,6 @@
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, 'backend')
 
@@ -25,6 +26,20 @@ class OutlookLocalMailParsingTests(unittest.TestCase):
         provider = OutlookLocalProvider(fixed_account={})
         _subject, text, _from_header, _sent_at = provider._extract_message_bundle_from_raw(RAW_OPENAI_MAIL_SPACED)
         self.assertEqual('123456', provider._extract_code(text))
+
+    def test_create_email_does_not_preflight_mailbox(self):
+        account = {
+            'id': 1,
+            'email': 'user@example.com',
+            'password': 'mail-pass',
+            'client_id': 'client-id',
+            'refresh_token': 'ms-rt',
+        }
+        provider = OutlookLocalProvider(fixed_account=account)
+        provider._preflight_oauth_mailbox = lambda: (_ for _ in ()).throw(RuntimeError('should not run'))
+        result = provider.create_email()
+        self.assertEqual('user@example.com', result['email'])
+
 
 
 if __name__ == '__main__':
