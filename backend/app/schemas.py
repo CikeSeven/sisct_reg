@@ -100,3 +100,12 @@ class OAuthCpaCallbackRequest(BaseModel):
     callback_url: str = Field(default="")
     state: str = Field(default="")
     code_verifier: str = Field(default="")
+
+
+class StartCodexAuthBatchJobRequest(BaseModel):
+    data: str = Field(default="")
+    executor_type: ExecutorType = "protocol"
+
+
+class CodexAuthBatchExportRequest(BaseModel):
+    emails: list[str] = Field(default_factory=list)

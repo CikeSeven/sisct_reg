@@ -349,21 +349,24 @@ class RegisterTaskStore:
             record = self._records[task_id]
             return list(record.logs), record.status
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> list[str]:
         with self._lock:
             if len(self._records) <= self.cleanup_threshold:
-                return
+                return []
             finished = [
                 (task_id, record)
                 for task_id, record in self._records.items()
                 if record.status in ("done", "failed", "stopped")
             ]
             if len(finished) <= self.max_finished_tasks:
-                return
+                return []
             finished.sort(key=lambda item: item[1].created_at)
             to_remove = finished[: len(finished) - self.max_finished_tasks]
+            removed_task_ids: list[str] = []
             for task_id, _ in to_remove:
                 self._records.pop(task_id, None)
+                removed_task_ids.append(task_id)
+            return removed_task_ids
 
 
 __all__ = [

@@ -34,6 +34,30 @@ from .sentinel_token import build_sentinel_token
 from .sentinel_browser import get_sentinel_token_via_browser
 
 
+def choose_codex_consent_workspace(workspaces):
+    items = [dict(item or {}) for item in (workspaces or []) if isinstance(item, dict)]
+    if not items:
+        return None
+
+    def workspace_id(item):
+        return str(item.get("id") or item.get("workspace_id") or item.get("account_id") or "").strip()
+
+    for item in items:
+        kind = str(item.get("kind") or item.get("workspace_type") or item.get("account_type") or "").strip().lower()
+        if kind == "organization" and workspace_id(item):
+            return item
+
+    for flag in ("is_default", "default", "selected", "is_selected"):
+        for item in items:
+            if bool(item.get(flag)) and workspace_id(item):
+                return item
+
+    for item in items:
+        if workspace_id(item):
+            return item
+    return None
+
+
 class OAuthClient:
     """OAuth 客户端 - 用于获取 Access Token 和 Refresh Token"""
 
@@ -2586,13 +2610,22 @@ class OAuthClient:
             self._set_error("session 中没有 workspace 信息")
             return None, None
 
-        workspace_id = (workspaces[0] or {}).get("id")
+        selected_workspace = choose_codex_consent_workspace(workspaces)
+        if not selected_workspace:
+            self._set_error("未找到可用的 Codex workspace")
+            return None, None
+
+        workspace_id = str(
+            selected_workspace.get("id") or selected_workspace.get("workspace_id") or selected_workspace.get("account_id") or ""
+        ).strip()
         if not workspace_id:
             self._set_error("workspace_id 为空")
             return None, None
 
-        self.last_workspace_id = str(workspace_id).strip()
-        self._log(f"选择 workspace: {workspace_id}")
+        self.last_workspace_id = workspace_id
+        workspace_kind = str(selected_workspace.get("kind") or selected_workspace.get("workspace_type") or "").strip() or "unknown"
+        workspace_label = str(selected_workspace.get("name") or selected_workspace.get("title") or workspace_id).strip()
+        self._log(f"选择 workspace: {workspace_label} ({workspace_kind})")
 
         headers = self._headers(
             f"{self.oauth_issuer}/api/accounts/workspace/select",

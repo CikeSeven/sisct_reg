@@ -1330,3 +1330,52 @@ button:disabled {
   flex: 0 0 auto;
   min-width: 72px;
 }
+
+ .codex-auth-batch-layout {
+  position: relative;
+  z-index: 1;
+}
+
+ .codex-auth-batch-grid {
+  align-items: start;
+}
+
+ .codex-auth-batch-result-panel {
+  min-width: 0;
+}
+
+ .codex-auth-batch-title-row {
+  margin-bottom: 10px;
+}
+
+ .codex-auth-batch-export-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+ .codex-auth-batch-sections {
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+}
+
+ .codex-auth-batch-item {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+ .codex-auth-batch-actions {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+ .codex-auth-batch-mini-btn {
+  flex: 0 0 auto;
+  min-width: 96px;
+}
+ .codex-auth-batch-select-actions {
+  align-items: center;
+}
+
+ .codex-auth-batch-check-placeholder {
+  width: 34px;
+  min-width: 34px;
+}

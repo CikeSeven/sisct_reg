@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch } from './lib/api'
+import CodexAuthBatchPage from './CodexAuthBatchPage'
 import CodexTeamPage from './CodexTeamPage'
 import OAuthCpaPage from './OAuthCpaPage'
 
@@ -11,7 +12,7 @@ type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
 type AccountFilter = 'all' | 'success' | 'failed'
 type AccountScope = 'all' | 'active'
-type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa'
+type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa' | 'codex_auth_batch'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -1935,10 +1936,17 @@ export default function App() {
         >
           OAuth 转 CPA
         </button>
+        <button
+          className={`page-switch-btn ${page === 'codex_auth_batch' ? 'active' : ''}`}
+          type="button"
+          onClick={() => setPage('codex_auth_batch')}
+        >
+          批量 Codex 授权
+        </button>
       </div>
       {page === 'register' && error ? <div className="error-banner">{error}</div> : null}
 
-      {page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : (
+      {page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : page === 'codex_auth_batch' ? <CodexAuthBatchPage /> : (
       <main className="workbench-grid two-pane">
         <section className="panel form-panel">
           <div className="panel-title-row">

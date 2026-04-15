@@ -776,6 +776,7 @@ class RegistrationManager:
         *,
         request_payload: dict[str, Any] | None = None,
         log_limit: int | None = None,
+        include_event_logs: bool = True,
     ) -> list[dict[str, Any]]:
         request_payload = request_payload or {}
         task_row = get_task_run(task_id) or {}
@@ -798,40 +799,41 @@ class RegistrationManager:
             if idx <= 0:
                 continue
             state_by_attempt[idx] = dict(account_state or {})
-        all_events = get_task_events(task_id, after_seq=0)
-        for event in all_events:
-            attempt_index = event.get("attempt_index")
-            message = str(event.get("message") or "")
-            if attempt_index is None:
-                attempt_index = self._guess_attempt_index_from_message(message)
-                if attempt_index is not None:
-                    current_attempt_index = int(attempt_index)
-                else:
-                    attempt_index = current_attempt_index
-            else:
-                try:
-                    attempt_index = int(attempt_index)
-                    if attempt_index <= 0:
-                        attempt_index = current_attempt_index
-                    else:
+        all_events: list[dict[str, Any]] = []
+        if include_event_logs:
+            all_events = get_task_events(task_id, after_seq=0)
+            for event in all_events:
+                attempt_index = event.get("attempt_index")
+                message = str(event.get("message") or "")
+                if attempt_index is None:
+                    attempt_index = self._guess_attempt_index_from_message(message)
+                    if attempt_index is not None:
                         current_attempt_index = int(attempt_index)
-                except Exception:
-                    attempt_index = current_attempt_index
-            if attempt_index is None:
-                if task_total == 1 and all_events:
-                    attempt_index = 1
-                    current_attempt_index = 1
+                    else:
+                        attempt_index = current_attempt_index
                 else:
-                    continue
-            idx = int(attempt_index)
-            logs = logs_by_attempt.setdefault(idx, [])
-            logs.append(str(event.get("message") or ""))
-            if log_limit is not None and len(logs) > max(int(log_limit or 0), 0):
-                logs_by_attempt[idx] = logs[-max(int(log_limit or 0), 0):]
-            guessed_email = self._guess_email_from_message(message)
-            if guessed_email and idx not in email_by_attempt:
-                email_by_attempt[idx] = guessed_email
-
+                    try:
+                        attempt_index = int(attempt_index)
+                        if attempt_index <= 0:
+                            attempt_index = current_attempt_index
+                        else:
+                            current_attempt_index = int(attempt_index)
+                    except Exception:
+                        attempt_index = current_attempt_index
+                if attempt_index is None:
+                    if task_total == 1 and all_events:
+                        attempt_index = 1
+                        current_attempt_index = 1
+                    else:
+                        continue
+                idx = int(attempt_index)
+                logs = logs_by_attempt.setdefault(idx, [])
+                logs.append(str(event.get("message") or ""))
+                if log_limit is not None and len(logs) > max(int(log_limit or 0), 0):
+                    logs_by_attempt[idx] = logs[-max(int(log_limit or 0), 0):]
+                guessed_email = self._guess_email_from_message(message)
+                if guessed_email and idx not in email_by_attempt:
+                    email_by_attempt[idx] = guessed_email
         items: list[dict[str, Any]] = []
         result_attempts: set[int] = set()
         for result in get_task_results(task_id):
@@ -963,8 +965,14 @@ class RegistrationManager:
         *,
         request_payload: dict[str, Any] | None = None,
         log_limit: int | None = None,
+        include_event_logs: bool = True,
     ) -> list[dict[str, Any]]:
-        db_items = self._build_db_accounts(task_id, request_payload=request_payload, log_limit=log_limit)
+        db_items = self._build_db_accounts(
+            task_id,
+            request_payload=request_payload,
+            log_limit=log_limit,
+            include_event_logs=include_event_logs,
+        )
         live_items = self._get_live_accounts(task_id, log_limit=log_limit)
         if not live_items:
             return db_items
@@ -992,6 +1000,23 @@ class RegistrationManager:
         active_statuses = {"pending", "registering", "running"}
         merged.sort(key=lambda item: (0 if item.get("status") in active_statuses else 1, item.get("attempt_index", 0)))
         return merged
+
+    def _cleanup_stale_task_runtime_state(self, removed_task_ids: list[str]) -> None:
+        stale_ids = [
+            str(task_id or "").strip()
+            for task_id in (removed_task_ids or [])
+            if str(task_id or "").strip()
+        ]
+        if not stale_ids:
+            return
+        with self._lock:
+            for stale_task_id in stale_ids:
+                self._log_sequences.pop(stale_task_id, None)
+                self._task_accounts.pop(stale_task_id, None)
+                self._task_execution_states.pop(stale_task_id, None)
+                self._snapshot_cache.pop((stale_task_id, False), None)
+                self._snapshot_cache.pop((stale_task_id, True), None)
+
 
     def _clear_live_accounts(self, task_id: str) -> None:
         with self._lock:
@@ -1075,7 +1100,12 @@ class RegistrationManager:
                 snapshot['source'] = source
                 snapshot['meta'] = meta
                 snapshot['request'] = request_payload
-            snapshot['accounts'] = self._merged_accounts_snapshot(task_id, request_payload=request_payload, log_limit=account_log_limit)
+            snapshot['accounts'] = self._merged_accounts_snapshot(
+                task_id,
+                request_payload=request_payload,
+                log_limit=account_log_limit,
+                include_event_logs=False,
+            )
             snapshot['logs'] = []
             snapshot['is_active'] = True
             with self._lock:
@@ -1084,7 +1114,7 @@ class RegistrationManager:
         
         if db_task is None:
             return None
-        events = get_task_events(task_id, after_seq=0)
+        events = [] if lite else get_task_events(task_id, after_seq=0)
         results = get_task_results(task_id)
         snapshot = {
             "id": db_task["id"],
@@ -1102,7 +1132,12 @@ class RegistrationManager:
             "logs": [] if lite else [item["message"] for item in events],
             "control": {"stop_requested": db_task["status"] == "stopped"},
             "summary": db_task.get("summary_json") or {},
-            "accounts": self._build_db_accounts(task_id, request_payload=db_task.get("request_json") or {}, log_limit=account_log_limit),
+            "accounts": self._build_db_accounts(
+                task_id,
+                request_payload=db_task.get("request_json") or {},
+                log_limit=account_log_limit,
+                include_event_logs=not lite,
+            ),
         }
         with self._lock:
             self._snapshot_cache[cache_key] = (time.time(), deepcopy(snapshot))
@@ -2131,7 +2166,8 @@ class RegistrationManager:
             self._finalize_incomplete_accounts(task_id, final_status="stopped", error_message=str(exc))
             self._set_task_execution_state(task_id, None)
             self._clear_live_accounts(task_id)
-            self._task_store.cleanup()
+            removed_task_ids = self._task_store.cleanup()
+            self._cleanup_stale_task_runtime_state(removed_task_ids)
             return
         except Exception as exc:
             message = f"代理检测失败: {exc}" if str(req.proxy or "").strip() else f"网络预检失败: {exc}"
@@ -2183,7 +2219,8 @@ class RegistrationManager:
             self._task_store.finish(task_id, status="failed", success=success, skipped=skipped, errors=[message], error=message)
             self._set_task_execution_state(task_id, None)
             self._clear_live_accounts(task_id)
-            self._task_store.cleanup()
+            removed_task_ids = self._task_store.cleanup()
+            self._cleanup_stale_task_runtime_state(removed_task_ids)
             return
 
         prepared_initial_attempts = self._prepare_initial_attempts(initial_attempts)
@@ -2624,7 +2661,8 @@ class RegistrationManager:
             self._finalize_incomplete_accounts(task_id, final_status="failed", error_message=str(exc))
             self._set_task_execution_state(task_id, None)
             self._clear_live_accounts(task_id)
-            self._task_store.cleanup()
+            removed_task_ids = self._task_store.cleanup()
+            self._cleanup_stale_task_runtime_state(removed_task_ids)
             return
 
         completed, success, failed, skipped = state.snapshot_counts()
@@ -2656,7 +2694,8 @@ class RegistrationManager:
         )
         self._set_task_execution_state(task_id, None)
         self._clear_live_accounts(task_id)
-        self._task_store.cleanup()
+        removed_task_ids = self._task_store.cleanup()
+        self._cleanup_stale_task_runtime_state(removed_task_ids)
 
 
 manager = RegistrationManager()

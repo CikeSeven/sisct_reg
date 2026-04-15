@@ -4,6 +4,7 @@ import imaplib
 import re
 import time
 import hashlib
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from email import message_from_bytes
@@ -66,14 +67,18 @@ class ProviderBase:
     def _extract_code(self, text: str) -> Optional[str]:
         text = str(text or "")
         patterns = [
-            r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,30}(\d{6})",
-            r"(?is)\bcode\b[^0-9]{0,12}(\d{6})",
-            r"(?<!\d)(\d{6})(?!\d)",
+            r"(?is)(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code|authentication\s+code|auth\s+code|验证码|校验码|动态码|認證碼|驗證碼)[^0-9]{0,40}(\d(?:[\s-]*\d){5})",
+            r"(?is)\bcode\b[^0-9]{0,20}(\d(?:[\s-]*\d){5})",
+            r"(?<!\d)(\d(?:[\s-]*\d){5})(?!\d)",
         ]
         for pattern in patterns:
             match = re.search(pattern, text)
-            if match:
-                return match.group(1) if match.groups() else match.group(0)
+            if not match:
+                continue
+            raw = match.group(1) if match.groups() else match.group(0)
+            normalized = re.sub(r"\D", "", raw)
+            if len(normalized) == 6:
+                return normalized
         return None
 
     def _decode_raw_content(self, raw: str) -> str:
@@ -726,8 +731,8 @@ class OutlookLocalProvider(ProviderBase):
                 for item in messages
                 if str(item.get("id") or "").strip()
             }
-            self._lock_provider("graph_api", strict=True)
-            self._log(f"[OutlookLocal] Graph API 预检成功: count={len(messages)}，已锁定 graph_api")
+            self._lock_provider("graph_api", strict=False)
+            self._log(f"[OutlookLocal] Graph API 预检成功: count={len(messages)}，优先使用 graph_api")
         except Exception as exc:
             message = str(exc or "").strip()
             if self._is_permanent_oauth_failure("graph_api", message):
@@ -940,17 +945,18 @@ class OutlookLocalProvider(ProviderBase):
         )
         return any(marker in lowered for marker in markers)
 
-    def _read_provider_order(self) -> tuple[str, ...]:
+    def _read_provider_order(self, *, include_disabled: bool = False) -> tuple[str, ...]:
         if not self._account:
             return ()
         if self._account.get("client_id") and self._account.get("refresh_token"):
             order = list(self._provider_order_with_oauth)
         else:
             order = list(self._provider_order_without_oauth)
-        order = [item for item in order if self._is_provider_available(item)]
+        if not include_disabled:
+            order = [item for item in order if self._is_provider_available(item)]
         preferred = str(self._preferred_provider or "").strip()
         if preferred and preferred in order:
-            if self._strict_provider_lock:
+            if self._strict_provider_lock and not include_disabled:
                 return (preferred,)
             return tuple([preferred, *[item for item in order if item != preferred]])
         return tuple(order)
@@ -1135,19 +1141,76 @@ class OutlookLocalProvider(ProviderBase):
             return text or "(无主题)"
         return f"{text[:77]}..."
 
-    def _is_recent_message(self, message, otp_sent_at) -> bool:
+    def _is_recent_timestamp(self, sent_at: float | None, otp_sent_at) -> bool:
         if not otp_sent_at:
             return True
-        sent_at = self._message_sent_at(message)
         if sent_at is None:
             return True
-        return sent_at + 300 >= float(otp_sent_at)
+        return float(sent_at) + 300 >= float(otp_sent_at)
+
+    def _extract_header_from_raw_text(self, raw_text: str, header_name: str) -> str:
+        lines = str(raw_text or "").splitlines()
+        target = f"{str(header_name or '').strip().lower()}:"
+        collecting = False
+        parts: list[str] = []
+        for line in lines:
+            if not collecting:
+                if line.lower().startswith(target):
+                    parts.append(line.split(":", 1)[1].strip())
+                    collecting = True
+                continue
+            if line.startswith((" ", "\t")):
+                parts.append(line.strip())
+                continue
+            break
+        return " ".join(parts).strip()
+
+    def _extract_message_bundle_from_raw(self, raw: bytes) -> tuple[str, str, str, float | None]:
+        raw_text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw or "")
+        subject = self._decode_header_value(self._extract_header_from_raw_text(raw_text, "Subject"))
+        from_header = self._decode_header_value(self._extract_header_from_raw_text(raw_text, "From")).lower()
+        try:
+            sent_at = parsedate_to_datetime(self._extract_header_from_raw_text(raw_text, "Date") or "").timestamp()
+        except Exception:
+            sent_at = None
+        text = self._decode_raw_content(raw_text)
+
+        try:
+            msg = message_from_bytes(raw, policy=email_default_policy)
+            subject = self._decode_header_value(msg.get("Subject", "")) or subject
+            from_header = self._decode_header_value(msg.get("From", "")).lower() or from_header
+            sent_at = self._message_sent_at(msg) or sent_at
+            parsed_text = self._extract_message_text(msg)
+            if parsed_text:
+                text = parsed_text
+        except Exception as exc:
+            self._log(f"[OutlookLocal] MIME 解析回退: {exc}")
+
+        return subject, text, from_header, sent_at
+
+    def _is_recent_message(self, message, otp_sent_at) -> bool:
+        sent_at = self._message_sent_at(message)
+        return self._is_recent_timestamp(sent_at, otp_sent_at)
 
     def _is_openai_related(self, subject: str, text: str, sender: str) -> bool:
         lowered = f"{subject} {text} {sender}".lower()
         return any(
             keyword in lowered
-            for keyword in ("openai", "chatgpt", "verification code", "your openai code", "验证码")
+            for keyword in (
+                "openai",
+                "open ai",
+                "chatgpt",
+                "codex",
+                "verification code",
+                "your openai code",
+                "authentication code",
+                "security code",
+                "login code",
+                "sign in",
+                "验证码",
+                "校验码",
+                "动态码",
+            )
         )
 
     def _parse_graph_timestamp(self, value: str) -> float | None:
@@ -1276,10 +1339,13 @@ class OutlookLocalProvider(ProviderBase):
                     continue
                 status, data = conn.uid("search", None, "ALL")
                 if status != "OK":
+                    self._log(f"[OutlookLocal] IMAP 搜索失败: provider={provider_name} mailbox={mailbox} status={status}")
                     continue
                 ids = data[0].split() if data and data[0] else []
+                total_ids = len(ids)
                 if len(ids) > 50:
                     ids = ids[-50:]
+                self._log(f"[OutlookLocal] IMAP 扫描邮箱: provider={provider_name} mailbox={mailbox} total={total_ids} scanning={len(ids)}")
                 for uid in reversed(ids):
                     uid_text = uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid)
                     seen_key = f"{provider_name}:{mailbox}:{uid_text}"
@@ -1288,6 +1354,7 @@ class OutlookLocalProvider(ProviderBase):
                     self._seen_ids.add(seen_key)
                     status, msg_data = conn.uid("fetch", uid, "(RFC822)")
                     if status != "OK":
+                        self._log(f"[OutlookLocal] IMAP 拉取邮件失败: provider={provider_name} mailbox={mailbox} uid={uid_text} status={status}")
                         continue
                     raw = None
                     for item in msg_data or []:
@@ -1295,39 +1362,46 @@ class OutlookLocalProvider(ProviderBase):
                             raw = item[1]
                             break
                     if not raw:
+                        self._log(f"[OutlookLocal] IMAP 邮件为空: provider={provider_name} mailbox={mailbox} uid={uid_text}")
                         continue
-                    msg = message_from_bytes(raw, policy=email_default_policy)
-                    subject = self._decode_header_value(msg.get("Subject", ""))
-                    sent_at = self._message_sent_at(msg)
-                    if not self._is_recent_message(msg, otp_sent_at):
-                        preview = self._subject_preview(subject)
-                        sent_label = (
-                            f" ({time.strftime('%H:%M:%S', time.localtime(sent_at))})"
-                            if sent_at
-                            else ""
-                        )
-                        self._log(f"[OutlookLocal] 跳过旧邮件: {preview}{sent_label}")
-                        continue
-                    text = self._extract_message_text(msg)
-                    code = self._extract_code(text)
-                    if code:
+                    try:
+                        subject, text, from_header, sent_at = self._extract_message_bundle_from_raw(raw)
                         self._log(
-                            f"[OutlookLocal] 扫描到验证码: provider={provider_name} mailbox={mailbox} "
-                            f"subject={self._subject_preview(subject)} code={code}"
+                            f"[OutlookLocal] IMAP 邮件摘要: provider={provider_name} mailbox={mailbox} uid={uid_text} from={from_header or '-'} subject={self._subject_preview(subject)} sent_at={time.strftime('%H:%M:%S', time.localtime(sent_at)) if sent_at else '-'}"
                         )
-                    if code and code not in exclude_codes:
-                        self._lock_provider(provider_name, strict=True)
-                        self._log(f"[OutlookLocal] 已锁定收码方式: {provider_name}")
-                        self._log(f"[OutlookLocal] 命中新验证码: {code}")
-                        return code
-                    if code and code in exclude_codes:
-                        self._log(f"[OutlookLocal] 跳过旧验证码: {code}")
-                        continue
-                    from_header = self._decode_header_value(msg.get("From", "")).lower()
-                    if self._is_openai_related(subject, text, from_header):
+                        if not self._is_recent_timestamp(sent_at, otp_sent_at):
+                            preview = self._subject_preview(subject)
+                            sent_label = (
+                                f" ({time.strftime('%H:%M:%S', time.localtime(sent_at))})"
+                                if sent_at
+                                else ""
+                            )
+                            self._log(f"[OutlookLocal] 跳过旧邮件: {preview}{sent_label}")
+                            continue
+                        code = self._extract_code(text)
+                        if code:
+                            self._log(
+                                f"[OutlookLocal] 扫描到验证码: provider={provider_name} mailbox={mailbox} uid={uid_text} subject={self._subject_preview(subject)} code={code}"
+                            )
+                        if code and code not in exclude_codes:
+                            self._lock_provider(provider_name, strict=True)
+                            self._log(f"[OutlookLocal] 已锁定收码方式: {provider_name}")
+                            self._log(f"[OutlookLocal] 命中新验证码: {code}")
+                            return code
+                        if code and code in exclude_codes:
+                            self._log(f"[OutlookLocal] 跳过旧验证码: {code}")
+                            continue
+                        if self._is_openai_related(subject, text, from_header):
+                            self._log(
+                                f"[OutlookLocal] 发现 OpenAI/Codex 相关邮件但未提取到验证码: provider={provider_name} mailbox={mailbox} uid={uid_text} subject={self._subject_preview(subject)}"
+                            )
+                    except Exception as exc:
+                        trace = traceback.format_exc(limit=3).strip().replace("\n", " | ")
+                        raw_preview = (raw[:240] if isinstance(raw, (bytes, bytearray)) else str(raw or "")[:240])
                         self._log(
-                            f"[OutlookLocal] 在 {mailbox} 发现相关邮件但未提取到验证码: {self._subject_preview(subject)}"
+                            f"[OutlookLocal] IMAP 邮件解析异常: provider={provider_name} mailbox={mailbox} uid={uid_text} error={exc!r} trace={trace} raw_preview={raw_preview}"
                         )
+                        continue
             return ""
         finally:
             try:
@@ -1335,7 +1409,6 @@ class OutlookLocalProvider(ProviderBase):
                     conn.logout()
             except Exception:
                 pass
-
     def _list_current_ids(self) -> set[str]:
         seen: set[str] = set()
         for provider_name in self._read_provider_order():
@@ -1419,11 +1492,9 @@ class OutlookLocalProvider(ProviderBase):
                             break
                     if not raw:
                         continue
-                    msg = message_from_bytes(raw, policy=email_default_policy)
-                    subject = self._decode_header_value(msg.get("Subject", ""))
-                    if not self._is_recent_message(msg, invite_sent_at):
+                    subject, raw_text, _from_header, sent_at = self._extract_message_bundle_from_raw(raw)
+                    if not self._is_recent_timestamp(sent_at, invite_sent_at):
                         continue
-                    raw_text = self._extract_message_raw_text(msg)
                     urls = extract_invite_urls(raw_text)
                     if not urls:
                         continue
@@ -1454,9 +1525,14 @@ class OutlookLocalProvider(ProviderBase):
         exclude_codes: set[str],
         otp_sent_at=None,
         limit: int = 8,
-    ) -> None:
+    ) -> str:
         seen_logs = 0
-        for provider_name in self._read_provider_order():
+        fallback_code = ""
+        provider_names = self._read_provider_order(include_disabled=True)
+        if not provider_names:
+            self._log("[OutlookLocal] 最近验证码回溯：没有可用 provider 定义")
+            return ""
+        for provider_name in provider_names:
             try:
                 if provider_name == "graph_api":
                     messages = self._fetch_graph_messages(otp_sent_at=otp_sent_at, limit=limit)
@@ -1475,6 +1551,8 @@ class OutlookLocalProvider(ProviderBase):
                             f"[OutlookLocal] 最近验证码: provider=graph_api mailbox={item.get('_folder') or 'graph'} "
                             f"subject={self._subject_preview(subject)} code={code} status={status_text}"
                         )
+                        if not fallback_code and code not in exclude_codes:
+                            fallback_code = code
                         seen_logs += 1
                         if seen_logs >= max(int(limit or 0), 1):
                             return
@@ -1505,11 +1583,9 @@ class OutlookLocalProvider(ProviderBase):
                                     break
                             if not raw:
                                 continue
-                            msg = message_from_bytes(raw, policy=email_default_policy)
-                            subject = self._decode_header_value(msg.get("Subject", ""))
-                            if not self._is_recent_message(msg, otp_sent_at):
+                            subject, text, _from_header, sent_at = self._extract_message_bundle_from_raw(raw)
+                            if not self._is_recent_timestamp(sent_at, otp_sent_at):
                                 continue
-                            text = self._extract_message_text(msg)
                             code = self._extract_code(text)
                             if not code:
                                 continue
@@ -1518,6 +1594,8 @@ class OutlookLocalProvider(ProviderBase):
                                 f"[OutlookLocal] 最近验证码: provider={provider_name} mailbox={mailbox} "
                                 f"subject={self._subject_preview(subject)} code={code} status={status_text}"
                             )
+                            if not fallback_code and code not in exclude_codes:
+                                fallback_code = code
                             seen_logs += 1
                             if seen_logs >= max(int(limit or 0), 1):
                                 return
@@ -1530,6 +1608,9 @@ class OutlookLocalProvider(ProviderBase):
                 self._log(f"[OutlookLocal] 最近验证码回溯失败: provider={provider_name} error={exc}")
         if seen_logs == 0:
             self._log("[OutlookLocal] 最近未发现可提取的验证码")
+        elif fallback_code:
+            self._log(f"[OutlookLocal] 最近验证码回溯命中未使用验证码，将直接返回: {fallback_code}")
+        return fallback_code
 
     def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
         if not self._account:
@@ -1539,6 +1620,7 @@ class OutlookLocalProvider(ProviderBase):
         exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
         deadline = time.monotonic() + max(int(timeout or 0), 1)
         provider_order = self._read_provider_order()
+        provider_order_all = self._read_provider_order(include_disabled=True)
         fixed_preferred_provider = str(self._preferred_provider or "").strip()
 
         try:
@@ -1547,12 +1629,20 @@ class OutlookLocalProvider(ProviderBase):
             while time.monotonic() < deadline:
                 self._interrupt(interrupt_check)
                 elapsed_now = int(time.monotonic() - started_at)
+                current_order = (fixed_preferred_provider,) if fixed_preferred_provider else provider_order
                 if elapsed_now >= last_progress_log + 10:
                     last_progress_log = elapsed_now
-                    self._log(f"[OutlookLocal] 等待验证码进度: elapsed={elapsed_now}s timeout={int(timeout or 0)}s")
+                    self._log(
+                        f"[OutlookLocal] 等待验证码进度: elapsed={elapsed_now}s timeout={int(timeout or 0)}s providers={','.join(current_order) if current_order else '-'}"
+                    )
                 poll_had_success = False
                 fatal_errors: list[str] = []
                 current_order = (fixed_preferred_provider,) if fixed_preferred_provider else provider_order
+                if not current_order and provider_order_all:
+                    current_order = provider_order_all
+                    self._log(
+                        f"[OutlookLocal] 所有 provider 目前均处于禁用窗口，强制调试扫描: providers={','.join(current_order)}"
+                    )
                 for provider_name in current_order:
                     self._interrupt(interrupt_check)
                     try:
@@ -1562,15 +1652,17 @@ class OutlookLocalProvider(ProviderBase):
                             code = self._scan_imap_for_code(provider_name, otp_sent_at=otp_sent_at, exclude_codes=exclude_codes)
                         poll_had_success = True
                         self._record_provider_success(provider_name)
-                        self._lock_provider(provider_name, strict=True)
                         self._last_provider_errors.pop(provider_name, None)
                         if code:
                             return code
                     except Exception as exc:
                         error_text = str(exc)
+                        trace = traceback.format_exc(limit=3).strip().replace("\n", " | ")
                         self._last_provider_errors[provider_name] = error_text
                         self._record_provider_failure(provider_name, error_text)
-                        self._log(f"[OutlookLocal] provider 失败: provider={provider_name} error={error_text}")
+                        self._log(
+                            f"[OutlookLocal] provider 失败: provider={provider_name} error={error_text} trace={trace}"
+                        )
                         if self._is_fatal_mail_auth_error(error_text):
                             fatal_errors.append(f"{provider_name}: {error_text}")
                         continue
@@ -1584,7 +1676,10 @@ class OutlookLocalProvider(ProviderBase):
         finally:
             pass
 
-        self._log_recent_code_snapshot(exclude_codes=exclude_codes, otp_sent_at=otp_sent_at)
+        fallback_code = self._log_recent_code_snapshot(exclude_codes=exclude_codes, otp_sent_at=otp_sent_at)
+        if fallback_code and fallback_code not in exclude_codes:
+            self._log(f"[OutlookLocal] 超时回溯后返回未使用验证码: {fallback_code}")
+            return fallback_code
         raise TimeoutError(f"Outlook 本地邮箱等待验证码超时 ({timeout}s)")
 
     def get_invitation_link(self, email=None, timeout: int = 180, invite_sent_at=None, **kwargs):

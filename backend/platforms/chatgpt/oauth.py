@@ -128,24 +128,28 @@ def _post_form(
 ) -> Dict[str, Any]:
     """
     发送 POST 表单请求
-
+    
     Args:
         url: 请求 URL
         data: 表单数据
         timeout: 超时时间
         proxy_url: 代理 URL
-
+    
     Returns:
         响应 JSON 数据
     """
-    # 构建代理配置
     proxies = build_requests_proxy_config(proxy_url)
+    oauth_origin = urllib.parse.urlsplit(OAUTH_AUTH_URL).scheme + "://" + urllib.parse.urlsplit(OAUTH_AUTH_URL).netloc
 
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": oauth_origin,
+        "Referer": f"{oauth_origin}/sign-in-with-chatgpt/codex/consent",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
     try:
