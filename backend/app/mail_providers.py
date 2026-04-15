@@ -37,6 +37,74 @@ class ProviderBase:
     log_fn: callable | None = None
     fixed_email: str | None = None
 
+    def _ensure_code_tracking_state(self) -> None:
+        if not hasattr(self, "_used_codes") or not isinstance(getattr(self, "_used_codes", None), set):
+            self._used_codes = set()
+        if not hasattr(self, "_last_code"):
+            self._last_code = ""
+        if not hasattr(self, "_last_code_at"):
+            self._last_code_at = 0.0
+        if not hasattr(self, "_last_success_code"):
+            self._last_success_code = ""
+        if not hasattr(self, "_last_success_code_at"):
+            self._last_success_code_at = 0.0
+
+    @property
+    def last_code(self) -> str:
+        self._ensure_code_tracking_state()
+        return self._last_success_code or self._last_code
+
+    def _remember_code(self, code: str, *, successful: bool = False) -> None:
+        self._ensure_code_tracking_state()
+        code = str(code or "").strip()
+        if not code:
+            return
+        now = time.time()
+        self._last_code = code
+        self._last_code_at = now
+        self._used_codes.add(code)
+        if successful:
+            self._last_success_code = code
+            self._last_success_code_at = now
+
+    def remember_successful_code(self, code: str) -> None:
+        self._remember_code(code, successful=True)
+
+    def get_recent_code(self, max_age_seconds: int = 180, *, prefer_successful: bool = True) -> str:
+        self._ensure_code_tracking_state()
+        now = time.time()
+        if (
+            prefer_successful
+            and self._last_success_code
+            and now - self._last_success_code_at <= max_age_seconds
+        ):
+            return self._last_success_code
+        if self._last_code and now - self._last_code_at <= max_age_seconds:
+            return self._last_code
+        return ""
+
+    def extract_verification_code(self, text: str) -> Optional[str]:
+        return self._extract_code(text)
+
+    def wait_for_verification_code(
+        self,
+        email: str,
+        timeout: int = 90,
+        otp_sent_at: float | None = None,
+        exclude_codes=None,
+    ):
+        exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
+        code = self.get_verification_code(
+            email=email,
+            timeout=timeout,
+            otp_sent_at=otp_sent_at,
+            exclude_codes=exclude_codes,
+        )
+        code = str(code or "").strip()
+        if code:
+            self._remember_code(code, successful=False)
+        return code
+
     def _log(self, message: str) -> None:
         if callable(self.log_fn):
             self.log_fn(message)
@@ -1557,7 +1625,7 @@ class OutlookLocalProvider(ProviderBase):
                             fallback_code = code
                         seen_logs += 1
                         if seen_logs >= max(int(limit or 0), 1):
-                            return
+                            return fallback_code
                     continue
 
                 conn = self._open_imap(provider_name)
@@ -1600,7 +1668,7 @@ class OutlookLocalProvider(ProviderBase):
                                 fallback_code = code
                             seen_logs += 1
                             if seen_logs >= max(int(limit or 0), 1):
-                                return
+                                return fallback_code
                 finally:
                     try:
                         conn.logout()

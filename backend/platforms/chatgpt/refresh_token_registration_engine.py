@@ -249,6 +249,15 @@ class RefreshTokenRegistrationEngine:
     def _create_email(self) -> bool:
         self._create_email_error = ""
         try:
+            existing_email_info = dict(self.email_info or {}) if isinstance(self.email_info, dict) else {}
+            fixed_email = str(self.email or existing_email_info.get("email") or "").strip()
+            if fixed_email and existing_email_info:
+                self.email_info = existing_email_info
+                self.email_info["email"] = fixed_email
+                self.email = fixed_email
+                self._log(f"复用已取出的邮箱: {self.email}")
+                return True
+
             self._log(f"正在创建 {self.email_service.service_type.value} 邮箱...")
             self.email_info = self.email_service.create_email()
 
@@ -520,6 +529,10 @@ class RefreshTokenRegistrationEngine:
                 interrupt_check=self.interrupt_check,
             )
 
+            register_only_before_invite = bool(
+                self.extra_config.get("codex_team_register_only_before_invite")
+                or self.extra_config.get("register_only_before_invite")
+            )
             direct_oauth_retry = retry_resume_stage in {"about_you", "workspace_select", "token_exchange"} or (
                 retry_resume_origin == "oauth" and retry_resume_stage in {"authorize_continue", "otp"}
             )
@@ -572,6 +585,39 @@ class RefreshTokenRegistrationEngine:
                         "注册状态机返回成功但未停在 about_you。"
                         "将继续进入 OAuth 会话，按状态机实际返回推进。"
                     )
+
+            if register_only_before_invite:
+                if not registered:
+                    last_error = f"注册后停止模式未能完成注册阶段: {registration_message or 'unknown'}"
+                    result.error_message = last_error
+                    result.metadata = self._build_failure_metadata(
+                        stage=str(getattr(register_client, "last_stage", "") or "register_flow"),
+                        origin="register",
+                        detail=last_error,
+                        resume_supported=bool(result.email),
+                    )
+                    return result
+                result.success = True
+                result.email = self.email or ""
+                result.password = self.password or ""
+                result.source = source
+                result.metadata = {
+                    "email_service": self.email_service.service_type.value,
+                    "proxy_used": self.proxy_url,
+                    "registered_at": datetime.now().isoformat(),
+                    "registration_message": registration_message,
+                    "registration_flow": "chatgpt_client.register_complete_flow",
+                    "browser_mode": self.browser_mode,
+                    "email_binding": (
+                        dict((self.email_info or {}).get("account") or {})
+                        if isinstance((self.email_info or {}).get("account"), dict)
+                        else {}
+                    ),
+                    "register_only_before_invite": True,
+                }
+                self._log("3. 已按配置在注册完成后停止，等待后续邀请完成后再进行 Codex OAuth")
+                self._log("=" * 60)
+                return result
 
             oauth_client = self._build_oauth_client()
             oauth_client.config.setdefault(

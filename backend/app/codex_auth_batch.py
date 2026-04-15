@@ -114,33 +114,47 @@ def authorize_codex_account_via_outlook(
         interrupt_check=interrupt_check,
     )
 
-    client = ChatGPTWebAuthClient(
-        config=provider_config,
-        proxy=proxy_url or None,
-        verbose=False,
-        browser_mode=str(executor_type or "protocol"),
-    )
-    client._log = lambda message: logger(str(message or ""))
+    max_retry_count = 3
+    last_error = "Codex 授权失败"
+    tokens = None
+    for attempt in range(1, max_retry_count + 2):
+        client = ChatGPTWebAuthClient(
+            config=provider_config,
+            proxy=proxy_url or None,
+            verbose=False,
+            browser_mode=str(executor_type or "protocol"),
+        )
+        client._log = lambda message: logger(str(message or ""))
 
-    tokens = client.login_and_get_tokens(
-        email=email,
-        password=password,
-        device_id="",
-        user_agent=None,
-        sec_ch_ua=None,
-        impersonate=None,
-        skymail_client=email_adapter,
-        prefer_passwordless_login=True,
-        allow_phone_verification=False,
-        force_new_browser=True,
-        force_chatgpt_entry=True,
-        screen_hint="login",
-        force_password_login=False,
-        complete_about_you_if_needed=False,
-        login_source="codex_auth_batch",
-    )
+        logger(f"开始 Codex OAuth 尝试: {attempt}/{max_retry_count + 1}")
+        tokens = client.login_and_get_tokens(
+            email=email,
+            password=password,
+            device_id="",
+            user_agent=None,
+            sec_ch_ua=None,
+            impersonate=None,
+            skymail_client=email_adapter,
+            prefer_passwordless_login=True,
+            allow_phone_verification=False,
+            force_new_browser=True,
+            force_chatgpt_entry=True,
+            screen_hint="login",
+            force_password_login=False,
+            complete_about_you_if_needed=False,
+            login_source="codex_auth_batch",
+        )
+        if tokens:
+            break
+        last_error = str(client.last_error or "Codex 授权失败")
+        if attempt <= max_retry_count:
+            logger(f"Codex OAuth 尝试失败 {attempt}/{max_retry_count + 1}: {last_error}；准备重试")
+            time.sleep(min(5, attempt))
+            continue
+        return {"success": False, "error": last_error}
+
     if not tokens:
-        return {"success": False, "error": str(client.last_error or "Codex 授权失败")}
+        return {"success": False, "error": last_error}
 
     result_obj = SimpleNamespace(
         email=email,

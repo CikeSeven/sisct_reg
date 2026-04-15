@@ -35,33 +35,55 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
         with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
-            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls, \
+            patch('app.codex_team_manager.ChatGPTWebAuthClient') as web_auth_cls, \
+            patch('app.codex_team_manager.random.randint', return_value=5), \
+            patch('app.codex_team_manager.time.sleep', return_value=None):
             client = client_cls.return_value
+            client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
             client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
-            client.accept_invite = Mock(return_value={'success': True, 'error': ''})
             engine = engine_cls.return_value
             engine.run.return_value = Mock(
                 success=True,
                 email='child@example.com',
-                password='mail-pass',
+                password='chatgpt-pass',
                 account_id='acct-1',
-                workspace_id='org-1',
-                access_token='child-at',
-                refresh_token='child-rt',
-                id_token='child-id',
-                session_token='child-st',
+                workspace_id='personal-1',
+                access_token='child-at-register',
+                refresh_token='child-rt-register',
+                id_token='child-id-register',
+                session_token='child-st-register',
                 error_message='',
-                metadata={'plan_type': 'team', 'account_role': 'standard-user'},
+                metadata={'plan_type': 'free', 'account_role': 'owner'},
             )
+            web_auth = web_auth_cls.return_value
+            web_auth.login_and_select_workspace.return_value = {'success': True, 'selected_workspace_id': 'parent-acct', 'next_auth_session_token': 'web-st'}
+            web_auth.login_and_get_session.return_value = {
+                'success': True,
+                'email': 'child@example.com',
+                'selected_workspace_id': 'parent-acct',
+                'selected_workspace_kind': 'organization',
+                'account_id': 'acct-team',
+                'next_auth_session_token': 'child-st',
+                'access_token': 'child-at',
+                'refresh_token': 'child-rt',
+                'id_token': 'child-id',
+                'user_id': 'user-1',
+                'display_name': 'Child Name',
+                'cookie_jar': [{'name': 'a', 'value': 'b'}],
+                'info': {'plan_type': 'team', 'account_role': 'standard-user'},
+                'error': '',
+            }
             manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
 
         engine_cls.assert_called_once()
+        web_auth_cls.assert_called_once()
         snapshot = manager.get_job_snapshot(job_id)
         sessions = list_codex_team_web_sessions(job_id=job_id)
         self.assertEqual('done', snapshot['status'])
         self.assertEqual(1, snapshot['success'])
         self.assertEqual(1, len(sessions))
-        self.assertEqual('org-1', sessions[0]['selected_workspace_id'])
+        self.assertEqual('parent-acct', sessions[0]['selected_workspace_id'])
         self.assertEqual('child-at', sessions[0]['access_token'])
 
     def test_process_account_failure_without_team_workspace_marks_failed(self):
@@ -69,24 +91,33 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
 
         with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
-            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls, \
+            patch('app.codex_team_manager.ChatGPTWebAuthClient') as web_auth_cls, \
+            patch('app.codex_team_manager.random.randint', return_value=5), \
+            patch('app.codex_team_manager.time.sleep', return_value=None):
             client = client_cls.return_value
             client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
             client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
             engine = engine_cls.return_value
             engine.run.return_value = Mock(
-                success=False,
+                success=True,
                 email='child@example.com',
-                password='mail-pass',
-                account_id='',
-                workspace_id='',
-                access_token='',
-                refresh_token='',
-                id_token='',
-                session_token='',
-                error_message='没有可用的 team workspace',
+                password='chatgpt-pass',
+                account_id='acct-1',
+                workspace_id='personal-1',
+                access_token='child-at-register',
+                refresh_token='child-rt-register',
+                id_token='child-id-register',
+                session_token='child-st-register',
+                error_message='',
                 metadata={},
             )
+            web_auth = web_auth_cls.return_value
+            web_auth.login_and_select_workspace.return_value = {'success': True, 'selected_workspace_id': 'parent-acct', 'next_auth_session_token': 'web-st'}
+            web_auth.login_and_get_session.return_value = {
+                'success': False,
+                'error': '没有可用的 team workspace',
+            }
             manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
 
         snapshot = manager.get_job_snapshot(job_id)
@@ -96,15 +127,30 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertEqual(1, snapshot['failed'])
         self.assertIn('team workspace', sessions[0]['error'])
 
-    def test_process_account_invite_failure_marks_failed_without_login(self):
+    def test_process_account_invite_failure_marks_failed_after_registration(self):
         manager, job_id, job = self._make_job()
 
         with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
-            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls, \
+            patch('app.codex_team_manager.ChatGPTWebAuthClient') as web_auth_cls:
             client = client_cls.return_value
             client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
             client.send_invite = Mock(return_value={'success': False, 'invite_id': '', 'error': 'invite denied'})
+            engine = engine_cls.return_value
+            engine.run.return_value = Mock(
+                success=True,
+                email='child@example.com',
+                password='chatgpt-pass',
+                account_id='acct-1',
+                workspace_id='personal-1',
+                access_token='child-at-register',
+                refresh_token='child-rt-register',
+                id_token='child-id-register',
+                session_token='child-st-register',
+                error_message='',
+                metadata={},
+            )
             manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
 
         snapshot = manager.get_job_snapshot(job_id)
@@ -112,41 +158,63 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertEqual(0, snapshot['success'])
         self.assertEqual(1, snapshot['failed'])
         self.assertIn('invite denied', sessions[0]['error'])
-        engine_cls.assert_not_called()
+        engine_cls.assert_called_once()
+        web_auth_cls.assert_not_called()
 
     def test_process_account_reuses_existing_pending_invite_after_send_failure(self):
         manager, job_id, job = self._make_job()
 
         with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
-            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls:
+            patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls, \
+            patch('app.codex_team_manager.ChatGPTWebAuthClient') as web_auth_cls, \
+            patch('app.codex_team_manager.random.randint', return_value=5), \
+            patch('app.codex_team_manager.time.sleep', return_value=None):
             client = client_cls.return_value
             client.get_invites = Mock(side_effect=[
                 {'success': True, 'items': [], 'total': 0, 'error': ''},
                 {'success': True, 'items': [{'id': 'inv-existing', 'email_address': 'child@example.com'}], 'total': 1, 'error': ''},
             ])
             client.send_invite = Mock(return_value={'success': False, 'invite_id': '', 'error': 'invite denied'})
-            client.accept_invite = Mock(return_value={'success': True, 'error': ''})
             engine = engine_cls.return_value
             engine.run.return_value = Mock(
                 success=True,
                 email='child@example.com',
-                password='mail-pass',
+                password='chatgpt-pass',
                 account_id='acct-1',
-                workspace_id='org-1',
-                access_token='child-at',
-                refresh_token='child-rt',
-                id_token='child-id',
-                session_token='child-st',
+                workspace_id='personal-1',
+                access_token='child-at-register',
+                refresh_token='child-rt-register',
+                id_token='child-id-register',
+                session_token='child-st-register',
                 error_message='',
-                metadata={'plan_type': 'team', 'account_role': 'standard-user'},
+                metadata={'plan_type': 'free', 'account_role': 'owner'},
             )
+            web_auth = web_auth_cls.return_value
+            web_auth.login_and_select_workspace.return_value = {'success': True, 'selected_workspace_id': 'parent-acct', 'next_auth_session_token': 'web-st'}
+            web_auth.login_and_get_session.return_value = {
+                'success': True,
+                'email': 'child@example.com',
+                'selected_workspace_id': 'parent-acct',
+                'selected_workspace_kind': 'organization',
+                'account_id': 'acct-team',
+                'next_auth_session_token': 'child-st',
+                'access_token': 'child-at',
+                'refresh_token': 'child-rt',
+                'id_token': 'child-id',
+                'user_id': 'user-1',
+                'display_name': 'Child Name',
+                'cookie_jar': [],
+                'info': {'plan_type': 'team', 'account_role': 'standard-user'},
+                'error': '',
+            }
             manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
 
         snapshot = manager.get_job_snapshot(job_id)
         self.assertEqual(1, snapshot['success'])
         self.assertEqual(0, snapshot['failed'])
         engine_cls.assert_called_once()
+        web_auth_cls.assert_called_once()
 
     def test_process_account_retries_registration_on_http_429(self):
         manager, job_id, job = self._make_job()
@@ -154,17 +222,18 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         with patch('app.codex_team_manager.build_mail_provider', return_value=_FakeMailProvider()), \
             patch('app.codex_team_manager.TeamManageStyleClient') as client_cls, \
             patch('app.codex_team_manager.RefreshTokenRegistrationEngine') as engine_cls, \
+            patch('app.codex_team_manager.ChatGPTWebAuthClient') as web_auth_cls, \
+            patch('app.codex_team_manager.random.randint', return_value=5), \
             patch('app.codex_team_manager.time.sleep', return_value=None):
             client = client_cls.return_value
             client.get_invites = Mock(return_value={'success': True, 'items': [], 'total': 0, 'error': ''})
             client.send_invite = Mock(return_value={'success': True, 'invite_id': 'invite-1', 'error': ''})
-            client.accept_invite = Mock(return_value={'success': True, 'error': ''})
             engine = engine_cls.return_value
             engine.run.side_effect = [
                 Mock(
                     success=False,
                     email='child@example.com',
-                    password='mail-pass',
+                    password='chatgpt-pass',
                     account_id='',
                     workspace_id='',
                     access_token='',
@@ -177,24 +246,42 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
                 Mock(
                     success=True,
                     email='child@example.com',
-                    password='mail-pass',
+                    password='chatgpt-pass',
                     account_id='acct-1',
-                    workspace_id='org-1',
-                    access_token='child-at',
-                    refresh_token='child-rt',
-                    id_token='child-id',
-                    session_token='child-st',
+                    workspace_id='personal-1',
+                    access_token='child-at-register',
+                    refresh_token='child-rt-register',
+                    id_token='child-id-register',
+                    session_token='child-st-register',
                     error_message='',
-                    metadata={'plan_type': 'team', 'account_role': 'standard-user'},
+                    metadata={'plan_type': 'free', 'account_role': 'owner'},
                 ),
             ]
+            web_auth = web_auth_cls.return_value
+            web_auth.login_and_select_workspace.return_value = {'success': True, 'selected_workspace_id': 'parent-acct', 'next_auth_session_token': 'web-st'}
+            web_auth.login_and_get_session.return_value = {
+                'success': True,
+                'email': 'child@example.com',
+                'selected_workspace_id': 'parent-acct',
+                'selected_workspace_kind': 'organization',
+                'account_id': 'acct-team',
+                'next_auth_session_token': 'child-st',
+                'access_token': 'child-at',
+                'refresh_token': 'child-rt',
+                'id_token': 'child-id',
+                'user_id': 'user-1',
+                'display_name': 'Child Name',
+                'cookie_jar': [],
+                'info': {'plan_type': 'team', 'account_role': 'standard-user'},
+                'error': '',
+            }
             manager._process_account(job, 1, parent_context={'access_token': 'at-1', 'account_id': 'parent-acct', 'email': 'parent@example.com'})
 
         snapshot = manager.get_job_snapshot(job_id)
         self.assertEqual(1, snapshot['success'])
         self.assertEqual(0, snapshot['failed'])
         self.assertEqual(2, engine.run.call_count)
-
+        web_auth_cls.assert_called_once()
 
 
 
@@ -245,8 +332,9 @@ class CodexTeamManagerTests(IsolatedCodexTeamDbTestCase, unittest.TestCase):
         self.assertEqual(1, summary['items'][0]['child_member_count'])
         self.assertTrue(any('当前子号数=1' in str(item.get('message') or '') for item in job.events))
 
-    def test_default_register_otp_wait_seconds_is_60(self):
-        self.assertEqual(60, int(DEFAULT_CONFIG['chatgpt_register_otp_wait_seconds']))
+    def test_default_register_otp_wait_seconds_is_180(self):
+        self.assertEqual(180, int(DEFAULT_CONFIG['chatgpt_register_otp_wait_seconds']))
+        self.assertEqual(180, int(DEFAULT_CONFIG['chatgpt_oauth_otp_wait_seconds']))
 
     def test_parent_pool_job_stops_when_outlook_pool_is_empty(self):
         manager = CodexTeamManager()

@@ -34,13 +34,20 @@ from .sentinel_token import build_sentinel_token
 from .sentinel_browser import get_sentinel_token_via_browser
 
 
-def choose_codex_consent_workspace(workspaces):
+def choose_codex_consent_workspace(workspaces, preferred_workspace_id: str = ""):
     items = [dict(item or {}) for item in (workspaces or []) if isinstance(item, dict)]
     if not items:
         return None
 
+    preferred_workspace_id = str(preferred_workspace_id or "").strip()
+
     def workspace_id(item):
         return str(item.get("id") or item.get("workspace_id") or item.get("account_id") or "").strip()
+
+    if preferred_workspace_id:
+        for item in items:
+            if workspace_id(item) == preferred_workspace_id:
+                return item
 
     for item in items:
         kind = str(item.get("kind") or item.get("workspace_type") or item.get("account_type") or "").strip().lower()
@@ -1011,6 +1018,8 @@ class OAuthClient:
                 time.sleep(1.2 + attempt * 0.8)
                 continue
 
+            if not authorize_final_url and combined_error:
+                self._set_error(f"Bootstrap 失败: {combined_error[:240]}")
             return authorize_final_url
 
         return last_authorize_final_url
@@ -1673,7 +1682,7 @@ class OAuthClient:
             impersonate=impersonate,
         )
         if not authorize_final_url:
-            self._set_error("Bootstrap 失败")
+            self._set_error(self.last_error or "Bootstrap 失败")
             return None
 
         continue_referer = f"{self.oauth_issuer}/create-account"
@@ -2163,7 +2172,7 @@ class OAuthClient:
             impersonate=impersonate,
         )
         if not authorize_final_url:
-            self._set_error("Bootstrap 失败")
+            self._set_error(self.last_error or "Bootstrap 失败")
             return None
 
         continue_referer = (
@@ -2610,7 +2619,14 @@ class OAuthClient:
             self._set_error("session 中没有 workspace 信息")
             return None, None
 
-        selected_workspace = choose_codex_consent_workspace(workspaces)
+        selected_workspace = choose_codex_consent_workspace(
+            workspaces,
+            preferred_workspace_id=str(
+                self.config.get("codex_preferred_workspace_id")
+                or self.config.get("preferred_workspace_id")
+                or ""
+            ),
+        )
         if not selected_workspace:
             self._set_error("未找到可用的 Codex workspace")
             return None, None
@@ -3518,7 +3534,7 @@ class OAuthClient:
         if not hasattr(skymail_client, "_used_codes"):
             skymail_client._used_codes = set()
 
-        tried_codes = set(getattr(skymail_client, "_used_codes", set()))
+        tried_codes = set()
         try:
             otp_wait_seconds = int(
                 self.config.get(

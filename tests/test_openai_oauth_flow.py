@@ -78,6 +78,16 @@ class OAuthFlowTests(unittest.TestCase):
         ])
         self.assertEqual('org-1', workspace['id'])
 
+    def test_choose_codex_consent_workspace_honors_preferred_workspace(self):
+        workspace = choose_codex_consent_workspace(
+            [
+                {'id': 'org-1', 'kind': 'organization', 'name': 'Org One'},
+                {'id': 'org-2', 'kind': 'organization', 'name': 'Org Two'},
+            ],
+            preferred_workspace_id='org-2',
+        )
+        self.assertEqual('org-2', workspace['id'])
+
 
 if __name__ == '__main__':
     unittest.main()

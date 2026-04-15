@@ -40,6 +40,22 @@ class OutlookLocalMailParsingTests(unittest.TestCase):
         result = provider.create_email()
         self.assertEqual('user@example.com', result['email'])
 
+    def test_outlook_provider_exposes_oauth_wait_adapter(self):
+        provider = OutlookLocalProvider(fixed_account={})
+        provider.get_verification_code = lambda **kwargs: '654321'
+
+        code = provider.wait_for_verification_code(
+            'user@example.com',
+            timeout=1,
+            otp_sent_at=123.0,
+            exclude_codes=set(),
+        )
+
+        self.assertEqual('654321', code)
+        self.assertEqual('654321', provider.get_recent_code())
+        provider.remember_successful_code('123456')
+        self.assertEqual('123456', provider.get_recent_code(prefer_successful=True))
+
 
 
 if __name__ == '__main__':

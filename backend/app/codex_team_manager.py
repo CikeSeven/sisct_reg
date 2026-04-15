@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import uuid
@@ -32,10 +33,10 @@ from .manager import RegistrationManager
 from .mail_providers import build_mail_provider
 from .codex_team_parent_login import login_parent_via_outlook, parse_outlook_parent_import_data
 from platforms.chatgpt.refresh_token_registration_engine import RefreshTokenRegistrationEngine
+from platforms.chatgpt.chatgpt_web_auth import ChatGPTWebAuthClient
 from platforms.chatgpt.team_manage_style_client import TeamManageStyleClient
 from .external_uploads import generate_cpa_token_json
 from platforms.chatgpt.team_invite import (
-    accept_team_invite,
     resolve_parent_invite_context as resolve_parent_invite_context_from_token,
 )
 
@@ -615,104 +616,13 @@ class CodexTeamManager:
             append_codex_team_job_event(job.id, f"子号邮箱取出成功: {child_email}", account_email=child_email)
             append_codex_team_job_event(job.id, f"开始处理子号 #{attempt_index}", account_email=child_email)
 
-            active_parent_context = dict(parent_context or self._ensure_parent_invite_context(job))
-            parent_identifier = str(active_parent_context.get("email") or active_parent_context.get("account_id") or "default")
-            client = self._get_team_client(parent_identifier, proxy_url or None)
-            append_codex_team_job_event(job.id, "检查是否存在待接受邀请", account_email=child_email)
-            invites_before = client.get_invites(
-                access_token=str(active_parent_context.get("access_token") or ""),
-                account_id=str(active_parent_context.get("account_id") or ""),
-                identifier=parent_identifier,
-            )
-            pending_before = self._find_pending_invite(invites_before, child_email) if invites_before.get("success") else None
-            if pending_before:
-                append_codex_team_job_event(
-                    job.id,
-                    f"复用已有待接受邀请: invite_id={str(pending_before.get('id') or '-')}",
-                    account_email=child_email,
-                )
-                invite_result = {
-                    "success": True,
-                    "invite_id": str(pending_before.get("id") or "").strip(),
-                    "error": "",
-                    "data": {"reused_existing_invite": True, "invite": pending_before},
-                }
-            else:
-                invite_result = client.send_invite(
-                    access_token=str(active_parent_context.get("access_token") or ""),
-                    account_id=str(active_parent_context.get("account_id") or ""),
-                    email=child_email,
-                    identifier=parent_identifier,
-                )
-            self._check_job_stop(job)
-            if not invite_result.get("success"):
-                append_codex_team_job_event(job.id, "邀请失败后复查待接受邀请列表", account_email=child_email)
-                invites_after = client.get_invites(
-                    access_token=str(active_parent_context.get("access_token") or ""),
-                    account_id=str(active_parent_context.get("account_id") or ""),
-                    identifier=parent_identifier,
-                )
-                pending_after = self._find_pending_invite(invites_after, child_email) if invites_after.get("success") else None
-                if pending_after:
-                    invite_result = {
-                        "success": True,
-                        "invite_id": str(pending_after.get("id") or "").strip(),
-                        "error": "",
-                        "data": {"reused_existing_invite": True, "invite": pending_after},
-                    }
-                    append_codex_team_job_event(
-                        job.id,
-                        f"邀请接口失败，但检测到已存在待接受邀请，继续复用: invite_id={str(invite_result.get('invite_id') or '-')}",
-                        account_email=child_email,
-                    )
-                else:
-                    error_message = str(invite_result.get("error") or "发送邀请失败")
-                    insert_codex_team_web_session(
-                        job_id=job.id,
-                        email=child_email,
-                        status="failed",
-                        selected_workspace_id="",
-                        selected_workspace_kind="",
-                        account_id="",
-                        next_auth_session_token="",
-                        cookie_jar=[],
-                        error=error_message,
-                    )
-                    append_codex_team_job_event(
-                        job.id,
-                        f"母号邀请失败: {error_message}",
-                        level="error",
-                        account_email=child_email,
-                    )
-                    setattr(job, "_last_account_halt_parent", True)
-                    self._increment(job, failed=1)
-                    return False
-            append_codex_team_job_event(
-                job.id,
-                f"母号邀请已发送: invite_id={str(invite_result.get('invite_id') or '-')}",
-                account_email=child_email,
-            )
-            append_codex_team_job_event(job.id, "开始等待邀请链接邮件", account_email=child_email)
-            invite_link = provider.get_invitation_link(
-                email=child_email,
-                timeout=int(job.merged_config.get("chatgpt_invite_link_wait_seconds") or 300),
-                invite_sent_at=time.time(),
-                interrupt_check=lambda current_job=job: self._check_job_stop(current_job),
-            )
-            self._check_job_stop(job)
-            append_codex_team_job_event(
-                job.id,
-                f"已获取邀请链接: {invite_link[:180]}",
-                account_email=child_email,
-            )
-
             engine = RefreshTokenRegistrationEngine(
                 email_service=provider,
                 proxy_url=proxy_url or None,
                 callback_logger=lambda message: append_codex_team_job_event(job.id, str(message or ""), account_email=child_email),
                 task_uuid=f"{job.id}:{attempt_index}",
                 browser_mode=str(job.request_payload.get("executor_type") or "protocol"),
-                extra_config=dict(job.merged_config),
+                extra_config={**dict(job.merged_config), "codex_team_register_only_before_invite": True},
                 interrupt_check=lambda current_job=job: self._check_job_stop(current_job),
             )
             engine.email = child_email
@@ -742,9 +652,10 @@ class CodexTeamManager:
             result = {
                 "success": bool(getattr(result_obj, "success", False)),
                 "email": str(getattr(result_obj, "email", "") or child_email),
+                "password": str(getattr(result_obj, "password", "") or ""),
                 "selected_workspace_id": str(getattr(result_obj, "workspace_id", "") or ""),
                 "selected_workspace_kind": "organization" if getattr(result_obj, "workspace_id", "") else "",
-                "invite_workspace_id": str(active_parent_context.get("account_id") or ""),
+                "invite_workspace_id": "",
                 "account_id": str(getattr(result_obj, "account_id", "") or ""),
                 "next_auth_session_token": str(getattr(result_obj, "session_token", "") or ""),
                 "access_token": str(getattr(result_obj, "access_token", "") or ""),
@@ -756,16 +667,169 @@ class CodexTeamManager:
                 "info": dict(getattr(result_obj, "metadata", {}) or {}),
                 "error": str(getattr(result_obj, "error_message", "") or ""),
             }
-            if result.get("success") and result.get("access_token") and result.get("invite_workspace_id"):
+            if result.get("success"):
                 self._check_job_stop(job)
-                accept_result = client.accept_invite(
-                    access_token=str(result.get("access_token") or ""),
-                    account_id=str(result.get("invite_workspace_id") or ""),
-                    identifier=parent_identifier,
-                )
-                if not accept_result.get("success"):
+                try:
+                    active_parent_context = dict(parent_context or self._ensure_parent_invite_context(job))
+                    parent_identifier = str(active_parent_context.get("email") or active_parent_context.get("account_id") or "default")
+                    client = self._get_team_client(parent_identifier, proxy_url or None)
+                    result["invite_workspace_id"] = str(active_parent_context.get("account_id") or "")
+                    append_codex_team_job_event(job.id, "子号注册成功，开始处理母号邀请", account_email=child_email)
+                    registered_email = str(result.get("email") or child_email)
+                    append_codex_team_job_event(job.id, "检查是否存在待接受邀请", account_email=child_email)
+                    invites_before = client.get_invites(
+                        access_token=str(active_parent_context.get("access_token") or ""),
+                        account_id=str(active_parent_context.get("account_id") or ""),
+                        identifier=parent_identifier,
+                    )
+                    pending_before = self._find_pending_invite(invites_before, registered_email) if invites_before.get("success") else None
+                    if pending_before:
+                        append_codex_team_job_event(
+                            job.id,
+                            f"复用已有待接受邀请: invite_id={str(pending_before.get('id') or '-')}",
+                            account_email=child_email,
+                        )
+                        invite_result = {
+                            "success": True,
+                            "invite_id": str(pending_before.get("id") or "").strip(),
+                            "error": "",
+                            "data": {"reused_existing_invite": True, "invite": pending_before},
+                        }
+                    else:
+                        invite_result = client.send_invite(
+                            access_token=str(active_parent_context.get("access_token") or ""),
+                            account_id=str(active_parent_context.get("account_id") or ""),
+                            email=registered_email,
+                            identifier=parent_identifier,
+                        )
+                    self._check_job_stop(job)
+                    if not invite_result.get("success"):
+                        append_codex_team_job_event(job.id, "邀请失败后复查待接受邀请列表", account_email=child_email)
+                        invites_after = client.get_invites(
+                            access_token=str(active_parent_context.get("access_token") or ""),
+                            account_id=str(active_parent_context.get("account_id") or ""),
+                            identifier=parent_identifier,
+                        )
+                        pending_after = self._find_pending_invite(invites_after, registered_email) if invites_after.get("success") else None
+                        if pending_after:
+                            invite_result = {
+                                "success": True,
+                                "invite_id": str(pending_after.get("id") or "").strip(),
+                                "error": "",
+                                "data": {"reused_existing_invite": True, "invite": pending_after},
+                            }
+                            append_codex_team_job_event(
+                                job.id,
+                                f"邀请接口失败，但检测到已存在待接受邀请，继续复用: invite_id={str(invite_result.get('invite_id') or '-')}",
+                                account_email=child_email,
+                            )
+                        else:
+                            error_message = str(invite_result.get("error") or "发送邀请失败")
+                            result["success"] = False
+                            result["error"] = error_message
+                            append_codex_team_job_event(
+                                job.id,
+                                f"母号邀请失败: {error_message}",
+                                level="error",
+                                account_email=child_email,
+                            )
+                    if invite_result.get("success"):
+                        append_codex_team_job_event(
+                            job.id,
+                            f"母号邀请已发送: invite_id={str(invite_result.get('invite_id') or '-')}",
+                            account_email=child_email,
+                        )
+                    if result.get("success") and result.get("invite_workspace_id"):
+                        self._check_job_stop(job)
+                        invite_wait_seconds = int(random.randint(5, 10))
+                        append_codex_team_job_event(
+                            job.id,
+                            f"邀请发送成功，等待 {invite_wait_seconds}s 后开始普通登录切换 Team 工作空间",
+                            account_email=child_email,
+                        )
+                        time.sleep(invite_wait_seconds)
+                        self._check_job_stop(job)
+                        auth_config = dict(job.merged_config)
+                        auth_config["codex_preferred_workspace_id"] = str(result.get("invite_workspace_id") or "")
+                        web_auth_client = ChatGPTWebAuthClient(
+                            config=auth_config,
+                            proxy=proxy_url or None,
+                            verbose=False,
+                            browser_mode=str(job.request_payload.get("executor_type") or "protocol"),
+                        )
+                        web_auth_client._log = lambda message: append_codex_team_job_event(
+                            job.id,
+                            f"[普通登录] {str(message or '')}",
+                            account_email=child_email,
+                        )
+                        login_result = web_auth_client.login_and_select_workspace(
+                            email=registered_email,
+                            password=str(result.get("password") or ""),
+                            skymail_client=provider,
+                            preferred_workspace_id=str(result.get("invite_workspace_id") or ""),
+                        )
+                        if not login_result.get("success"):
+                            result["success"] = False
+                            result["error"] = str(login_result.get("error") or "普通登录选择 Team 工作空间失败")
+                        else:
+                            append_codex_team_job_event(
+                                job.id,
+                                (
+                                    "普通登录成功，已切换 Team 工作空间，开始 Codex 授权登录"
+                                    if login_result.get("workspace_selected")
+                                    else "普通登录成功，已完成基础登录，工作空间留待 Codex 授权阶段获取"
+                                ),
+                                account_email=child_email,
+                            )
+                            web_auth_client._log = lambda message: append_codex_team_job_event(
+                                job.id,
+                                f"[Codex OAuth] {str(message or '')}",
+                                account_email=child_email,
+                            )
+                            auth_result = web_auth_client.login_and_get_session(
+                                email=registered_email,
+                                password=str(result.get("password") or ""),
+                                skymail_client=provider,
+                                executor_type=str(job.request_payload.get("executor_type") or "protocol"),
+                                force_new_browser=False,
+                                force_chatgpt_entry=False,
+                                login_source="child_invite_codex_oauth",
+                                require_web_session=False,
+                            )
+                            if not auth_result.get("success"):
+                                result["success"] = False
+                                result["error"] = str(auth_result.get("error") or "Codex 授权登录失败")
+                            else:
+                                registration_info = dict(result.get("info") or {})
+                                registration_info["web_login"] = dict(login_result)
+                                result.update(
+                                    {
+                                        "selected_workspace_id": str(auth_result.get("selected_workspace_id") or ""),
+                                        "selected_workspace_kind": str(auth_result.get("selected_workspace_kind") or ""),
+                                        "account_id": str(auth_result.get("account_id") or result.get("account_id") or ""),
+                                        "next_auth_session_token": str(auth_result.get("next_auth_session_token") or ""),
+                                        "access_token": str(auth_result.get("access_token") or ""),
+                                        "refresh_token": str(auth_result.get("refresh_token") or ""),
+                                        "id_token": str(auth_result.get("id_token") or ""),
+                                        "user_id": str(auth_result.get("user_id") or ""),
+                                        "display_name": str(auth_result.get("display_name") or ""),
+                                        "cookie_jar": list(auth_result.get("cookie_jar") or []),
+                                        "info": dict(auth_result.get("info") or {}),
+                                        "error": str(auth_result.get("error") or ""),
+                                    }
+                                )
+                                result["info"]["registration"] = registration_info
+                except StopTaskRequested:
+                    raise
+                except Exception as invite_exc:
                     result["success"] = False
-                    result["error"] = str(accept_result.get("error") or "接受邀请失败")
+                    result["error"] = str(invite_exc or "母号邀请流程异常")
+                    append_codex_team_job_event(
+                        job.id,
+                        f"母号邀请流程异常: {str(invite_exc or '')}",
+                        level="error",
+                        account_email=child_email,
+                    )
             success = bool(result.get("success"))
             failure_info = dict(result.get("info") or {})
             if (not success) and bool(failure_info.get("stop_task_on_failure")):

@@ -24,7 +24,8 @@ DEFAULT_CONFIG = {
     "smstome_otp_timeout_seconds": 45,
     "smstome_poll_interval_seconds": 5,
     "smstome_sync_max_pages_per_country": 5,
-    "chatgpt_register_otp_wait_seconds": 60,
+    "chatgpt_register_otp_wait_seconds": 180,
+    "chatgpt_oauth_otp_wait_seconds": 180,
     "chatgpt_register_otp_resend_wait_seconds": 300,
     "chatgpt_invite_link_wait_seconds": 300,
 }

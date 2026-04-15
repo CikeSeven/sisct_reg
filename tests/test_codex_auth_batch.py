@@ -112,6 +112,79 @@ class CodexAuthBatchTests(unittest.TestCase):
         self.assertEqual('123456', code)
 
 
+    def test_authorize_codex_account_retries_three_times_before_success(self):
+        account = {
+            'email': 'parent@example.com',
+            'password': 'mail-pass',
+            'client_id': 'client-id',
+            'refresh_token': 'ms-rt',
+        }
+        access_token = _jwt({
+            'exp': 1800000000,
+            'https://api.openai.com/auth': {'chatgpt_account_id': 'acct-1'},
+            'https://api.openai.com/profile': {'email': 'parent@example.com'},
+        })
+        id_token = _jwt({
+            'email': 'parent@example.com',
+            'https://api.openai.com/auth': {'chatgpt_account_id': 'acct-1'},
+        })
+
+        class _FakeProvider:
+            def create_email(self, config=None):
+                return {'email': 'parent@example.com'}
+
+        with patch('app.codex_auth_batch.build_mail_provider', return_value=_FakeProvider()), \
+            patch('app.codex_auth_batch.ChatGPTWebAuthClient') as client_cls, \
+            patch('app.codex_auth_batch.time.sleep', return_value=None):
+            client = client_cls.return_value
+            client.login_and_get_tokens = Mock(side_effect=[
+                None,
+                None,
+                None,
+                {'access_token': access_token, 'refresh_token': 'openai-rt', 'id_token': id_token},
+            ])
+            client.last_error = '403 blocked'
+            client.last_workspace_id = 'acct-1'
+
+            result = authorize_codex_account_via_outlook(
+                account,
+                merged_config={'use_proxy': False},
+                executor_type='protocol',
+            )
+
+        self.assertTrue(result['success'])
+        self.assertEqual(4, client.login_and_get_tokens.call_count)
+
+    def test_authorize_codex_account_returns_last_error_after_retries(self):
+        account = {
+            'email': 'parent@example.com',
+            'password': 'mail-pass',
+            'client_id': 'client-id',
+            'refresh_token': 'ms-rt',
+        }
+
+        class _FakeProvider:
+            def create_email(self, config=None):
+                return {'email': 'parent@example.com'}
+
+        with patch('app.codex_auth_batch.build_mail_provider', return_value=_FakeProvider()), \
+            patch('app.codex_auth_batch.ChatGPTWebAuthClient') as client_cls, \
+            patch('app.codex_auth_batch.time.sleep', return_value=None):
+            client = client_cls.return_value
+            client.login_and_get_tokens = Mock(return_value=None)
+            client.last_error = '403 blocked'
+
+            result = authorize_codex_account_via_outlook(
+                account,
+                merged_config={'use_proxy': False},
+                executor_type='protocol',
+            )
+
+        self.assertFalse(result['success'])
+        self.assertEqual('403 blocked', result['error'])
+        self.assertEqual(4, client.login_and_get_tokens.call_count)
+
+
     def test_batch_manager_records_success_and_failure_results(self):
         manager = CodexAuthBatchManager()
 
