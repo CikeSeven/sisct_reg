@@ -17,6 +17,8 @@ from .manager import manager
 from .oauth_cpa import router as oauth_cpa_router
 from .outlook_pool import router as outlook_router
 from .proxy_pool import router as proxy_router
+from .team_open import router as team_open_router
+from .team_open_store import finalize_orphaned_team_open_jobs, init_team_open_db
 from .schemas import (
     AppendTaskRequest,
     BatchRetryRequest,
@@ -34,6 +36,7 @@ app.include_router(outlook_router)
 app.include_router(luckmail_pool_router)
 app.include_router(proxy_router)
 app.include_router(codex_team_router)
+app.include_router(team_open_router)
 app.include_router(oauth_cpa_router)
 app.include_router(codex_auth_batch_router)
 
@@ -41,8 +44,10 @@ app.include_router(codex_auth_batch_router)
 @app.on_event("startup")
 def _startup():
     init_db()
+    init_team_open_db()
     finalize_orphaned_tasks()
     finalize_orphaned_codex_team_jobs()
+    finalize_orphaned_team_open_jobs()
 
 
 @app.get("/api/health")

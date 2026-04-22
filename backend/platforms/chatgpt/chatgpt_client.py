@@ -21,7 +21,7 @@ except ImportError:
     sys.exit(1)
 
 from .sentinel_token import build_sentinel_token
-from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_browser import auth_browser_post_json, get_sentinel_token_via_browser, sync_auth_session_via_browser
 from .utils import (
     FlowState,
     build_browser_headers,
@@ -216,31 +216,51 @@ class ChatGPTClient:
             },
         )
 
+    def _sync_auth_browser_session(self, page_url: str, *, reason: str = "") -> None:
+        target_url = str(page_url or "").strip()
+        if not target_url:
+            return
+        try:
+            synced = sync_auth_session_via_browser(
+                session=self.session,
+                target_url=target_url,
+                proxy=self.proxy,
+                headless=self.browser_mode != "headed",
+                device_id=self.device_id,
+                log_fn=lambda msg: self._log(msg),
+            )
+            if synced:
+                self._log(f"auth challenge 预热完成: {reason or target_url}")
+        except Exception as e:
+            self._log(f"auth challenge 预热异常: {e}")
+
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
-        prefer_browser = flow in {"username_password_create", "oauth_create_account"}
+        prefer_browser = flow in {"username_password_create", "oauth_create_account", "authorize_continue"}
         for attempt in range(2):
             if prefer_browser:
-                token, source = self._get_sentinel_token_race(flow=flow, page_url=page_url)
-                if token:
-                    if source == "browser":
-                        self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
-                    else:
-                        self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
-                    return token
-
-            token = None
-            if not prefer_browser:
-                token = build_sentinel_token(
-                    self.session,
-                    self.device_id,
+                token = get_sentinel_token_via_browser(
                     flow=flow,
-                    user_agent=self.ua,
-                    sec_ch_ua=self.sec_ch_ua,
-                    impersonate=self.impersonate,
+                    proxy=self.proxy,
+                    page_url=page_url,
+                    headless=self.browser_mode != "headed",
+                    device_id=self.device_id,
+                    session=self.session,
+                    log_fn=lambda msg: self._log(msg),
                 )
                 if token:
-                    self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+                    self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
                     return token
+            token = build_sentinel_token(
+                self.session,
+                self.device_id,
+                flow=flow,
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                impersonate=self.impersonate,
+            )
+            if token:
+                self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+                return token
             if attempt < 1:
                 self._log(f"{flow}: sentinel 获取失败，准备重试")
                 time.sleep(1.0)
@@ -757,6 +777,7 @@ class ChatGPTClient:
             "prompt": "login",
             "ext-oai-did": self.device_id,
             "auth_session_logging_id": str(uuid.uuid4()),
+            "ext-passkey-client-capabilities": "0101",
             "screen_hint": "login_or_signup",
             "login_hint": email,
         }
@@ -881,6 +902,11 @@ class ChatGPTClient:
         headers.update(generate_datadog_trace())
         headers["oai-device-id"] = self.device_id
 
+        self._sync_auth_browser_session(
+            f"{self.AUTH}/create-account/password",
+            reason="register_user_pre_sentinel",
+        )
+
         sentinel_token = self._get_sentinel_token(
             "username_password_create",
             page_url=f"{self.AUTH}/create-account/password",
@@ -894,6 +920,10 @@ class ChatGPTClient:
         }
 
         try:
+            self._sync_auth_browser_session(
+                f"{self.AUTH}/create-account/password",
+                reason="register_user_pre_post",
+            )
             self._browser_pause()
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
 

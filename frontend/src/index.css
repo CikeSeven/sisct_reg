@@ -385,6 +385,14 @@ button:disabled {
   gap: 12px;
 }
 
+ .team-open-log-list {
+  min-height: 280px;
+  max-height: 520px;
+  overflow: auto;
+  padding-right: 6px;
+  align-content: start;
+}
+
 .timeline-item {
   display: grid;
   grid-template-columns: 12px 1fr;

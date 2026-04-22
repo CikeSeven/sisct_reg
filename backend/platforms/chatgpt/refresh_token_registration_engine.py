@@ -45,6 +45,7 @@ class RegistrationResult:
     logs: list | None = None
     metadata: dict | None = None
     source: str = "register"
+    session: Any = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -329,7 +330,7 @@ class RefreshTokenRegistrationEngine:
             browser_mode=self.browser_mode,
             extra_config=self.extra_config,
         )
-        client._log = lambda msg: self._log(f"[注册流程] {msg}")
+        client._log = lambda msg, *_args, **_kwargs: self._log(f"[注册流程] {msg}")
         return client
 
     def _build_oauth_client(self) -> OAuthClient:
@@ -339,7 +340,7 @@ class RefreshTokenRegistrationEngine:
             verbose=False,
             browser_mode=self.browser_mode,
         )
-        client._log = lambda msg: self._log(f"[令牌流程] {msg}")
+        client._log = lambda msg, *_args, **_kwargs: self._log(f"[令牌流程] {msg}")
         return client
 
     def _reuse_register_browser_context(
@@ -514,13 +515,11 @@ class RefreshTokenRegistrationEngine:
             self._log(f"邮箱: {result.email}")
             self._log(f"密码: {self.password}")
             self._log(f"注册信息: {first_name} {last_name}, 生日: {birthdate}")
-            self._log("流程策略: 注册阶段推进到 about_you 后切换到 OAuth 流程继续完成后续步骤")
-            self._log(
-                "验证码等待策略: "
-                f"register_wait={register_otp_wait_seconds}s, "
-                f"register_resend_wait={register_otp_resend_wait_seconds}s, "
-                "oauth_wait=读取 OAuthClient 配置（默认60s）"
+            team_open_reuse_registration_session = bool(
+                self.extra_config.get("team_open_reuse_registration_session")
+                or self.extra_config.get("team_open_register_and_reuse_session")
             )
+            self._log(f"验证码等待策略: register_wait={register_otp_wait_seconds}s, register_resend_wait={register_otp_resend_wait_seconds}s")
 
             email_adapter = EmailServiceAdapter(
                 self.email_service,
@@ -544,7 +543,10 @@ class RefreshTokenRegistrationEngine:
                 register_client = self._build_chatgpt_client()
             else:
                 register_client = self._build_chatgpt_client()
-                self._log("2. 执行注册状态机（interrupt 模式：不在注册阶段提交 about_you）...")
+                self._log(
+                    "2. 执行注册状态机"
+                    + ("（Team 母号模式：提交 about_you 并落地 ChatGPT session）..." if team_open_reuse_registration_session else "（interrupt 模式：不在注册阶段提交 about_you）...")
+                )
                 registered, registration_message = register_client.register_complete_flow(
                     result.email,
                     self.password,
@@ -552,7 +554,7 @@ class RefreshTokenRegistrationEngine:
                     last_name,
                     birthdate,
                     email_adapter,
-                    stop_before_about_you_submission=True,
+                    stop_before_about_you_submission=not team_open_reuse_registration_session,
                     otp_wait_timeout=register_otp_wait_seconds,
                     otp_resend_wait_timeout=register_otp_resend_wait_seconds,
                 )
@@ -586,6 +588,58 @@ class RefreshTokenRegistrationEngine:
                         "将继续进入 OAuth 会话，按状态机实际返回推进。"
                     )
 
+
+            if team_open_reuse_registration_session:
+                if not registered:
+                    last_error = f"Team 母号注册未完成: {registration_message or 'unknown'}"
+                    result.error_message = last_error
+                    result.metadata = self._build_failure_metadata(
+                        stage=str(getattr(register_client, "last_stage", "") or "register_flow"),
+                        origin="register",
+                        detail=last_error,
+                        resume_supported=bool(result.email),
+                    )
+                    return result
+
+                self._log("3. Team 母号模式：复用注册后的 ChatGPT session 获取 accessToken")
+                ok, session_or_error = register_client.reuse_session_and_get_tokens()
+                if not ok:
+                    last_error = f"注册成功但获取 ChatGPT accessToken 失败: {session_or_error}"
+                    result.error_message = last_error
+                    result.metadata = self._build_failure_metadata(
+                        stage="token_exchange",
+                        origin="chatgpt_session",
+                        detail=last_error,
+                        resume_supported=bool(result.email),
+                    )
+                    return result
+
+                session_tokens = dict(session_or_error or {})
+                result.success = True
+                result.email = self.email or ""
+                result.password = self.password or ""
+                result.access_token = str(session_tokens.get("access_token") or "").strip()
+                result.session_token = str(session_tokens.get("session_token") or "").strip()
+                result.account_id = str(session_tokens.get("account_id") or "").strip()
+                result.workspace_id = str(session_tokens.get("workspace_id") or result.account_id or "").strip()
+                result.source = "chatgpt_session"
+                result.metadata = {
+                    "email_service": self.email_service.service_type.value,
+                    "proxy_used": self.proxy_url,
+                    "registered_at": datetime.now().isoformat(),
+                    "registration_message": registration_message,
+                    "registration_flow": "chatgpt_client.register_complete_flow",
+                    "token_flow": "chatgpt_client.reuse_session_and_get_tokens",
+                    "browser_mode": self.browser_mode,
+                    "email_binding": (
+                        dict((self.email_info or {}).get("account") or {})
+                        if isinstance((self.email_info or {}).get("account"), dict)
+                        else {}
+                    ),
+                    "team_open_reuse_registration_session": True,
+                }
+                result.session = register_client.session
+                return result
             if register_only_before_invite:
                 if not registered:
                     last_error = f"注册后停止模式未能完成注册阶段: {registration_message or 'unknown'}"

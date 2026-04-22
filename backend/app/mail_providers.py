@@ -3,6 +3,9 @@ from __future__ import annotations
 import imaplib
 import re
 import time
+import random
+import string
+import threading
 import hashlib
 import traceback
 from dataclasses import dataclass
@@ -642,6 +645,334 @@ class LuckMailProvider(ProviderBase):
                     self._log(f"[LuckMail] 发现相关邮件但未提取到验证码: {self._subject_preview(subject)}")
             self._sleep_interruptibly(4, interrupt_check)
         raise TimeoutError(f"LuckMail 等待验证码超时 ({timeout}s)")
+
+
+
+class CloudMailProvider(ProviderBase):
+    service_type = _ServiceType("cloud_mail")
+    _shared_tokens: dict[str, tuple[str, float]] = {}
+    _token_lock = threading.Lock()
+    _shared_seen_ids: dict[str, set[str]] = {}
+    _seen_ids_lock = threading.Lock()
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        admin_email: str,
+        admin_password: str,
+        domain="",
+        subdomain: str = "",
+        timeout: int | str = 30,
+        fixed_account: dict | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.admin_email = str(admin_email or "").strip()
+        self.admin_password = str(admin_password or "").strip()
+        self.domain = domain
+        self.subdomain = str(subdomain or "").strip().strip(".")
+        self._fixed_account = dict(fixed_account or {}) if isinstance(fixed_account, dict) else None
+        self._created_emails: dict[str, dict] = {}
+        try:
+            self.timeout = max(1, int(timeout or 30))
+        except Exception:
+            self.timeout = 30
+
+        if not self.base_url:
+            raise RuntimeError("CloudMail 未配置：请填写 cloud_mail_base_url")
+        if not self.admin_email or not self.admin_password:
+            raise RuntimeError("CloudMail 未配置：请填写 cloud_mail_admin_email 和 cloud_mail_admin_password")
+
+    def _normalize_domains(self, value) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            raw_items = [str(item or "").strip() for item in value]
+        else:
+            raw_items = re.split(r"[,\n\r]+", str(value or ""))
+        domains: list[str] = []
+        for item in raw_items:
+            current = str(item or "").strip().lstrip("@").strip(".")
+            if current:
+                domains.append(current)
+        return domains
+
+    def _generate_token(self) -> str:
+        response = tracked_request(
+            requests.request,
+            "POST",
+            f"{self.base_url}/api/public/genToken",
+            json={
+                "email": self.admin_email,
+                "password": self.admin_password,
+            },
+            proxies=self.proxies,
+            timeout=self.timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"CloudMail 生成 token 失败: HTTP {response.status_code}")
+        payload = response.json() or {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("CloudMail 生成 token 失败: 响应格式异常")
+        if int(payload.get("code") or 0) != 200:
+            raise RuntimeError(str(payload.get("message") or payload or "CloudMail 生成 token 失败"))
+        token = str(((payload.get("data") or {}).get("token") if isinstance(payload.get("data"), dict) else "") or "").strip()
+        if not token:
+            raise RuntimeError("CloudMail 生成 token 失败: 未返回 token")
+        return token
+
+    def _get_token(self, *, force_refresh: bool = False) -> str:
+        with self._token_lock:
+            cached = self._shared_tokens.get(self.base_url)
+            if not force_refresh and cached and time.time() < float(cached[1] or 0):
+                return str(cached[0] or "")
+            token = self._generate_token()
+            self._shared_tokens[self.base_url] = (token, time.time() + 3600)
+            return token
+
+    def _request(self, method: str, path: str, *, retry_on_auth_error: bool = True, **kwargs):
+        url = f"{self.base_url}{path}"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            **(kwargs.pop("headers", {}) or {}),
+        }
+        headers["Authorization"] = self._get_token()
+        response = tracked_request(
+            requests.request,
+            method,
+            url,
+            headers=headers,
+            proxies=self.proxies,
+            timeout=kwargs.pop("timeout", self.timeout),
+            **kwargs,
+        )
+        if response.status_code == 401 and retry_on_auth_error:
+            headers["Authorization"] = self._get_token(force_refresh=True)
+            response = tracked_request(
+                requests.request,
+                method,
+                url,
+                headers=headers,
+                proxies=self.proxies,
+                timeout=kwargs.pop("timeout", self.timeout),
+                **kwargs,
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"CloudMail 请求失败: HTTP {response.status_code}")
+        payload = response.json() or {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("CloudMail 请求失败: 响应格式异常")
+        return payload
+
+    def _pick_domain(self, domain: str = "", subdomain: str = "") -> str:
+        selected = str(domain or "").strip().lstrip("@").strip(".")
+        if not selected:
+            candidates = self._normalize_domains(self.domain)
+            if not candidates:
+                raise RuntimeError("CloudMail 未配置：请填写 cloud_mail_domain")
+            selected = random.choice(candidates)
+        selected_subdomain = str(subdomain or self.subdomain or "").strip().strip(".")
+        if selected_subdomain:
+            return f"{selected_subdomain}.{selected}"
+        return selected
+
+    def _generate_email_address(self, prefix: str = "", domain: str = "", subdomain: str = "") -> str:
+        local_part = str(prefix or "").strip()
+        if not local_part:
+            local_part = random.choice(string.ascii_lowercase) + "".join(
+                random.choices(string.ascii_lowercase + string.digits, k=9)
+            )
+        return f"{local_part}@{self._pick_domain(domain=domain, subdomain=subdomain)}"
+
+    @staticmethod
+    def _generate_password(length: int = 12) -> str:
+        alphabet = string.ascii_letters + string.digits
+        return "".join(random.choices(alphabet, k=max(8, int(length or 12))))
+
+    @staticmethod
+    def _extract_message_timestamp(mail: dict) -> float | None:
+        for key in ("sendTime", "createdAt", "created_at", "timestamp", "time", "date"):
+            value = mail.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, (int, float)):
+                numeric = float(value)
+                if numeric > 1e12:
+                    numeric /= 1000.0
+                if numeric > 0:
+                    return numeric
+            text = str(value or "").strip()
+            if not text:
+                continue
+            if text.isdigit():
+                try:
+                    numeric = float(text)
+                    if numeric > 1e12:
+                        numeric /= 1000.0
+                    if numeric > 0:
+                        return numeric
+                except Exception:
+                    pass
+            for candidate in (text, text.replace("Z", "+00:00"), text.replace("/", "-")):
+                try:
+                    return datetime.fromisoformat(candidate).timestamp()
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _normalize_visible_mail_text(*parts: str) -> str:
+        raw = " ".join(str(part or "") for part in parts if str(part or "").strip())
+        raw = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", raw)
+        raw = re.sub(r"(?is)<([a-z0-9]+)[^>]*display\s*:\s*none[^>]*>.*?</\1>", " ", raw)
+        raw = re.sub(r"(?is)<([a-z0-9]+)[^>]*visibility\s*:\s*hidden[^>]*>.*?</\1>", " ", raw)
+        text = ProviderBase._decode_raw_content(ProviderBase, raw)
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        return text
+
+    def _extract_cloudmail_code(self, mail: dict) -> str:
+        subject = str(mail.get("subject") or "").strip()
+        visible_text = self._normalize_visible_mail_text(
+            str(mail.get("content") or ""),
+            str(mail.get("text") or ""),
+            str(mail.get("html") or ""),
+        )
+
+        lowered_meta = " ".join(
+            [
+                str(mail.get("sendEmail") or ""),
+                str(mail.get("sendName") or ""),
+                subject,
+                visible_text,
+            ]
+        ).lower()
+        if not any(keyword in lowered_meta for keyword in ("openai", "chatgpt", "verification code", "验证码")):
+            return ""
+
+        patterns = [
+            r"(?is)(?:temporary\s+chatgpt\s+verification\s+code|chatgpt\s+verification\s+code|verification\s+code|login\s+code|security\s+code|authentication\s+code|验证码|驗證碼|認證碼)[^0-9]{0,80}(\d(?:[\s-]*\d){5})",
+            r"(?is)\b(?:openai\s+)?code\b[^0-9]{0,80}(\d(?:[\s-]*\d){5})",
+        ]
+        for source_text in (visible_text, subject):
+            if not source_text:
+                continue
+            for pattern in patterns:
+                match = re.search(pattern, source_text)
+                if not match:
+                    continue
+                code = re.sub(r"\D", "", str(match.group(1) or ""))
+                if len(code) == 6:
+                    return code
+        return ""
+
+    @staticmethod
+    def _mail_debug_excerpt(mail: dict) -> str:
+        subject = str(mail.get("subject") or "").strip()
+        content = " ".join(
+            [
+                str(mail.get("content") or ""),
+                str(mail.get("text") or ""),
+                str(mail.get("html") or ""),
+            ]
+        )
+        visible = re.sub(r"\s+", " ", CloudMailProvider._normalize_visible_mail_text(content)).strip()
+        if len(visible) > 160:
+            visible = visible[:157] + "..."
+        return f"subject={subject!r} body={visible!r}"
+
+    def create_email(self, config=None):
+        request_config = dict(config or {})
+        fixed_email = str(
+            self.fixed_email
+            or request_config.get("email")
+            or ((self._fixed_account or {}).get("email") if isinstance(self._fixed_account, dict) else "")
+            or ""
+        ).strip()
+        password = str(
+            request_config.get("password")
+            or ((self._fixed_account or {}).get("password") if isinstance(self._fixed_account, dict) else "")
+            or self._generate_password()
+        ).strip()
+        email = fixed_email or self._generate_email_address(
+            prefix=str(request_config.get("name") or "").strip(),
+            domain=str(request_config.get("domain") or "").strip(),
+            subdomain=str(request_config.get("subdomain") or "").strip(),
+        )
+        result = {
+            "email": email,
+            "service_id": email,
+            "password": password,
+            "account": {
+                "email": email,
+                "password": password,
+            },
+        }
+        self._created_emails[email] = result
+        self._log(f"[CloudMail] 已生成邮箱: {email}")
+        return result
+
+    def get_verification_code(self, email=None, timeout: int = 120, otp_sent_at=None, exclude_codes=None, **kwargs):
+        target_email = str(email or "").strip()
+        if not target_email:
+            raise RuntimeError("CloudMail 邮箱为空")
+        interrupt_check = kwargs.get("interrupt_check")
+        exclude_codes = {str(item).strip() for item in (exclude_codes or set()) if str(item or "").strip()}
+
+        with self._seen_ids_lock:
+            initial_seen_ids = set(self._shared_seen_ids.get(target_email, set()))
+            self._shared_seen_ids.setdefault(target_email, set())
+
+        current_seen_ids: set[str] = set()
+        deadline = time.monotonic() + max(int(timeout or 0), 1)
+
+        while time.monotonic() < deadline:
+            self._interrupt(interrupt_check)
+            payload = self._request(
+                "POST",
+                "/api/public/emailList",
+                json={
+                    "toEmail": target_email,
+                    "timeSort": "desc",
+                },
+            )
+            if int(payload.get("code") or 0) != 200:
+                self._sleep_interruptibly(3, interrupt_check)
+                continue
+            emails = payload.get("data") or []
+            if not isinstance(emails, list):
+                self._sleep_interruptibly(3, interrupt_check)
+                continue
+
+            for mail in emails:
+                message_id = str(mail.get("emailId") or mail.get("id") or "").strip()
+                if not message_id or message_id in initial_seen_ids or message_id in current_seen_ids:
+                    continue
+
+                mail_ts = self._extract_message_timestamp(mail)
+                if otp_sent_at and mail_ts and mail_ts + 1 < float(otp_sent_at):
+                    continue
+
+                current_seen_ids.add(message_id)
+                with self._seen_ids_lock:
+                    self._shared_seen_ids.setdefault(target_email, set()).add(message_id)
+
+                to_email = str(mail.get("toEmail") or "").strip().lower()
+                if to_email and to_email != target_email.lower():
+                    continue
+
+                code = self._extract_cloudmail_code(mail)
+                if not code or code in exclude_codes:
+                    continue
+
+                self._log(
+                    f"[CloudMail] 命中验证码邮件: id={message_id} code={code} {self._mail_debug_excerpt(mail)}"
+                )
+                return code
+
+            self._sleep_interruptibly(3, interrupt_check)
+
+        raise TimeoutError(f"CloudMail 等待验证码超时 ({timeout}s)")
 
 
 class OutlookLocalProvider(ProviderBase):
@@ -1810,6 +2141,19 @@ def build_mail_provider(
             project_code="openai",
             email_type=str(config.get("luckmail_email_type") or ""),
             domain=str(config.get("luckmail_domain") or ""),
+            fixed_account=(config.get("retry_email_binding") if isinstance(config.get("retry_email_binding"), dict) else None),
+            proxy=proxy,
+            log_fn=log_fn,
+            fixed_email=fixed_email,
+        )
+    if name == "cloud_mail":
+        return CloudMailProvider(
+            base_url=str(config.get("cloud_mail_base_url") or ""),
+            admin_email=str(config.get("cloud_mail_admin_email") or ""),
+            admin_password=str(config.get("cloud_mail_admin_password") or ""),
+            domain=config.get("cloud_mail_domain") or "",
+            subdomain=str(config.get("cloud_mail_subdomain") or ""),
+            timeout=config.get("cloud_mail_timeout") or 30,
             fixed_account=(config.get("retry_email_binding") if isinstance(config.get("retry_email_binding"), dict) else None),
             proxy=proxy,
             log_fn=log_fn,

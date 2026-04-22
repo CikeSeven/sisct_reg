@@ -10,6 +10,22 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 _PROXY_USAGE_CONTEXT = threading.local()
 
 
+def _build_proxy_netloc(parts, *, username: str = "", password: str = "") -> str:
+    netloc = ""
+    if username:
+        netloc += quote(username, safe="")
+        if password:
+            netloc += f":{quote(password, safe='')}"
+        netloc += "@"
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc += host
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return netloc
+
+
 def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
     """补全代理协议，并将 socks5:// 规范化为 socks5h://，避免本地 DNS 泄漏。"""
     if proxy_url is None:
@@ -23,10 +39,17 @@ def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
         value = f"http://{value}"
 
     parts = urlsplit(value)
-    if (parts.scheme or "").lower() == "socks5":
+    scheme = (parts.scheme or "").lower()
+    if scheme == "socks5":
         parts = parts._replace(scheme="socks5h")
+
+    if not parts.hostname:
         return urlunsplit(parts)
-    return value
+
+    username = unquote(parts.username or "")
+    password = unquote(parts.password or "")
+    netloc = _build_proxy_netloc(parts, username=username, password=password)
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def build_requests_proxy_config(proxy_url: Optional[str]) -> Optional[dict[str, str]]:
@@ -75,16 +98,7 @@ def isolate_proxy_session(proxy_url: Optional[str], *, scope: str = "") -> Optio
         count=1,
     )
 
-    netloc = ""
-    if rotated_username:
-        netloc += quote(rotated_username, safe="")
-        if password:
-            netloc += f":{quote(password, safe='')}"
-        netloc += "@"
-    host = parts.hostname or ""
-    netloc += host
-    if parts.port is not None:
-        netloc += f":{parts.port}"
+    netloc = _build_proxy_netloc(parts, username=rotated_username, password=password)
 
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 

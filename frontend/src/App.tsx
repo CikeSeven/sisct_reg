@@ -3,8 +3,9 @@ import { apiFetch } from './lib/api'
 import CodexAuthBatchPage from './CodexAuthBatchPage'
 import CodexTeamPage from './CodexTeamPage'
 import OAuthCpaPage from './OAuthCpaPage'
+import TeamOpenPage from './TeamOpenPage'
 
-type MailProvider = 'luckmail' | 'tempmail_lol' | 'outlook_local'
+type MailProvider = 'luckmail' | 'tempmail_lol' | 'outlook_local' | 'cloud_mail'
 type Executor = 'protocol' | 'headless' | 'headed'
 type SettingsTab = 'base' | 'mail' | 'uploads' | 'outlook'
 type OutlookDeleteScope = 'all' | 'taken'
@@ -12,7 +13,7 @@ type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
 type AccountFilter = 'all' | 'success' | 'failed'
 type AccountScope = 'all' | 'active'
-type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa' | 'codex_auth_batch'
+type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa' | 'codex_auth_batch' | 'team_open'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -35,6 +36,11 @@ type FormState = {
   luckmail_email_type: string
   luckmail_domain: string
   tempmail_api_base: string
+  cloud_mail_base_url: string
+  cloud_mail_admin_email: string
+  cloud_mail_admin_password: string
+  cloud_mail_domain: string
+  cloud_mail_subdomain: string
   cpa_api_url: string
   cpa_api_key: string
   sub2api_api_url: string
@@ -216,6 +222,11 @@ const defaultForm: FormState = {
   luckmail_email_type: '',
   luckmail_domain: '',
   tempmail_api_base: 'https://api.tempmail.lol/v2',
+  cloud_mail_base_url: '',
+  cloud_mail_admin_email: '',
+  cloud_mail_admin_password: '',
+  cloud_mail_domain: '',
+  cloud_mail_subdomain: '',
   cpa_api_url: '',
   cpa_api_key: '',
   sub2api_api_url: '',
@@ -1022,6 +1033,11 @@ export default function App() {
             luckmail_email_type: form.luckmail_email_type,
             luckmail_domain: form.luckmail_domain,
             tempmail_api_base: form.tempmail_api_base,
+            cloud_mail_base_url: form.cloud_mail_base_url,
+            cloud_mail_admin_email: form.cloud_mail_admin_email,
+            cloud_mail_admin_password: form.cloud_mail_admin_password,
+            cloud_mail_domain: form.cloud_mail_domain,
+            cloud_mail_subdomain: form.cloud_mail_subdomain,
             cpa_api_url: form.cpa_api_url,
             cpa_api_key: form.cpa_api_key,
             sub2api_api_url: form.sub2api_api_url,
@@ -1266,6 +1282,11 @@ export default function App() {
                 luckmail_email_type: form.luckmail_email_type,
                 luckmail_domain: form.luckmail_domain,
                 tempmail_api_base: form.tempmail_api_base,
+                cloud_mail_base_url: form.cloud_mail_base_url,
+                cloud_mail_admin_email: form.cloud_mail_admin_email,
+                cloud_mail_admin_password: form.cloud_mail_admin_password,
+                cloud_mail_domain: form.cloud_mail_domain,
+                cloud_mail_subdomain: form.cloud_mail_subdomain,
               },
               phone_config: {},
             }),
@@ -1553,6 +1574,7 @@ export default function App() {
                   <option value="luckmail">LuckMail</option>
                   <option value="tempmail_lol">TempMail.lol</option>
                   <option value="outlook_local">Outlook（本地微软令牌）</option>
+                  <option value="cloud_mail">Cloud Mail</option>
                 </select>
               </label>
             </div>
@@ -1678,6 +1700,34 @@ export default function App() {
               <label>
                 <span>指定域名</span>
                 <input value={form.luckmail_domain} onChange={(e) => updateField('luckmail_domain', e.target.value)} placeholder="outlook.com" />
+              </label>
+            </div>
+          </div>
+
+          <div className="sub-block">
+            <div className="sub-block-title">Cloud Mail</div>
+            <label>
+              <span>API Base URL</span>
+              <input value={form.cloud_mail_base_url} onChange={(e) => updateField('cloud_mail_base_url', e.target.value)} placeholder="https://your-worker.example.com" />
+            </label>
+            <div className="field-group two-col compact">
+              <label>
+                <span>管理员邮箱</span>
+                <input value={form.cloud_mail_admin_email} onChange={(e) => updateField('cloud_mail_admin_email', e.target.value)} placeholder="admin@example.com" />
+              </label>
+              <label>
+                <span>管理员密码</span>
+                <input type="password" value={form.cloud_mail_admin_password} onChange={(e) => updateField('cloud_mail_admin_password', e.target.value)} placeholder="输入 Cloud Mail 管理密码" />
+              </label>
+            </div>
+            <div className="field-group two-col compact">
+              <label>
+                <span>接收域名</span>
+                <input value={form.cloud_mail_domain} onChange={(e) => updateField('cloud_mail_domain', e.target.value)} placeholder="example.com 或 example.com,example.net" />
+              </label>
+              <label>
+                <span>子域名（可选）</span>
+                <input value={form.cloud_mail_subdomain} onChange={(e) => updateField('cloud_mail_subdomain', e.target.value)} placeholder="mail" />
               </label>
             </div>
           </div>
@@ -1923,6 +1973,13 @@ export default function App() {
           注册工作台
         </button>
         <button
+          className={`page-switch-btn ${page === 'team_open' ? 'active' : ''}`}
+          type="button"
+          onClick={() => setPage('team_open')}
+        >
+          Team 母号开通
+        </button>
+        <button
           className={`page-switch-btn ${page === 'codex_team' ? 'active' : ''}`}
           type="button"
           onClick={() => setPage('codex_team')}
@@ -1946,7 +2003,7 @@ export default function App() {
       </div>
       {page === 'register' && error ? <div className="error-banner">{error}</div> : null}
 
-      {page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : page === 'codex_auth_batch' ? <CodexAuthBatchPage /> : (
+      {page === 'team_open' ? <TeamOpenPage /> : page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : page === 'codex_auth_batch' ? <CodexAuthBatchPage /> : (
       <main className="workbench-grid two-pane">
         <section className="panel form-panel">
           <div className="panel-title-row">
@@ -1993,6 +2050,7 @@ export default function App() {
                 <option value="luckmail">LuckMail</option>
                 <option value="tempmail_lol">TempMail.lol</option>
                 <option value="outlook_local">Outlook（本地微软令牌）</option>
+                <option value="cloud_mail">Cloud Mail</option>
               </select>
             </label>
 
@@ -2000,6 +2058,11 @@ export default function App() {
               <div className="inline-meta-row">
                 <span>剩余邮箱：{outlookSummary?.enabled ?? 0}</span>
                 <span>已取出：{outlookSummary?.disabled ?? 0}</span>
+              </div>
+            ) : form.mail_provider === 'cloud_mail' ? (
+              <div className="inline-meta-row">
+                <span>域名：{form.cloud_mail_domain || '-'}</span>
+                <span>子域名：{form.cloud_mail_subdomain || '-'}</span>
               </div>
             ) : null}
 

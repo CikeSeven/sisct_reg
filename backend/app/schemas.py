@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 ExecutorType = Literal["protocol", "headless", "headed"]
-MailProvider = Literal["luckmail", "tempmail_lol", "outlook_local"]
+MailProvider = Literal["luckmail", "tempmail_lol", "outlook_local", "cloud_mail"]
 
 
 class CreateRegisterTaskRequest(BaseModel):
@@ -109,3 +109,38 @@ class StartCodexAuthBatchJobRequest(BaseModel):
 
 class CodexAuthBatchExportRequest(BaseModel):
     emails: list[str] = Field(default_factory=list)
+
+
+class CreateTeamOpenJobRequest(BaseModel):
+    count: int = Field(default=1, ge=1, le=500)
+    concurrency: int = Field(default=1, ge=1, le=20)
+    executor_type: ExecutorType = "protocol"
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class ImportTeamOpenCardsRequest(BaseModel):
+    data: str = Field(default="")
+    enabled: bool = True
+    default_holder_name: str = Field(default="")
+    default_billing_email: str = Field(default="")
+    default_country: str = Field(default="")
+    default_state: str = Field(default="")
+    default_city: str = Field(default="")
+    default_line1: str = Field(default="")
+    default_postal_code: str = Field(default="")
+
+    @field_validator(
+        "default_holder_name",
+        "default_billing_email",
+        "default_country",
+        "default_state",
+        "default_city",
+        "default_line1",
+        "default_postal_code",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_default_text_fields(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
