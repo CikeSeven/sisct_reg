@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 ExecutorType = Literal["protocol", "headless", "headed"]
 MailProvider = Literal["luckmail", "tempmail_lol", "outlook_local", "cloud_mail"]
+RegistrationMode = Literal["refresh_token", "register_only"]
 
 
 class CreateRegisterTaskRequest(BaseModel):
@@ -19,6 +20,7 @@ class CreateRegisterTaskRequest(BaseModel):
     use_proxy: bool = True
     executor_type: ExecutorType = "protocol"
     mail_provider: MailProvider = "luckmail"
+    registration_mode: RegistrationMode = "refresh_token"
     provider_config: dict[str, Any] = Field(default_factory=dict)
     phone_config: dict[str, Any] = Field(default_factory=dict)
 
@@ -109,6 +111,17 @@ class StartCodexAuthBatchJobRequest(BaseModel):
 
 class CodexAuthBatchExportRequest(BaseModel):
     emails: list[str] = Field(default_factory=list)
+class StartGptPasswordCodexJobRequest(BaseModel):
+    data: str = Field(default="")
+    delimiter: str = Field(default="|")
+    otp_site_url: str = Field(default="https://nissanserena.my.id/otp")
+    executor_type: ExecutorType = "protocol"
+
+
+class GptPasswordCodexExportRequest(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+
+
 
 
 class CreateTeamOpenJobRequest(BaseModel):

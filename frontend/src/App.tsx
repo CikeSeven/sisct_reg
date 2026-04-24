@@ -1,19 +1,21 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch } from './lib/api'
 import CodexAuthBatchPage from './CodexAuthBatchPage'
+import GptPasswordCodexPage from './GptPasswordCodexPage'
 import CodexTeamPage from './CodexTeamPage'
 import OAuthCpaPage from './OAuthCpaPage'
 import TeamOpenPage from './TeamOpenPage'
 
 type MailProvider = 'luckmail' | 'tempmail_lol' | 'outlook_local' | 'cloud_mail'
 type Executor = 'protocol' | 'headless' | 'headed'
+type RegistrationMode = 'refresh_token' | 'register_only'
 type SettingsTab = 'base' | 'mail' | 'uploads' | 'outlook'
 type OutlookDeleteScope = 'all' | 'taken'
 type ProxyDeleteScope = 'all'
 type UploadTarget = 'cpa' | 'sub2api'
 type AccountFilter = 'all' | 'success' | 'failed'
 type AccountScope = 'all' | 'active'
-type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa' | 'codex_auth_batch' | 'team_open'
+type WorkbenchPage = 'register' | 'codex_team' | 'oauth_cpa' | 'codex_auth_batch' | 'gpt_password_codex' | 'team_open'
 type DeleteDialogState = {
   items: AccountItem[]
 } | null
@@ -31,6 +33,7 @@ type FormState = {
   use_proxy: boolean
   executor_type: Executor
   mail_provider: MailProvider
+  registration_mode: RegistrationMode
   luckmail_base_url: string
   luckmail_api_key: string
   luckmail_email_type: string
@@ -217,6 +220,7 @@ const defaultForm: FormState = {
   use_proxy: true,
   executor_type: 'protocol',
   mail_provider: 'luckmail',
+  registration_mode: 'refresh_token',
   luckmail_base_url: 'https://mails.luckyous.com/',
   luckmail_api_key: '',
   luckmail_email_type: '',
@@ -1027,6 +1031,7 @@ export default function App() {
           values: {
             executor_type: form.executor_type,
             mail_provider: form.mail_provider,
+            registration_mode: form.registration_mode,
             use_proxy: form.use_proxy,
             luckmail_base_url: form.luckmail_base_url,
             luckmail_api_key: form.luckmail_api_key,
@@ -1276,6 +1281,7 @@ export default function App() {
               use_proxy: form.use_proxy,
               executor_type: form.executor_type,
               mail_provider: form.mail_provider,
+              registration_mode: form.registration_mode,
               provider_config: {
                 luckmail_base_url: form.luckmail_base_url,
                 luckmail_api_key: form.luckmail_api_key,
@@ -1578,6 +1584,13 @@ export default function App() {
                 </select>
               </label>
             </div>
+            <label>
+              <span>默认注册模式</span>
+              <select value={form.registration_mode} onChange={(e) => updateField('registration_mode', e.target.value as RegistrationMode)}>
+                <option value="refresh_token">注册并获取 refresh token</option>
+                <option value="register_only">仅注册，不获取 refresh token</option>
+              </select>
+            </label>
 
             <label className="checkbox-row settings-checkbox-row">
               <input type="checkbox" checked={form.use_proxy} onChange={(e) => updateField('use_proxy', e.target.checked)} />
@@ -2000,10 +2013,17 @@ export default function App() {
         >
           批量 Codex 授权
         </button>
+        <button
+          className={`page-switch-btn ${page === 'gpt_password_codex' ? 'active' : ''}`}
+          type="button"
+          onClick={() => setPage('gpt_password_codex')}
+        >
+          GPT 账号转 Codex
+        </button>
       </div>
       {page === 'register' && error ? <div className="error-banner">{error}</div> : null}
 
-      {page === 'team_open' ? <TeamOpenPage /> : page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : page === 'codex_auth_batch' ? <CodexAuthBatchPage /> : (
+      {page === 'team_open' ? <TeamOpenPage /> : page === 'codex_team' ? <CodexTeamPage /> : page === 'oauth_cpa' ? <OAuthCpaPage /> : page === 'codex_auth_batch' ? <CodexAuthBatchPage /> : page === 'gpt_password_codex' ? <GptPasswordCodexPage /> : (
       <main className="workbench-grid two-pane">
         <section className="panel form-panel">
           <div className="panel-title-row">
@@ -2038,6 +2058,19 @@ export default function App() {
                 </select>
               </label>
             </div>
+
+            <label>
+              <span>注册模式</span>
+              <select value={form.registration_mode} onChange={(e) => updateField('registration_mode', e.target.value as RegistrationMode)}>
+                <option value="refresh_token">注册并获取 refresh token</option>
+                <option value="register_only">仅注册，不获取 refresh token</option>
+              </select>
+            </label>
+            {form.registration_mode === 'register_only' ? (
+              <div className="inline-meta-row">
+                <span>当前模式下注册完成后直接结束，不再继续 OAuth / refresh token 流程。</span>
+              </div>
+            ) : null}
 
             <label className="checkbox-row">
               <input type="checkbox" checked={form.use_proxy} onChange={(e) => updateField('use_proxy', e.target.checked)} />

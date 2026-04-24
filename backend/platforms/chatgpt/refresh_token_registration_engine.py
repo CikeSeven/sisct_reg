@@ -58,6 +58,7 @@ class RegistrationResult:
             "refresh_token": self.refresh_token[:20] + "..." if self.refresh_token else "",
             "id_token": self.id_token[:20] + "..." if self.id_token else "",
             "session_token": self.session_token[:20] + "..." if self.session_token else "",
+            "sessionToken": self.session_token[:20] + "..." if self.session_token else "",
             "error_message": self.error_message,
             "logs": self.logs or [],
             "metadata": self.metadata or {},
@@ -528,9 +529,18 @@ class RefreshTokenRegistrationEngine:
                 interrupt_check=self.interrupt_check,
             )
 
+            registration_mode = str(
+                self.extra_config.get("registration_mode")
+                or self.extra_config.get("chatgpt_registration_mode")
+                or "refresh_token"
+            ).strip().lower() or "refresh_token"
             register_only_before_invite = bool(
                 self.extra_config.get("codex_team_register_only_before_invite")
                 or self.extra_config.get("register_only_before_invite")
+                or registration_mode == "register_only"
+            )
+            submit_about_you_in_register_stage = (
+                team_open_reuse_registration_session or register_only_before_invite
             )
             direct_oauth_retry = retry_resume_stage in {"about_you", "workspace_select", "token_exchange"} or (
                 retry_resume_origin == "oauth" and retry_resume_stage in {"authorize_continue", "otp"}
@@ -543,10 +553,13 @@ class RefreshTokenRegistrationEngine:
                 register_client = self._build_chatgpt_client()
             else:
                 register_client = self._build_chatgpt_client()
-                self._log(
-                    "2. 执行注册状态机"
-                    + ("（Team 母号模式：提交 about_you 并落地 ChatGPT session）..." if team_open_reuse_registration_session else "（interrupt 模式：不在注册阶段提交 about_you）...")
-                )
+                if team_open_reuse_registration_session:
+                    register_stage_mode = "Team 母号模式：提交 about_you 并落地 ChatGPT session"
+                elif register_only_before_invite:
+                    register_stage_mode = "register_only 模式：提交 about_you 并落地 ChatGPT session"
+                else:
+                    register_stage_mode = "interrupt 模式：不在注册阶段提交 about_you"
+                self._log(f"2. 执行注册状态机（{register_stage_mode}）...")
                 registered, registration_message = register_client.register_complete_flow(
                     result.email,
                     self.password,
@@ -554,7 +567,7 @@ class RefreshTokenRegistrationEngine:
                     last_name,
                     birthdate,
                     email_adapter,
-                    stop_before_about_you_submission=not team_open_reuse_registration_session,
+                    stop_before_about_you_submission=not submit_about_you_in_register_stage,
                     otp_wait_timeout=register_otp_wait_seconds,
                     otp_resend_wait_timeout=register_otp_resend_wait_seconds,
                 )
@@ -651,16 +664,38 @@ class RefreshTokenRegistrationEngine:
                         resume_supported=bool(result.email),
                     )
                     return result
+
+                self._log("3. register_only 模式：复用注册后的 ChatGPT session 获取基础参数（不取 refresh_token）")
+                ok, session_or_error = register_client.reuse_session_and_get_tokens()
+                if not ok:
+                    last_error = f"注册成功但获取 ChatGPT 基础参数失败: {session_or_error}"
+                    result.error_message = last_error
+                    result.metadata = self._build_failure_metadata(
+                        stage="token_exchange",
+                        origin="chatgpt_session",
+                        detail=last_error,
+                        resume_supported=bool(result.email),
+                    )
+                    return result
+
+                session_tokens = dict(session_or_error or {})
                 result.success = True
                 result.email = self.email or ""
                 result.password = self.password or ""
-                result.source = source
+                result.access_token = str(session_tokens.get("access_token") or "").strip()
+                result.session_token = str(
+                    session_tokens.get("session_token") or session_tokens.get("sessionToken") or ""
+                ).strip()
+                result.account_id = str(session_tokens.get("account_id") or "").strip()
+                result.workspace_id = str(session_tokens.get("workspace_id") or result.account_id or "").strip()
+                result.source = "chatgpt_session"
                 result.metadata = {
                     "email_service": self.email_service.service_type.value,
                     "proxy_used": self.proxy_url,
                     "registered_at": datetime.now().isoformat(),
                     "registration_message": registration_message,
                     "registration_flow": "chatgpt_client.register_complete_flow",
+                    "token_flow": "chatgpt_client.reuse_session_and_get_tokens",
                     "browser_mode": self.browser_mode,
                     "email_binding": (
                         dict((self.email_info or {}).get("account") or {})
@@ -668,8 +703,11 @@ class RefreshTokenRegistrationEngine:
                         else {}
                     ),
                     "register_only_before_invite": True,
+                    "registration_mode": registration_mode,
+                    "refresh_token_skipped": True,
                 }
-                self._log("3. 已按配置在注册完成后停止，等待后续邀请完成后再进行 Codex OAuth")
+                result.session = register_client.session
+                self._log("3. 已获取 access_token / session_token / account_id，按配置跳过 refresh_token / Codex OAuth")
                 self._log("=" * 60)
                 return result
 

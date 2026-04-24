@@ -126,6 +126,11 @@ def generate_cpa_token_json(result: Any) -> dict[str, Any]:
     access_token = str(getattr(result, "access_token", "") or "").strip()
     refresh_token = str(getattr(result, "refresh_token", "") or "").strip()
     id_token = str(getattr(result, "id_token", "") or "").strip()
+    session_token = str(
+        getattr(result, "session_token", "")
+        or getattr(result, "sessionToken", "")
+        or ""
+    ).strip()
     if access_token and not id_token:
         id_token = _build_compat_id_token(access_token=access_token, email=email)
 
@@ -141,7 +146,7 @@ def generate_cpa_token_json(result: Any) -> dict[str, Any]:
             expired_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
     now = datetime.now(tz=timezone(timedelta(hours=8)))
-    return {
+    payload = {
         "type": "codex",
         "email": email,
         "expired": expired_str,
@@ -151,6 +156,9 @@ def generate_cpa_token_json(result: Any) -> dict[str, Any]:
         "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         "refresh_token": refresh_token,
     }
+    if session_token and not refresh_token:
+        payload["sessionToken"] = session_token
+    return payload
 
 
 def _parse_group_ids(raw: Any) -> list[int]:

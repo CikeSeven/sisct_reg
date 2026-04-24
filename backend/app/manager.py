@@ -401,7 +401,7 @@ class RegistrationManager:
         initial_attempts: list[QueuedAttempt] | None = None,
     ) -> str:
         task_id = f"task_{int(time.time() * 1000)}"
-        task_meta = {"mail_provider": req.mail_provider, "mode": "refresh_token"}
+        task_meta = {"mail_provider": req.mail_provider, "mode": str(req.registration_mode or "refresh_token")}
         task_meta.update(meta or {})
         self._task_store.create(
             task_id,
@@ -1178,13 +1178,15 @@ class RegistrationManager:
         for item in get_task_results(task_id):
             if item.get("status") != "success":
                 continue
+            session_token = str(item.get("session_token") or "")
             exported.append(
                 {
                     "email": item.get("email") or "",
                     "password": item.get("password") or "",
                     "access_token": item.get("access_token") or "",
                     "refresh_token": item.get("refresh_token") or "",
-                    "session_token": item.get("session_token") or "",
+                    "session_token": session_token,
+                    "sessionToken": session_token,
                     "workspace_id": item.get("workspace_id") or "",
                     "extra": item.get("extra_json") or {},
                 }
@@ -1498,6 +1500,12 @@ class RegistrationManager:
                 "use_proxy": bool(current_use_proxy),
                 "executor_type": request_payload.get("executor_type") or merged_config.get("executor_type") or "protocol",
                 "mail_provider": mail_provider,
+                "registration_mode": (
+                    request_payload.get("registration_mode")
+                    or merged_config.get("registration_mode")
+                    or merged_config.get("chatgpt_registration_mode")
+                    or "refresh_token"
+                ),
                 "provider_config": request_payload.get("provider_config") or {},
                 "phone_config": request_payload.get("phone_config") or {},
             },
@@ -1560,6 +1568,7 @@ class RegistrationManager:
             use_proxy=bool((first.req_overrides or {}).get("use_proxy", True)),
             executor_type=(first.req_overrides or {}).get("executor_type") or "protocol",
             mail_provider=(first.req_overrides or {}).get("mail_provider") or "luckmail",
+            registration_mode=(first.req_overrides or {}).get("registration_mode") or "refresh_token",
             provider_config=(first.req_overrides or {}).get("provider_config") or {},
             phone_config=(first.req_overrides or {}).get("phone_config") or {},
         )
@@ -1790,6 +1799,7 @@ class RegistrationManager:
             access_token=str(row.get("access_token") or "").strip(),
             refresh_token=str(row.get("refresh_token") or "").strip(),
             session_token=str(row.get("session_token") or "").strip(),
+            sessionToken=str(row.get("session_token") or "").strip(),
             workspace_id=str(row.get("workspace_id") or "").strip(),
             account_id=str(extra.get("account_id") or "").strip(),
             id_token=str(extra.get("id_token") or "").strip(),
@@ -2092,9 +2102,12 @@ class RegistrationManager:
         config.update(merged_config or {})
         config.update(req.provider_config or {})
         config.update(req.phone_config or {})
+        registration_mode = str(getattr(req, "registration_mode", "refresh_token") or "refresh_token").strip() or "refresh_token"
         config["mail_provider"] = req.mail_provider
         config["executor_type"] = req.executor_type
-        config["chatgpt_registration_mode"] = "refresh_token"
+        config["registration_mode"] = registration_mode
+        config["chatgpt_registration_mode"] = registration_mode
+        config["register_only_before_invite"] = registration_mode == "register_only"
         config["captcha_solver"] = "yescaptcha"
         config["use_proxy"] = bool(getattr(req, "use_proxy", True))
         if req.proxy and bool(getattr(req, "use_proxy", True)):
@@ -2422,7 +2435,7 @@ class RegistrationManager:
                         "account_id": str(getattr(result, "account_id", "") or ""),
                         "id_token": str(getattr(result, "id_token", "") or ""),
                         "metadata": getattr(result, "metadata", None) or {},
-                        "mode": "refresh_token",
+                        "mode": str(getattr(attempt_req, "registration_mode", "refresh_token") or "refresh_token"),
                         "mail_provider": attempt_req.mail_provider,
                         "upload_results": upload_results,
                         **attempt_retry_origin,

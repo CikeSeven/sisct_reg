@@ -698,6 +698,7 @@ class ChatGPTClient:
         normalized = {
             "access_token": access_token,
             "session_token": session_token,
+            "sessionToken": session_token,
             "account_id": account_id,
             "user_id": user_id,
             "workspace_id": account_id,

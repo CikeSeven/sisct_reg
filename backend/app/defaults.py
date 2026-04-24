@@ -3,6 +3,7 @@ from __future__ import annotations
 DEFAULT_CONFIG = {
     "executor_type": "protocol",
     "mail_provider": "luckmail",
+    "registration_mode": "refresh_token",
     "count": 1,
     "concurrency": 1,
     "register_delay_seconds": 0,
